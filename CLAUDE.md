@@ -10,17 +10,22 @@ code in this repository.
 project: a Rust binary packaged as a Python wheel via maturin.
 
 It reports two things per file: symbols nothing references, and symbols only
-tests reach. A second command, `changed-symbols`, maps the working tree's git
-diff to the Python symbols it changed — the first stage of impact-based pytest
-selection, and the one part of the crate that needs `git` rather than `tyf`.
-Architecture details: `docs/dev/ARCHITECTURE.md`.
+tests reach. `changed-symbols` maps the working tree's git diff to the Python
+symbols it changed — the one part of the crate that needs `git` rather than
+`tyf`. `impacted-tests` walks the reverse reference graph from those symbols out
+to the tests that reach them. Together they are impact-based pytest selection,
+minus the pytest invocation (phase 3).
+
+Architecture details: `docs/dev/ARCHITECTURE.md`. Decisions and their costs:
+`docs/adr/`.
 
 ## Prerequisites
 
 - **`tyf`** on `PATH` for `audit`/`doctor` (`uv add --dev ty ty-find`). Not
   needed for the test suite — the tests stub it.
 - **`git`** on `PATH` for `changed-symbols` and its tests, or `GERENUK_GIT`
-  pointing at it. That is all it needs.
+  pointing at it. That is all `changed-symbols` needs; `impacted-tests` needs
+  `tyf` as well.
 - **`uv`** for the fixture package's pytest suite.
 
 ## Common Commands
@@ -32,6 +37,7 @@ cargo fmt --all -- --check && cargo clippy --all-targets --all-features -- -D wa
 make review        # the above, plus the fixture pytest suite, audit and deny
 make review-quick  # skip the network checks
 make test-fixture  # just the Python fixture package's pytest suite
+make test-impact   # impacted-tests against the fixture with a REAL tyf
 make docs          # build the mdBook site + llms.txt
 ```
 
@@ -60,10 +66,12 @@ When a test fails during implementation:
 
 ## Key Invariants
 
-- **`tyf::Runner::run` and `git::Git::run` are the only functions that spawn a
-  process.** Everything downstream takes parsed data. Keep it that way — it is
-  what makes `analyze`, `changed` and `report` testable with no `tyf`, no `ty`,
-  no `git` and no Python. Adding a third seam needs a very good reason.
+- **`tyf` and `git` are the only two modules that spawn a process.** The literal
+  spawn sites are `tyf::Runner::run` and the private `git::Git::output`, which
+  `git::Git::run` and `git::Git::try_run` are the only ways into. Everything
+  downstream takes parsed data. Keep it that way — it is what makes `analyze`,
+  `changed`, `closure` and `report` testable with no `tyf`, no `ty`, no `git`
+  and no Python. Adding a third seam needs a very good reason (ADR 0001).
 - **`changed-symbols` must never construct a `tyf::Runner`.** Discovery happens
   inside the `Audit` and `Doctor` arms of `Cli::run`, not before the match. A
   test in `tests/changed_symbols.rs` runs with an empty `PATH` to enforce this.
@@ -78,7 +86,23 @@ When a test fails during implementation:
 - **The fixture package and the canned payloads must agree.** Changing the call
   graph in `tests/fixtures/sample_pkg` means updating both its pytest suite and
   the stub payloads in `tests/audit.rs`.
-- **`clippy::unwrap_used` / `expect_used` are denied outside tests.** Use
+- **`closure.rs` reaches the world only through `Refs` and `Index`.** New inputs
+  go behind one of those traits, not into `walk` directly, or the unit tests
+  stop being able to run without `tyf`. `impact.rs` is glue and holds no rules.
+- **`impacted-tests` never fails a run it could answer.** Anything that goes
+  wrong past the first gate — `tyf` missing, `tyf` garbling its output, an
+  unreadable file — degrades to `verdict: run_all` and exit `0`. The one
+  exception is a run with no answer at all (not a repository, unreadable
+  `--changed`), which is exit `2`. There is no exit `1` (ADR 0009).
+- **The up-front verdicts are checked before `tyf` is looked for.** Reordering
+  `run_impacted_tests` so discovery happens first would break
+  `impacted-tests` on a `pyproject.toml`-only diff in a checkout with no `ty`.
+  `tests/impacted_tests.rs` runs those cases with an empty `PATH` to enforce it.
+- **A symbol id with no colon is a module.** That convention carries the
+  module-level edge and the whole-file test selection (`"symbol": null`) through
+  `via`, `origin` and `impacted_tests[].symbol` alike (ADR 0008).
+- **`clippy::unwrap_used` / `expect_used` warn outside tests, and the documented
+  `cargo clippy … -D warnings` makes them fatal.** Use
   `anyhow::Context` on every `?` that crosses an I/O or parsing boundary.
 - **A symbol's `added`/`modified`/`deleted` verdict comes from whether it exists
   on each side of the diff, not from which side the hunk touched.** Deleting

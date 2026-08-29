@@ -45,6 +45,18 @@ pub struct SymbolSpan {
     pub kind: Kind,
     pub start_line: u32,
     pub end_line: u32,
+    /// Line of the definition's *name*, which is where a reference to it lands.
+    ///
+    /// Distinct from [`Self::start_line`], which is the first decorator: a
+    /// position query and an `include_declaration` self-reference both mean the
+    /// identifier, not the `@`.
+    pub name_line: u32,
+    /// 1-based column of the definition's name, as `tyf refs file:line:col`
+    /// wants it.
+    ///
+    /// Byte-based, which matches character positions for every prefix Python
+    /// allows here — indentation, `def `, `class `, `async def ` are all ASCII.
+    pub name_column: u32,
     /// Dotted names of the decorators applied to this definition.
     pub decorators: Vec<String>,
 }
@@ -60,6 +72,9 @@ impl SymbolSpan {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Module {
     pub spans: Vec<SymbolSpan>,
+    /// Lines covered by an `import` or `from ... import` statement, wherever it
+    /// sits. Parenthesised imports span several lines, hence ranges.
+    pub imports: Vec<(u32, u32)>,
     /// The source did not parse cleanly. Callers treat the whole file as
     /// module-level rather than trusting a partial tree.
     pub has_error: bool,
@@ -73,6 +88,21 @@ impl Module {
     #[must_use]
     pub fn symbol_at(&self, line: u32) -> Option<&SymbolSpan> {
         self.spans.iter().filter(|span| span.contains(line)).max_by_key(|span| span.start_line)
+    }
+
+    /// Whether `line` is part of an import statement.
+    ///
+    /// Callers consult this only for lines that belong to no symbol, so an
+    /// import *inside* a function is never reached through here — it resolves
+    /// to its enclosing definition first.
+    #[must_use]
+    pub fn is_import_line(&self, line: u32) -> bool {
+        self.imports.iter().any(|&(start, end)| line >= start && line <= end)
+    }
+
+    /// Definitions at module level — those whose qualname has no dot.
+    pub fn top_level(&self) -> impl Iterator<Item = &SymbolSpan> {
+        self.spans.iter().filter(|span| !span.qualname.contains('.'))
     }
 }
 
@@ -90,7 +120,30 @@ pub fn parse(source: &str) -> Result<Module> {
     collect(root, source.as_bytes(), &[], false, &mut spans);
     spans.sort_by_key(|span| (span.start_line, span.end_line));
 
-    Ok(Module { spans, has_error: root.has_error() })
+    let mut imports = Vec::new();
+    collect_imports(root, &mut imports);
+    imports.sort_unstable();
+
+    Ok(Module { spans, imports, has_error: root.has_error() })
+}
+
+/// Line ranges of every import statement in the tree, at any nesting depth.
+///
+/// The whole tree is walked, unlike [`collect`]: an import inside `try:` or
+/// `if TYPE_CHECKING:` is still an import line as far as the caller is
+/// concerned, and one inside a function is simply never asked about.
+fn collect_imports(node: Node, out: &mut Vec<(u32, u32)>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if matches!(
+            child.kind(),
+            "import_statement" | "import_from_statement" | "future_import_statement"
+        ) {
+            out.push((one_based(child.start_position().row), one_based(child.end_position().row)));
+        } else {
+            collect_imports(child, out);
+        }
+    }
 }
 
 /// Walk `node`'s children, emitting definitions and recursing everywhere except
@@ -141,11 +194,18 @@ fn emit(
     let mut qual = prefix.to_vec();
     qual.push(name.to_string());
 
+    let name_node = def.child_by_field_name("name");
+    let name_line = name_node
+        .map_or_else(|| one_based(def.start_position().row), |n| one_based(n.start_position().row));
+    let name_column = name_node.map_or(1, |n| one_based(n.start_position().column));
+
     out.push(SymbolSpan {
         qualname: qual.join("."),
         kind,
-        start_line: line_of(outer.start_position().row),
-        end_line: line_of(def.end_position().row),
+        start_line: one_based(outer.start_position().row),
+        end_line: one_based(def.end_position().row),
+        name_line,
+        name_column,
         decorators,
     });
 
@@ -184,9 +244,80 @@ fn dotted_name(node: Node, src: &[u8]) -> Option<String> {
     }
 }
 
-/// tree-sitter rows are 0-based; every line number gerenuk reports is 1-based.
-fn line_of(row: usize) -> u32 {
-    u32::try_from(row).unwrap_or(u32::MAX).saturating_add(1)
+/// Lines on which `name` appears as a whole word, 1-based, in order.
+///
+/// Deliberately textual: it is the fallback for a symbol whose definition no
+/// longer exists, so there is nothing left for a type checker to resolve. It
+/// over-matches — comments, docstrings, same-named locals — and that is the
+/// safe direction.
+#[must_use]
+pub fn word_lines(source: &str, name: &str) -> Vec<u32> {
+    source
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| word_appears(line, name))
+        .filter_map(|(index, _)| u32::try_from(index).ok().map(|row| row.saturating_add(1)))
+        .collect()
+}
+
+/// Whether `haystack` contains `needle` bounded by non-identifier characters.
+fn word_appears(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    haystack.match_indices(needle).any(|(at, _)| {
+        let before = at.checked_sub(1).map(|i| bytes[i]);
+        let after = bytes.get(at + needle.len()).copied();
+        !before.is_some_and(is_ident_byte) && !after.is_some_and(is_ident_byte)
+    })
+}
+
+const fn is_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
+/// Whether the source imports `module`, in any of the forms Python allows.
+///
+/// Also textual, and for the same reason: this answers "which test files would
+/// re-run if this module's top level changed?", where the module may have no
+/// symbol worth resolving at all. `from pkg import sub` is recognised as an
+/// import of `pkg.sub`, because that is what it is.
+#[must_use]
+pub fn imports_module(source: &str, module: &str) -> bool {
+    let (parent, leaf) = module.rsplit_once('.').unwrap_or(("", module));
+    let submodule_prefix = format!("{module}.");
+
+    source.lines().any(|line| {
+        let line = line.trim();
+
+        if let Some(rest) = line.strip_prefix("import ") {
+            return rest.split(',').any(|part| {
+                let name = part.split_whitespace().next().unwrap_or_default();
+                name == module || name.starts_with(&submodule_prefix)
+            });
+        }
+
+        let Some(rest) = line.strip_prefix("from ") else { return false };
+        let Some((from, names)) = rest.split_once(" import ") else { return false };
+        let from = from.trim();
+
+        if from == module || from.starts_with(&submodule_prefix) {
+            return true;
+        }
+        // `from pkg import sub` imports the module `pkg.sub`. A parenthesised
+        // list continues on later lines, so an open bracket counts as a match
+        // rather than a miss.
+        !parent.is_empty()
+            && from == parent
+            && (word_appears(names, leaf) || names.trim_end().ends_with('('))
+    })
+}
+
+/// tree-sitter rows and columns are 0-based; every line and column gerenuk
+/// reports is 1-based, which is also what `tyf` positions use.
+fn one_based(index: usize) -> u32 {
+    u32::try_from(index).unwrap_or(u32::MAX).saturating_add(1)
 }
 
 #[cfg(test)]
@@ -423,6 +554,206 @@ def a():
             spans[0].decorators
         );
         assert_eq!(spans[0].qualname, "a", "the definition itself is still found");
+    }
+
+    #[test]
+    fn the_name_line_skips_the_decorators() {
+        let source = "\
+@staticmethod
+@registry.thing
+def a():
+    pass
+";
+        let span = &module(source).spans[0];
+        assert_eq!(span.start_line, 1, "the span still opens at the first decorator");
+        assert_eq!(
+            span.name_line, 3,
+            "but the name is on the `def` line, which is where references land"
+        );
+        assert_eq!(span.name_column, 5, "`a` sits at 1-based column 5 of `def a():`");
+    }
+
+    #[test]
+    fn a_methods_name_column_includes_its_indentation() {
+        // A position query with the wrong column silently returns no
+        // references, so this has to be exact rather than approximately right.
+        let source = "\
+class C:
+    def m(self):
+        pass
+";
+        let span = module(source)
+            .spans
+            .into_iter()
+            .find(|s| s.qualname == "C.m")
+            .expect("the method is found");
+        assert_eq!((span.name_line, span.name_column), (2, 9), "4 spaces + `def ` + 1");
+    }
+
+    #[test]
+    fn an_undecorated_definition_starts_where_its_name_is() {
+        let spans = module(SAMPLE).spans;
+        let top = spans.iter().find(|s| s.qualname == "top").expect("`top` is in the sample");
+        assert_eq!(top.name_line, top.start_line, "no decorators means the two coincide");
+        assert_eq!(top.name_line, 6, "and it is the `def top(...)` line");
+    }
+
+    #[test]
+    fn import_statements_are_recorded_by_line() {
+        let source = "\
+import os
+from pathlib import Path
+
+x = 1
+";
+        let parsed = module(source);
+        assert!(parsed.is_import_line(1), "`import os`");
+        assert!(parsed.is_import_line(2), "`from ... import ...`");
+        assert!(!parsed.is_import_line(3), "a blank line is not an import");
+        assert!(!parsed.is_import_line(4), "an assignment is not an import");
+    }
+
+    #[test]
+    fn a_parenthesised_import_covers_every_line_it_spans() {
+        let source = "\
+from pkg import (
+    a,
+    b,
+)
+
+y = 2
+";
+        let parsed = module(source);
+        for line in 1..=4 {
+            assert!(parsed.is_import_line(line), "line {line} is inside the import");
+        }
+        assert!(!parsed.is_import_line(6), "the assignment below is not");
+    }
+
+    #[test]
+    fn a_conditional_import_is_still_an_import_line() {
+        let source = "\
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from pkg import Thing
+";
+        assert!(module(source).is_import_line(4), "`if TYPE_CHECKING:` guards imports too");
+    }
+
+    #[test]
+    fn an_import_inside_a_function_resolves_to_the_function_first() {
+        // Both are true of line 2; callers ask `symbol_at` first, so the import
+        // flag never gets consulted for it.
+        let source = "\
+def f():
+    import os
+
+    return os
+";
+        let parsed = module(source);
+        assert_eq!(
+            parsed.symbol_at(2).map(|s| s.qualname.as_str()),
+            Some("f"),
+            "the enclosing definition wins"
+        );
+        assert!(parsed.is_import_line(2), "the line is nonetheless an import");
+    }
+
+    #[test]
+    fn top_level_lists_module_scope_definitions_only() {
+        let parsed = module(SAMPLE);
+        let names: Vec<&str> = parsed.top_level().map(|s| s.qualname.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["top", "Enricher", "fetch"],
+            "methods and nested classes carry a dot and are excluded"
+        );
+    }
+
+    #[test]
+    fn a_module_with_no_definitions_has_no_top_level_symbols() {
+        assert_eq!(module("import os\n\nX = 1\n").top_level().count(), 0, "constants are not defs");
+    }
+
+    #[test]
+    fn word_lines_finds_whole_word_occurrences_only() {
+        let source = "\
+def enrich():
+    pass
+
+
+enriched = 1
+value = enrich()
+# enrich again
+";
+        assert_eq!(
+            word_lines(source, "enrich"),
+            vec![1, 6, 7],
+            "`enriched` must not match, but a comment mention does"
+        );
+    }
+
+    #[test]
+    fn word_lines_reports_a_line_once_however_often_it_appears() {
+        assert_eq!(word_lines("f(f(f()))\n", "f"), vec![1], "one hit per line");
+    }
+
+    #[test]
+    fn word_boundaries_include_dots_and_brackets() {
+        assert!(word_appears("obj.run()", "run"), "an attribute access is a hit");
+        assert!(word_appears("[run]", "run"), "so is a list element");
+        assert!(!word_appears("rerun()", "run"), "but not a longer identifier");
+        assert!(!word_appears("run_all()", "run"), "nor a prefix of one");
+        assert!(!word_appears("anything", ""), "an empty needle never matches");
+    }
+
+    #[test]
+    fn plain_imports_are_recognised() {
+        assert!(imports_module("import mypkg.enrich\n", "mypkg.enrich"));
+        assert!(imports_module("import os, mypkg.enrich\n", "mypkg.enrich"), "comma lists");
+        assert!(
+            imports_module("import mypkg.enrich as e\n", "mypkg.enrich"),
+            "an alias does not hide the module"
+        );
+        assert!(
+            imports_module("import mypkg.enrich.deep\n", "mypkg.enrich"),
+            "importing a submodule imports the package on the way"
+        );
+        assert!(!imports_module("import mypkg.enricher\n", "mypkg.enrich"), "prefix collision");
+    }
+
+    #[test]
+    fn from_imports_are_recognised_in_both_shapes() {
+        assert!(
+            imports_module("from mypkg.enrich import Enricher\n", "mypkg.enrich"),
+            "the module named directly"
+        );
+        assert!(
+            imports_module("from mypkg import enrich\n", "mypkg.enrich"),
+            "`from pkg import sub` is an import of pkg.sub"
+        );
+        assert!(
+            imports_module("from mypkg import (\n    enrich,\n)\n", "mypkg.enrich"),
+            "a parenthesised list continues elsewhere, so it counts"
+        );
+        assert!(
+            !imports_module("from mypkg import other\n", "mypkg.enrich"),
+            "a sibling module is not this one"
+        );
+    }
+
+    #[test]
+    fn unrelated_source_imports_nothing() {
+        let source = "\
+x = 1
+
+
+def f():
+    return x
+";
+        assert!(!imports_module(source, "mypkg.enrich"), "no import statement, no import");
+        assert!(!imports_module("# import mypkg.enrich\n", "mypkg.enrich"), "a comment is not one");
     }
 
     #[test]

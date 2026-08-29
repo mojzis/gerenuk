@@ -70,8 +70,9 @@ impl Git {
 
     /// Run `git <args>` in the repository and return stdout.
     ///
-    /// This is the only function in the crate outside [`crate::tyf`] that
-    /// spawns a process. A non-zero exit is an error carrying git's stderr.
+    /// This and [`Self::try_run`] are the only ways into [`Self::output`],
+    /// which is the one place outside [`crate::tyf`] that spawns a process.
+    /// A non-zero exit is an error carrying git's stderr.
     pub fn run<I, S>(&self, args: I) -> Result<String>
     where
         I: IntoIterator<Item = S>,
@@ -189,9 +190,28 @@ impl Git {
     /// `git diff` cannot see these, but a brand-new module that has not been
     /// staged yet is the most common thing a pre-commit hook meets.
     pub fn untracked(&self) -> Result<Vec<PathBuf>> {
-        let out = self
-            .run(["ls-files", "--others", "--exclude-standard", "-z"])
-            .context("could not list untracked files")?;
+        self.paths(
+            ["ls-files", "--others", "--exclude-standard", "-z"],
+            "could not list untracked files",
+        )
+    }
+
+    /// Every path git tracks, repository-relative.
+    ///
+    /// Used to enumerate the workspace's Python files for the textual scans:
+    /// `.gitignore` already encodes which directories are not worth reading
+    /// (`.venv`, `node_modules`, vendored trees), correctly and per project.
+    pub fn ls_files(&self) -> Result<Vec<PathBuf>> {
+        self.paths(["ls-files", "-z"], "could not list tracked files")
+    }
+
+    /// Run a `-z` listing command and split its NUL-separated paths.
+    fn paths<const N: usize>(
+        &self,
+        args: [&str; N],
+        context: &'static str,
+    ) -> Result<Vec<PathBuf>> {
+        let out = self.run(args).context(context)?;
         Ok(out.split('\0').filter(|s| !s.is_empty()).map(PathBuf::from).collect())
     }
 
@@ -377,6 +397,22 @@ mod tests {
             untracked,
             vec![PathBuf::from("fresh.py")],
             "--exclude-standard must honour .gitignore"
+        );
+    }
+
+    #[test]
+    fn ls_files_lists_tracked_paths_and_skips_ignored_ones() {
+        let repo = TestRepo::new();
+        repo.write(".gitignore", "build/\n");
+        repo.write("pkg/mod.py", "x = 1\n");
+        repo.write("build/generated.py", "y = 1\n");
+        repo.commit("base");
+
+        let tracked = repo.gerenuk_git().ls_files().expect("ls-files runs");
+        assert!(tracked.contains(&PathBuf::from("pkg/mod.py")), "tracked source is listed");
+        assert!(
+            !tracked.contains(&PathBuf::from("build/generated.py")),
+            "an ignored file was never added, so it is not tracked either: {tracked:?}"
         );
     }
 

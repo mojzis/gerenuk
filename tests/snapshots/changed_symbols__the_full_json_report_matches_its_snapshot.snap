@@ -7,14 +7,18 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
   "changed_symbols": [
     {
       "change": "added",
+      "column": 5,
       "file": "src/mypkg/fresh.py",
       "kind": "function",
+      "line": 1,
       "symbol": "mypkg.fresh:brand_new"
     },
     {
       "change": "modified",
+      "column": 9,
       "file": "src/mypkg/service.py",
       "kind": "method",
+      "line": 19,
       "symbol": "mypkg.service:Shelter.summary"
     }
   ],

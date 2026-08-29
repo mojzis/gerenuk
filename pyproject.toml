@@ -25,6 +25,9 @@ classifiers = [
 ]
 keywords = ["python", "lsp", "symbols", "static-analysis", "rust"]
 dynamic = ["version"]
+# `tyf` is not optional — every command except `changed-symbols` shells out to
+# it — so installing gerenuk installs it. `ty` itself is deliberately *not* a
+# hard dependency; see the `ty` extra below.
 dependencies = [
     "ty-find>=0.4",
 ]
@@ -35,6 +38,15 @@ repository = "https://github.com/mojzis/gerenuk"
 documentation = "https://mojzis.github.io/gerenuk"
 
 [project.optional-dependencies]
+# `pip install gerenuk[ty]` for a complete, offline-capable setup.
+#
+# `ty` is an extra rather than a dependency on purpose: it is a pre-1.0 type
+# checker that projects pin themselves, and a hard requirement here would fight
+# that pin for no gain — `tyf` falls back to `uvx ty` when it finds none on
+# PATH. ty-find made the same call for the same reason.
+ty = [
+    "ty",
+]
 dev = [
     "pytest>=8.0",
 ]

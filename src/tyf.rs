@@ -19,6 +19,13 @@ pub const DEFAULT_TYF_BIN: &str = "tyf";
 /// Environment variable that overrides which `tyf` binary is used.
 pub const TYF_BIN_ENV: &str = "GERENUK_TYF";
 
+/// Flags every `tyf refs` call sends.
+///
+/// `--tests` populates `test_references`, which is omitted by default;
+/// `--references-limit 0` disables truncation, so the returned lists match the
+/// counts alongside them.
+const REFS_FLAGS: [&str; 3] = ["--tests", "--references-limit", "0"];
+
 /// Spawns `tyf` inside a workspace and decodes its JSON output.
 #[derive(Debug, Clone)]
 pub struct Runner {
@@ -88,13 +95,38 @@ impl Runner {
     }
 
     /// Usages of `symbol` (`tyf refs`).
-    ///
-    /// `--tests` populates `test_references` (omitted by default) and
-    /// `--references-limit 0` disables truncation, so the returned lists match
-    /// the counts alongside them.
     pub fn refs(&self, symbol: &str) -> Result<ReferencesResult> {
-        let raw = self.run(["refs", symbol, "--tests", "--references-limit", "0"])?;
-        parse_refs(&raw)
+        let mut args = vec!["refs", symbol];
+        args.extend(REFS_FLAGS);
+        parse_refs(&self.run(args)?)
+    }
+
+    /// Usages of several symbols or positions in one invocation.
+    ///
+    /// Each query is either a bare name or a `file:line:col` position; `tyf`
+    /// auto-detects which. Answers come back in query order — one JSON object
+    /// for a single query, an array for several — so the caller zips by index.
+    ///
+    /// Positions are what phase 2 sends: `tyf refs` rejects a name with more
+    /// than one dot (`Outer.Inner.method`), and two same-named symbols in
+    /// different modules answer as one.
+    pub fn refs_batch(&self, queries: &[String]) -> Result<Vec<ReferencesResult>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut args: Vec<&str> = vec!["refs"];
+        args.extend(queries.iter().map(String::as_str));
+        args.extend(REFS_FLAGS);
+
+        let raw = self.run(args)?;
+        let found = parse_refs_batch(&raw)?;
+        anyhow::ensure!(
+            found.len() == queries.len(),
+            "`tyf refs` answered {} of {} queries",
+            found.len(),
+            queries.len()
+        );
+        Ok(found)
     }
 
     /// Outline of a Python file (`tyf list`).
@@ -123,6 +155,20 @@ pub fn parse_find(raw: &str) -> Result<Vec<Location>> {
 /// Parse a `tyf refs` payload.
 pub fn parse_refs(raw: &str) -> Result<ReferencesResult> {
     serde_json::from_str(extract_json(raw)?).context("could not parse `tyf refs` JSON")
+}
+
+/// Parse a multi-query `tyf refs` payload.
+///
+/// A single query answers with one object rather than a one-element array, so
+/// both shapes are accepted — and staying tolerant of that means a future `tyf`
+/// settling on one of them cannot break the walk.
+pub fn parse_refs_batch(raw: &str) -> Result<Vec<ReferencesResult>> {
+    let json = extract_json(raw)?;
+    if json.starts_with('[') {
+        serde_json::from_str(json).context("could not parse `tyf refs` JSON array")
+    } else {
+        parse_refs(json).map(|one| vec![one])
+    }
 }
 
 /// Parse a `tyf list` payload.
@@ -207,6 +253,31 @@ mod tests {
         assert_eq!(result.symbol, "solo");
         assert_eq!(result.reference_count, 0, "absent counts default to zero");
         assert!(result.references.is_empty(), "absent reference lists default to empty");
+    }
+
+    #[test]
+    fn a_single_query_answers_with_one_object_not_an_array() {
+        let found = parse_refs_batch(REFS_JSON).expect("a bare object is a valid answer");
+        assert_eq!(found.len(), 1, "it is wrapped so callers see one shape");
+        assert_eq!(found[0].symbol, "list_animals");
+    }
+
+    #[test]
+    fn several_queries_answer_with_an_array_in_query_order() {
+        let raw = format!("[{REFS_JSON},{{\"symbol\": \"other\", \"reference_count\": 1}}]");
+        let found = parse_refs_batch(&raw).expect("an array is the multi-query shape");
+        assert_eq!(
+            found.iter().map(|r| r.symbol.as_str()).collect::<Vec<_>>(),
+            vec!["list_animals", "other"],
+            "the caller zips answers to queries by index, so order is the contract"
+        );
+    }
+
+    #[test]
+    fn a_position_query_echoes_the_position_as_the_symbol() {
+        let raw = r#"{"symbol": "pkg/a.py:15:5", "reference_count": 0}"#;
+        let found = parse_refs_batch(raw).expect("position answers parse like any other");
+        assert_eq!(found[0].symbol, "pkg/a.py:15:5", "which is why order, not name, is the key");
     }
 
     #[test]

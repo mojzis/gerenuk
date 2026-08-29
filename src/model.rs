@@ -57,7 +57,11 @@ impl Location {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Reference {
     pub file: PathBuf,
+    /// 1-based, unlike [`Position::line`]. The closure compares it against a
+    /// definition's own line to drop `tyf`'s self-reference, so the base is
+    /// load-bearing.
     pub line: u32,
+    /// 1-based, like [`Self::line`], and what `tyf` accepts back as a position.
     pub column: u32,
     /// Enclosing symbol name, when `tyf` could determine one.
     #[serde(default)]

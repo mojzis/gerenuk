@@ -23,17 +23,20 @@ use common::{fake_tyf, gerenuk, sample_pkg, SERVICE_OUTLINE};
 /// * `tyf` includes the symbol's own definition among the references. gerenuk
 ///   must not count a definition as a usage — otherwise nothing is ever unused.
 ///
-/// Reference states: `describe` and `summary` are used from `cli.py`;
-/// `seniors` only from `tests/test_service.py`; `legacy_export` nowhere.
+/// Reference states: `describe` is used from `cli.py` and `pipelines.py`;
+/// `summary` from `cli.py`; `seniors` only from `tests/test_service.py`;
+/// `legacy_export` nowhere.
 fn refs_fixtures() -> Vec<(&'static str, &'static str)> {
     vec![
         (
             "describe",
             r#"{"symbol": "describe", "reference_count": 0, "references": [],
-                "test_reference_count": 4, "test_references": [
+                "test_reference_count": 6, "test_references": [
                   {"file": "sample_pkg/service.py", "line": 16, "column": 5, "context": "describe"},
                   {"file": "sample_pkg/cli.py", "line": 6, "column": 48, "context": "module scope"},
                   {"file": "sample_pkg/cli.py", "line": 24, "column": 15, "context": "main"},
+                  {"file": "sample_pkg/pipelines.py", "line": 12, "column": 32, "context": "module scope"},
+                  {"file": "sample_pkg/pipelines.py", "line": 23, "column": 17, "context": "Enricher.run"},
                   {"file": "tests/test_service.py", "line": 13, "column": 12, "context": "test_describe_marks_seniors"}
                 ]}"#,
         ),

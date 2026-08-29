@@ -1,8 +1,13 @@
 //! Project configuration, read from `[tool.gerenuk]` in the repo's
 //! `pyproject.toml`.
 //!
-//! Phase 1 has exactly one key. Unknown keys are accepted rather than rejected,
-//! so a newer gerenuk's config file does not break an older binary.
+//! Unknown keys are accepted rather than rejected, so a newer gerenuk's config
+//! file does not break an older binary.
+//!
+//! Budget keys are `Option`, not defaulted: "absent" has to stay
+//! distinguishable from "set to the default value", because a CLI flag must be
+//! able to override the file and the file must be able to override the
+//! built-in.
 
 use std::path::Path;
 
@@ -19,6 +24,13 @@ pub struct Config {
     /// invoked by a runner rather than called directly, so a change to one has
     /// no callers worth chasing.
     pub ignore_decorators: Vec<String>,
+
+    /// How many BFS levels `impacted-tests` will walk before giving up.
+    pub max_depth: Option<u32>,
+    /// How many symbols it will visit before giving up.
+    pub max_symbols: Option<usize>,
+    /// Wall-clock budget for the whole walk, in milliseconds.
+    pub budget_ms: Option<u64>,
 }
 
 /// Wrapper types mirroring `pyproject.toml`'s nesting: `[tool.gerenuk]`.
@@ -144,8 +156,35 @@ mod tests {
     }
 
     #[test]
+    fn budget_keys_are_absent_by_default() {
+        let config = Config::default();
+        assert_eq!(config.max_depth, None, "unset must be distinguishable from the default");
+        assert_eq!(config.max_symbols, None);
+        assert_eq!(config.budget_ms, None);
+    }
+
+    #[test]
+    fn budget_keys_are_read_in_kebab_case() {
+        let tmp =
+            with_pyproject("[tool.gerenuk]\nmax-depth = 4\nmax-symbols = 120\nbudget-ms = 5000\n");
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(config.max_depth, Some(4));
+        assert_eq!(config.max_symbols, Some(120));
+        assert_eq!(config.budget_ms, Some(5000));
+    }
+
+    #[test]
+    fn setting_only_one_budget_leaves_the_others_unset() {
+        let tmp = with_pyproject("[tool.gerenuk]\nmax-depth = 2\n");
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(config.max_depth, Some(2), "the one that was set");
+        assert_eq!(config.max_symbols, None, "and the others stay at the built-in default");
+    }
+
+    #[test]
     fn a_bare_entry_matches_bare_and_dotted_decorators() {
-        let config = Config { ignore_decorators: vec!["transformation".to_string()] };
+        let config =
+            Config { ignore_decorators: vec!["transformation".to_string()], ..Config::default() };
         assert_eq!(config.matching_decorator("transformation"), Some("transformation"), "bare");
         assert_eq!(
             config.matching_decorator("registry.transformation"),
@@ -156,7 +195,10 @@ mod tests {
 
     #[test]
     fn a_dotted_entry_does_not_match_a_bare_decorator() {
-        let config = Config { ignore_decorators: vec!["registry.transformation".to_string()] };
+        let config = Config {
+            ignore_decorators: vec!["registry.transformation".to_string()],
+            ..Config::default()
+        };
         assert_eq!(
             config.matching_decorator("transformation"),
             None,
@@ -176,7 +218,8 @@ mod tests {
 
     #[test]
     fn suffix_matching_respects_component_boundaries() {
-        let config = Config { ignore_decorators: vec!["formation".to_string()] };
+        let config =
+            Config { ignore_decorators: vec!["formation".to_string()], ..Config::default() };
         assert_eq!(
             config.matching_decorator("transformation"),
             None,

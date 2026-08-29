@@ -1,4 +1,4 @@
-.PHONY: review fmt-check lint test test-fixture audit deny coverage mutants review-quick docs docs-serve
+.PHONY: review fmt-check lint test test-fixture test-impact audit deny coverage mutants review-quick docs docs-serve
 
 # Full review — run before pushing or merging
 review: fmt-check lint test test-fixture audit deny
@@ -63,6 +63,12 @@ mutants:
 test-fixture:
 	@echo "🐍 Running fixture package tests..."
 	@cd tests/fixtures/sample_pkg && uv run --with pytest --with hatchling python -m pytest -q
+
+# Drive `impacted-tests` against the fixture with a REAL tyf, outside cargo test
+# (which stubs it). Skips cleanly when tyf is not installed.
+test-impact:
+	@cargo build --quiet
+	@bash scripts/impact-smoke.sh
 
 # Build the mdBook site plus llms.txt into docs/book/html
 docs:

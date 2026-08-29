@@ -6,6 +6,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -14,9 +15,11 @@ use crate::analyze::{audit, auditable_symbols, outline_size, SymbolUsage};
 use crate::changed::{
     analyze as analyze_changes, untracked_change, ChangedSymbols, FileChange, GitSources,
 };
+use crate::closure::Reason;
 use crate::config::Config;
 use crate::diff;
-use crate::git::Git;
+use crate::git::{Base, Git};
+use crate::impact::{self, Budgets, FsIndex, ImpactReport, TyfRefs};
 use crate::model::relative_display;
 use crate::report::{Format, Report};
 use crate::tyf::Runner;
@@ -42,12 +45,18 @@ Getting started:
   2. `gerenuk audit pkg/*.py`     — report unreferenced and test-only symbols.
   3. `gerenuk audit --format json` — same, as JSON for scripting.
   4. `gerenuk changed-symbols`    — which symbols the working tree changed.
+  5. `gerenuk impacted-tests`     — which tests those changed symbols reach.
 
 Exit codes:
 
   0  no findings
   1  findings reported
-  2  the run could not complete (tyf missing, bad workspace, ...)";
+  2  the run could not complete (tyf missing, bad workspace, ...)
+
+`changed-symbols` and `impacted-tests` never return 1: they are inventories \
+rather than verdicts. When `impacted-tests` cannot trust its own answer it \
+says so in the report (`verdict: run_all`) and still exits 0, because \
+\"run everything\" is a usable answer for a pre-commit hook.";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -90,6 +99,33 @@ pub enum Command {
         /// Base ref to diff against. Default: origin/main, then main, then master.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+    },
+
+    /// Report the tests the working tree's changed symbols can reach.
+    ///
+    /// Walks the reverse reference graph from `changed-symbols` outwards until
+    /// it reaches test code. Needs `git` and `tyf`.
+    ImpactedTests {
+        /// Base ref to diff against. Default: origin/main, then main, then master.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        /// Replay a saved `changed-symbols --format json` report instead of
+        /// diffing the working tree.
+        #[arg(long, value_name = "FILE", conflicts_with = "base")]
+        changed: Option<PathBuf>,
+
+        /// BFS levels to walk before giving up and saying `run_all`.
+        #[arg(long, value_name = "N")]
+        max_depth: Option<u32>,
+
+        /// Symbols to visit before giving up and saying `run_all`.
+        #[arg(long, value_name = "N")]
+        max_symbols: Option<usize>,
+
+        /// Wall-clock budget for the walk. `0` disables it.
+        #[arg(long, value_name = "MS")]
+        budget_ms: Option<u64>,
     },
 
     /// Check that `tyf` and the workspace resolve, without running an analysis.
@@ -137,6 +173,15 @@ impl Cli {
                 // report is the normal case, so it must not fail the hook.
                 Ok(Outcome::Clean)
             }
+            Command::ImpactedTests { base, changed, max_depth, max_symbols, budget_ms } => {
+                let budgets = Budgets { max_depth, max_symbols, budget_ms };
+                let report =
+                    run_impacted_tests(&root, base.as_deref(), changed.as_deref(), budgets)?;
+                write!(out, "{}", report.render(self.format)?)?;
+                // Either verdict is an answer. Only a run that could not
+                // produce one at all is a failure, and that arrives as an Err.
+                Ok(Outcome::Clean)
+            }
         }
     }
 }
@@ -147,20 +192,116 @@ impl Cli {
 /// because diff paths are repository-relative — and because the pitch puts
 /// `[tool.gerenuk]` in the repo-root `pyproject.toml`.
 pub fn run_changed_symbols(workspace: &Path, base: Option<&str>) -> Result<ChangedSymbols> {
+    let (git, root, config) = repo_context(workspace)?;
+    let base = git.resolve_base(base)?;
+    let untracked = git.untracked()?;
+    changed_report(&git, &root, &base, &config, &untracked)
+}
+
+/// The repository the command runs against, plus its configuration.
+fn repo_context(workspace: &Path) -> Result<(Git, PathBuf, Config)> {
     let git = Git::discover(workspace)?;
     let root = git.top_level()?;
     let git = git.rebind(&root);
-
-    let base = git.resolve_base(base)?;
     let config = Config::load(&root)?;
+    Ok((git, root, config))
+}
 
+/// Diff the working tree against `base` and map the result to symbols.
+///
+/// `untracked` is passed in rather than fetched, because `impacted-tests` needs
+/// the same list again for its file index and one `git ls-files --others` per
+/// run is enough.
+fn changed_report(
+    git: &Git,
+    root: &Path,
+    base: &Base,
+    config: &Config,
+    untracked: &[PathBuf],
+) -> Result<ChangedSymbols> {
     let raw = git.diff(&base.merge_base)?;
     let mut changes: Vec<FileChange> =
         diff::parse(&raw).into_iter().map(FileChange::from).collect();
-    changes.extend(git.untracked()?.into_iter().map(untracked_change));
+    changes.extend(untracked.iter().cloned().map(untracked_change));
 
-    let sources = GitSources::new(&git, &root, &base.merge_base);
-    analyze_changes(&base, &changes, &root, &sources, &config)
+    let sources = GitSources::new(git, root, &base.merge_base);
+    analyze_changes(base, &changes, root, &sources, config)
+}
+
+/// Walk from the changed symbols to the tests that reach them.
+///
+/// Reads like a series of gates, and the order is the point: the verdicts that
+/// need nothing but the phase-1 report are settled before `tyf` is looked for,
+/// so a diff of `pyproject.toml` alone answers in a checkout with no `ty`
+/// installed. Past that gate, anything that goes wrong degrades to `run_all`
+/// rather than failing — see `docs/adr/0009-run-all-is-a-success.md`.
+pub fn run_impacted_tests(
+    workspace: &Path,
+    base: Option<&str>,
+    changed_file: Option<&Path>,
+    budgets: Budgets,
+) -> Result<ImpactReport> {
+    let started = Instant::now();
+    let (git, root, config) = repo_context(workspace)?;
+    let limits = impact::resolve_limits(budgets, &config, started);
+
+    // Kept from the phase-1 diff when there was one: the file index below needs
+    // the same list, and asking git twice is a second process for one answer.
+    let mut untracked = None;
+    let changed = if let Some(path) = changed_file {
+        load_changed(path)?
+    } else {
+        let listed = git.untracked()?;
+        let report = changed_report(&git, &root, &git.resolve_base(base)?, &config, &listed)?;
+        untracked = Some(listed);
+        report
+    };
+
+    if let Some(reason) = impact::upfront_reason(&changed) {
+        return Ok(impact::run_all(&changed, reason, Vec::new()));
+    }
+
+    let runner = match Runner::discover(&root) {
+        Ok(runner) => runner,
+        Err(err) => {
+            return Ok(impact::run_all(&changed, Reason::TyfUnavailable, vec![format!("{err:#}")]))
+        }
+    };
+
+    // Past the gate every failure is a verdict, not an exit code: a repository
+    // that stops answering here still gets `run_all`.
+    // See `docs/adr/0009-run-all-is-a-success.md`.
+    let files = match workspace_files(&git, untracked) {
+        Ok(files) => files,
+        Err(err) => {
+            return Ok(impact::run_all(&changed, Reason::IndexFailed, vec![format!("{err:#}")]))
+        }
+    };
+
+    let index = FsIndex::new(&root, &files);
+    let refs = TyfRefs::new(&runner, &root);
+    Ok(impact::analyze(&changed, &refs, &index, &config, &limits))
+}
+
+/// Every path in the repository, tracked and untracked alike.
+fn workspace_files(git: &Git, untracked: Option<Vec<PathBuf>>) -> Result<Vec<PathBuf>> {
+    let mut files = git.ls_files()?;
+    match untracked {
+        Some(listed) => files.extend(listed),
+        None => files.extend(git.untracked()?),
+    }
+    Ok(files)
+}
+
+/// Replay a saved `changed-symbols --format json` report.
+///
+/// This is what pins the phase-1 schema as the interface between the phases:
+/// a report written by one gerenuk has to be walkable by the next.
+fn load_changed(path: &Path) -> Result<ChangedSymbols> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read --changed {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("cannot parse {} as a changed-symbols report", path.display()))
 }
 
 /// Outline each file, ask `tyf refs` about every auditable symbol, then apply
@@ -285,6 +426,62 @@ mod tests {
             }
             other => panic!("expected changed-symbols, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn impacted_tests_takes_no_required_arguments() {
+        let cli = Cli::try_parse_from(["gerenuk", "impacted-tests"])
+            .expect("the subcommand should be usable bare");
+        match cli.command {
+            Command::ImpactedTests { base, changed, max_depth, max_symbols, budget_ms } => {
+                assert_eq!(base, None, "the default base chain applies");
+                assert_eq!(changed, None, "and the diff is computed, not replayed");
+                assert_eq!(
+                    (max_depth, max_symbols, budget_ms),
+                    (None, None, None),
+                    "unset budgets fall through to the config and then the defaults"
+                );
+            }
+            other => panic!("expected impacted-tests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn impacted_tests_accepts_every_budget_flag() {
+        let cli = Cli::try_parse_from([
+            "gerenuk",
+            "impacted-tests",
+            "--max-depth",
+            "3",
+            "--max-symbols",
+            "40",
+            "--budget-ms",
+            "1500",
+        ])
+        .expect("valid invocation should parse");
+
+        match cli.command {
+            Command::ImpactedTests { max_depth, max_symbols, budget_ms, .. } => {
+                assert_eq!((max_depth, max_symbols, budget_ms), (Some(3), Some(40), Some(1500)));
+            }
+            other => panic!("expected impacted-tests, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn replaying_a_report_and_naming_a_base_are_mutually_exclusive() {
+        // A saved report already records the base it was taken against, so
+        // accepting both would silently ignore one of them.
+        let err = Cli::try_parse_from([
+            "gerenuk",
+            "impacted-tests",
+            "--changed",
+            "report.json",
+            "--base",
+            "main",
+        ])
+        .expect_err("the two flags contradict each other");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

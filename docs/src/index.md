@@ -26,6 +26,11 @@ Two things fall out of that:
 - **Test-only symbols** — production code stopped using them, but the tests
   kept them alive. Usually the residue of an unfinished refactor.
 
+Turned around, the same reference graph answers the opposite question — *which
+tests could this change break?* — which is what
+[`changed-symbols`](commands/changed-symbols.md) and
+[`impacted-tests`](commands/impacted-tests.md) are for.
+
 ## What it is not
 
 `gerenuk` reports static references. Dynamic dispatch, plugin registries,
