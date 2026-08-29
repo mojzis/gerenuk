@@ -21,6 +21,21 @@ pub enum Format {
     Json,
 }
 
+/// Write a titled, counted list of plain strings — the shape every command's
+/// human output uses for its secondary sections.
+pub(crate) fn list_section(out: &mut String, title: &str, entries: &[String]) {
+    use std::fmt::Write as _;
+
+    if entries.is_empty() {
+        return;
+    }
+    // Writing into a String is infallible, so the Results carry nothing.
+    let _ = writeln!(out, "\n{title} ({})", entries.len());
+    for entry in entries {
+        let _ = writeln!(out, "  {entry}");
+    }
+}
+
 /// Everything one audit run produced.
 #[derive(Debug, Clone, Serialize)]
 pub struct Report {
@@ -175,6 +190,16 @@ mod tests {
             value["findings"][0]["file"], "/proj/pkg/service.py",
             "JSON keeps absolute paths so downstream tools do not have to guess the root"
         );
+    }
+
+    #[test]
+    fn a_list_section_is_titled_counted_and_skipped_when_empty() {
+        let mut out = String::new();
+        list_section(&mut out, "errors", &[]);
+        assert!(out.is_empty(), "an empty section prints no heading at all");
+
+        list_section(&mut out, "errors", &["a.py".to_string(), "b.py".to_string()]);
+        assert_eq!(out, "\nerrors (2)\n  a.py\n  b.py\n", "got: {out:?}");
     }
 
     #[test]

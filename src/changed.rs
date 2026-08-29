@@ -14,9 +14,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::diff::{self, FileDiff, LineRange};
 use crate::git::{Base, Git};
-use crate::modpath::module_path;
+use crate::modpath::{module_path, symbol_id};
 use crate::pysource::{self, Kind, SymbolSpan};
-use crate::report::Format;
+use crate::report::{list_section, Format};
 use crate::workspace::is_test_path;
 
 /// What happened to a symbol between the merge base and the working tree.
@@ -33,20 +33,55 @@ pub enum Change {
 /// `ignored_by` is only ever set on entries in
 /// [`ChangedSymbols::ignored_symbols`], and is omitted from JSON otherwise.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolChange {
     /// `module.path:QualName`, e.g. `mypkg.pipelines.enrich:Enricher.run`.
     pub symbol: String,
     /// Repository-relative path.
     pub file: String,
     pub kind: Kind,
+    /// Line of the definition's name, 1-based — where a reference to it lands.
+    pub line: u32,
+    /// Column of the definition's name, 1-based.
+    ///
+    /// Together with `line` this is the `file:line:col` position phase 2 sends
+    /// to `tyf refs`. It is deliberately not `#[serde(default)]`: a replayed
+    /// report missing it must fail loudly, because a wrong column comes back as
+    /// *no references* rather than as an error.
+    pub column: u32,
     pub change: Change,
     /// The `ignore-decorators` entry that matched, when the symbol was ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ignored_by: Option<String>,
 }
 
+/// A module whose top level changed: imports, constants, module-level code.
+///
+/// The file travels with the module name because phase 2 has to outline the
+/// module to seed its symbols, and a dotted name is not a path.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ModuleChange {
+    /// Dotted module path, e.g. `mypkg.pipelines.enrich`.
+    pub module: String,
+    /// Repository-relative path.
+    pub file: String,
+}
+
 /// The whole answer for one `gerenuk changed-symbols` run.
+///
+/// Deserialising is what `impacted-tests --changed report.json` replays, so the
+/// rules are stricter than they look. `base` and `merge_base` are **required**
+/// and unknown keys are **rejected**: a truncated file, a typo, or a report
+/// from a different gerenuk would otherwise deserialise into an empty report,
+/// and an empty report is indistinguishable from "nothing changed" — a
+/// confident `selected` verdict that runs no tests at all. Failing loudly with
+/// exit 2 is the only safe reading of a report we cannot trust.
+///
+/// The arrays default individually, so a hand-written report may still omit the
+/// ones that are empty.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 #[allow(
     clippy::struct_field_names,
     reason = "the field names are the published JSON schema; they cannot be shortened"
@@ -55,14 +90,20 @@ pub struct ChangedSymbols {
     /// The ref the diff was taken against, e.g. `origin/main`.
     pub base: String,
     pub merge_base: String,
+    #[serde(default)]
     pub changed_symbols: Vec<SymbolChange>,
     /// Symbols suppressed by `ignore-decorators`.
+    #[serde(default)]
     pub ignored_symbols: Vec<SymbolChange>,
     /// Modules whose top level changed — imports, constants, module-level code.
-    pub module_level_changes: Vec<String>,
+    #[serde(default)]
+    pub module_level_changes: Vec<ModuleChange>,
+    #[serde(default)]
     pub non_python_changes: Vec<String>,
+    #[serde(default)]
     pub test_files_changed: Vec<String>,
     /// Files that could not be parsed; each is also a module-level change.
+    #[serde(default)]
     pub errors: Vec<String>,
 }
 
@@ -216,7 +257,7 @@ fn analyze_file(
     {
         acc.errors.insert(display(reported));
         for side in [&old, &new].into_iter().flatten() {
-            acc.module_level.insert(side.module.clone());
+            acc.module_level.insert(side.module_level_change());
         }
         return Ok(());
     }
@@ -238,7 +279,7 @@ fn analyze_file(
                 }
                 None if side.is_blank(line) => {}
                 None => {
-                    acc.module_level.insert(side.module.clone());
+                    acc.module_level.insert(side.module_level_change());
                 }
             }
         }
@@ -272,6 +313,8 @@ fn analyze_file(
             symbol,
             file: display(&side.path),
             kind: span.kind,
+            line: span.name_line,
+            column: span.name_column,
             change: change_kind,
             ignored_by,
         };
@@ -305,6 +348,11 @@ struct LoadedSide {
 impl LoadedSide {
     fn line_count(&self) -> u32 {
         u32::try_from(self.blank.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The `(module, file)` pair this side is reported under.
+    fn module_level_change(&self) -> (String, String) {
+        (self.module.clone(), display(&self.path))
     }
 
     /// Whether the line is whitespace-only.
@@ -375,11 +423,6 @@ fn find_span<'a>(spans: &'a [SymbolSpan], qualname: &str) -> Option<&'a SymbolSp
     spans.iter().find(|span| span.qualname == qualname)
 }
 
-/// `module.path:QualName` — the identity a symbol is reported under.
-fn symbol_id(module: &str, qualname: &str) -> String {
-    format!("{module}:{qualname}")
-}
-
 /// Whether `side` defines this exact symbol. The module must match too, which
 /// is what stops a rename from looking like a modification.
 fn has_symbol(side: Option<&LoadedSide>, module: &str, qualname: &str) -> bool {
@@ -409,7 +452,9 @@ fn display(path: &Path) -> String {
 struct Accumulator {
     changed: Vec<SymbolChange>,
     ignored: Vec<SymbolChange>,
-    module_level: BTreeSet<String>,
+    /// `(module, file)` pairs; the set deduplicates and the order is the
+    /// module's, which is what the report sorts by.
+    module_level: BTreeSet<(String, String)>,
     non_python: BTreeSet<String>,
     test_files: BTreeSet<String>,
     errors: BTreeSet<String>,
@@ -422,7 +467,11 @@ impl Accumulator {
             merge_base: base.merge_base.clone(),
             changed_symbols: sorted(self.changed),
             ignored_symbols: sorted(self.ignored),
-            module_level_changes: self.module_level.into_iter().collect(),
+            module_level_changes: self
+                .module_level
+                .into_iter()
+                .map(|(module, file)| ModuleChange { module, file })
+                .collect(),
             non_python_changes: self.non_python.into_iter().collect(),
             test_files_changed: self.test_files.into_iter().collect(),
             errors: self.errors.into_iter().collect(),
@@ -484,7 +533,7 @@ impl ChangedSymbols {
 
         symbol_section(&mut out, "changed symbols", &self.changed_symbols, width);
         symbol_section(&mut out, "ignored symbols", &self.ignored_symbols, width);
-        list_section(&mut out, "module-level changes", &self.module_level_changes);
+        module_section(&mut out, "module-level changes", &self.module_level_changes);
         list_section(&mut out, "changed test files", &self.test_files_changed);
         list_section(&mut out, "non-Python changes", &self.non_python_changes);
         list_section(&mut out, "parse errors", &self.errors);
@@ -531,15 +580,16 @@ fn symbol_section(out: &mut String, title: &str, entries: &[SymbolChange], width
     }
 }
 
-fn list_section(out: &mut String, title: &str, entries: &[String]) {
+fn module_section(out: &mut String, title: &str, entries: &[ModuleChange]) {
     use std::fmt::Write as _;
 
     if entries.is_empty() {
         return;
     }
+    let width = entries.iter().map(|e| e.module.chars().count()).max().unwrap_or(0);
     let _ = writeln!(out, "\n{title} ({})", entries.len());
     for entry in entries {
-        let _ = writeln!(out, "  {entry}");
+        let _ = writeln!(out, "  {:<width$}  {}", entry.module, entry.file);
     }
 }
 
@@ -621,6 +671,11 @@ mod tests {
     /// `(symbol, change)` pairs, for compact assertions.
     fn pairs(entries: &[SymbolChange]) -> Vec<(String, Change)> {
         entries.iter().map(|e| (e.symbol.clone(), e.change)).collect()
+    }
+
+    /// The module names of a report's module-level changes.
+    fn modules(report: &ChangedSymbols) -> Vec<&str> {
+        report.module_level_changes.iter().map(|m| m.module.as_str()).collect()
     }
 
     const BEFORE: &str = "\
@@ -750,9 +805,13 @@ class Service:
 
         assert!(report.changed_symbols.is_empty(), "a constant belongs to no symbol");
         assert_eq!(
-            report.module_level_changes,
-            vec!["pkg.mod".to_string()],
+            modules(&report),
+            vec!["pkg.mod"],
             "it is reported as a whole-module change instead"
+        );
+        assert_eq!(
+            report.module_level_changes[0].file, "src/pkg/mod.py",
+            "the file travels with the module, so phase 2 can outline it"
         );
     }
 
@@ -768,7 +827,7 @@ class Service:
             pairs(&report.changed_symbols),
             vec![("pkg.mod:keep".to_string(), Change::Modified)]
         );
-        assert_eq!(report.module_level_changes, vec!["pkg.mod".to_string()], "the import too");
+        assert_eq!(modules(&report), vec!["pkg.mod"], "the import too");
     }
 
     #[test]
@@ -811,11 +870,7 @@ class Service:
             pairs(&report.changed_symbols)
         );
         assert_eq!(report.changed_symbols.len(), 4, "all four definitions are reported");
-        assert_eq!(
-            report.module_level_changes,
-            vec!["pkg.gone".to_string()],
-            "its module-level code went too"
-        );
+        assert_eq!(modules(&report), vec!["pkg.gone"], "its module-level code went too");
     }
 
     #[test]
@@ -876,7 +931,8 @@ def normalize_prices(df):
     return df
 ";
         let sources = MapSources::default().with_both("src/pkg/daily.py", body);
-        let config = Config { ignore_decorators: vec!["transformation".to_string()] };
+        let config =
+            Config { ignore_decorators: vec!["transformation".to_string()], ..Config::default() };
         let report = run_with(
             &[modified("src/pkg/daily.py", hunks(&[(3, 1)], &[(3, 1)]))],
             &sources,
@@ -905,7 +961,8 @@ def normalize(df):
     return df
 ";
         let sources = MapSources::default().with_both("src/pkg/daily.py", body);
-        let config = Config { ignore_decorators: vec!["transformation".to_string()] };
+        let config =
+            Config { ignore_decorators: vec!["transformation".to_string()], ..Config::default() };
         let report = run_with(
             &[modified("src/pkg/daily.py", hunks(&[(4, 1)], &[(4, 1)]))],
             &sources,
@@ -932,7 +989,8 @@ def normalize(df):
     return df
 ";
         let sources = MapSources::default().with_both("src/pkg/daily.py", body);
-        let config = Config { ignore_decorators: vec!["transformation".to_string()] };
+        let config =
+            Config { ignore_decorators: vec!["transformation".to_string()], ..Config::default() };
         let report = run_with(
             &[modified("src/pkg/daily.py", hunks(&[(6, 1)], &[(6, 1)]))],
             &sources,
@@ -959,7 +1017,8 @@ def ordinary(x):
     return x
 ";
         let sources = MapSources::default().with_both("src/pkg/daily.py", body);
-        let config = Config { ignore_decorators: vec!["transformation".to_string()] };
+        let config =
+            Config { ignore_decorators: vec!["transformation".to_string()], ..Config::default() };
         let report = run_with(
             &[modified("src/pkg/daily.py", hunks(&[(3, 1), (7, 1)], &[(3, 1), (7, 1)]))],
             &sources,
@@ -982,7 +1041,8 @@ class Row:
     field: int = 0
 ";
         let sources = MapSources::default().with_both("src/pkg/daily.py", body);
-        let config = Config { ignore_decorators: vec!["registry.model".to_string()] };
+        let config =
+            Config { ignore_decorators: vec!["registry.model".to_string()], ..Config::default() };
         let report = run_with(
             &[modified("src/pkg/daily.py", hunks(&[(3, 1)], &[(3, 1)]))],
             &sources,
@@ -1001,8 +1061,8 @@ class Row:
 
         assert_eq!(report.errors, vec!["src/pkg/mod.py".to_string()], "the file is named");
         assert_eq!(
-            report.module_level_changes,
-            vec!["pkg.mod".to_string()],
+            modules(&report),
+            vec!["pkg.mod"],
             "an untrustworthy tree means the whole module is suspect"
         );
         assert!(report.changed_symbols.is_empty(), "no symbol claim is made from a broken parse");
@@ -1029,8 +1089,8 @@ class Row:
             "the file is reported under its new home, as everything else is"
         );
         assert_eq!(
-            report.module_level_changes,
-            vec!["pkg.new".to_string(), "pkg.old".to_string()],
+            modules(&report),
+            vec!["pkg.new", "pkg.old"],
             "both modules are suspect: callers of either have to be revisited"
         );
         assert!(report.changed_symbols.is_empty(), "no symbol claim from a broken parse");
@@ -1136,8 +1196,8 @@ def f(x):
         let sources = MapSources::default().with_both("src/pkg/mod.py", BEFORE);
         let report = run(&[modified("src/pkg/mod.py", hunks(&[(3, 1)], &[(3, 1)]))], &sources);
         assert_eq!(
-            report.module_level_changes,
-            vec!["pkg.mod".to_string()],
+            modules(&report),
+            vec!["pkg.mod"],
             "skipping blanks must not skip real module-level code"
         );
     }
@@ -1159,6 +1219,68 @@ def f(x):
         let mut sorted = symbols.clone();
         sorted.sort_unstable();
         assert_eq!(symbols, sorted, "callers diff this output; ordering must be stable");
+    }
+
+    #[test]
+    fn a_symbol_carries_the_line_of_its_name_not_its_decorator() {
+        let body = "\
+@registry.thing
+def normalize(df):
+    return df
+";
+        let sources = MapSources::default().with_both("src/pkg/daily.py", body);
+        let report = run(&[modified("src/pkg/daily.py", hunks(&[(3, 1)], &[(3, 1)]))], &sources);
+
+        assert_eq!(
+            (report.changed_symbols[0].line, report.changed_symbols[0].column),
+            (2, 5),
+            "phase 2 queries `file:line:col`, which means the `def` line, not the decorator"
+        );
+    }
+
+    #[test]
+    fn the_report_round_trips_through_json() {
+        // `--changed report.json` replays a saved phase-1 run, so the schema has
+        // to deserialise into exactly what produced it.
+        let sources = MapSources::default().with_both("src/pkg/mod.py", BEFORE);
+        let report = run(
+            &[modified("src/pkg/mod.py", hunks(&[(3, 1), (7, 1)], &[(3, 1), (7, 1)]))],
+            &sources,
+        );
+
+        let json = serde_json::to_string(&report).expect("the report serialises");
+        let back: ChangedSymbols = serde_json::from_str(&json).expect("and deserialises");
+        assert_eq!(back, report, "a round trip must not lose or reshape anything");
+    }
+
+    #[test]
+    fn a_report_missing_optional_arrays_still_deserialises() {
+        let back: ChangedSymbols =
+            serde_json::from_str(r#"{"base": "main", "merge_base": "abc123"}"#)
+                .expect("a hand-written --changed file need not spell out empty arrays");
+        assert_eq!(back.base, "main");
+        assert!(back.changed_symbols.is_empty(), "absent arrays default to empty");
+    }
+
+    #[test]
+    fn a_report_without_a_base_is_rejected_rather_than_defaulted() {
+        // The load-bearing case: `{}` used to deserialise into an empty report,
+        // which phase 2 then walked to a confident `selected` verdict selecting
+        // nothing. A CI job piping that into pytest runs no tests and passes.
+        let err = serde_json::from_str::<ChangedSymbols>("{}")
+            .expect_err("a report with no base is not a report");
+        assert!(err.to_string().contains("base"), "the error names what is missing: {err}");
+    }
+
+    #[test]
+    fn an_unknown_key_is_rejected_rather_than_ignored() {
+        // A typo, or a report written by a different gerenuk. Both mean the
+        // arrays we *did* read may be incomplete, so neither can be walked.
+        let err = serde_json::from_str::<ChangedSymbols>(
+            r#"{"base": "main", "merge_base": "abc", "changed_symbol": []}"#,
+        )
+        .expect_err("a misspelled key must not silently read as an empty array");
+        assert!(err.to_string().contains("changed_symbol"), "the error names the key: {err}");
     }
 
     #[test]

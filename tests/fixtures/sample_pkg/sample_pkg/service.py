@@ -2,7 +2,8 @@
 
 Reference states, which the gerenuk fixtures assert on:
 
-* ``describe`` and ``ShelterService.summary`` — used from ``cli.py``.
+* ``describe`` — used from ``cli.py`` and ``pipelines.py``.
+* ``ShelterService.summary`` — used from ``cli.py``.
 * ``ShelterService.seniors`` — used only from ``tests/test_service.py``.
 * ``legacy_export`` — used nowhere.
 """

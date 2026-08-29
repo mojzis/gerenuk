@@ -7,6 +7,24 @@ For `audit`, `gerenuk` does no parsing of its own. It asks `tyf`, which asks
 `tree-sitter-python` and needs nothing but `git`, so it works in a checkout that
 has never had `ty` installed — see [changed-symbols](commands/changed-symbols.md).
 
+[`impacted-tests`](commands/impacted-tests.md) uses both: `git` and
+`tree-sitter` to find the changed symbols, then `tyf` to walk outwards from
+them.
+
+```mermaid
+flowchart LR
+    H[gerenuk impacted-tests] --> I[changed-symbols<br/>git + tree-sitter]
+    I --> J{non-Python<br/>or unparseable?}
+    J -- yes --> K[verdict run_all<br/>no tyf needed]
+    J -- no --> L[BFS frontier]
+    L --> M["tyf refs file:line:col"]
+    M --> N{what owns the line?}
+    N -- import --> P[dropped]
+    N -- definition --> L
+    N -- test --> O[impacted test<br/>+ why-chain]
+```
+
+
 ```mermaid
 flowchart LR
     A[gerenuk audit file.py] --> B[tyf list file.py]
@@ -67,6 +85,8 @@ among the references. Counting it would mean nothing is ever unreferenced, so
 | `modpath` | File path → dotted module path |
 | `config` | `[tool.gerenuk]` in `pyproject.toml` |
 | `changed` | Diff plus sources → the `changed-symbols` report |
+| `closure` | BFS over the reverse reference graph — pure, behind two traits |
+| `impact` | `tyf` and the working tree behind those traits; the impact report |
 | `report` | Human and JSON rendering |
 
 `tyf::Runner::run` and `git::Git::run` are the only functions that spawn a

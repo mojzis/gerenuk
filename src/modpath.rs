@@ -75,6 +75,23 @@ fn fallback_chain(rel: &Path) -> Vec<String> {
     parts
 }
 
+/// `module.path:QualName` — the identity a symbol is reported under.
+///
+/// An id with **no colon is a module**, which is what carries the module-level
+/// edge and the whole-file test selection through `via`, `origin` and
+/// `impacted_tests[].symbol` alike.
+/// See `docs/adr/0008-module-ids-have-no-colon.md`.
+#[must_use]
+pub fn symbol_id(module: &str, qualname: &str) -> String {
+    format!("{module}:{qualname}")
+}
+
+/// The two halves of a [`symbol_id`], or `None` when the id is a module.
+#[must_use]
+pub fn split_symbol_id(id: &str) -> Option<(&str, &str)> {
+    id.split_once(':')
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;

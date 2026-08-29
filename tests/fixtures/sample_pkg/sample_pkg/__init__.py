@@ -1,9 +1,13 @@
 """A small, deliberately uneven package used as a gerenuk test fixture.
 
-The shape matters: `service.py` contains symbols in each state gerenuk cares
-about — used from production, used only from tests, and used nowhere at all.
+The shape matters twice over. `service.py` contains symbols in each state
+`gerenuk audit` cares about — used from production, used only from tests, and
+used nowhere at all. `pipelines.py` and `api.py` then add a two-hop chain out of
+`describe` for `gerenuk impacted-tests` to walk, plus one registry-decorated
+dead end.
+
 Changing the reference counts here will change the integration expectations in
-`tests/audit.rs`.
+`tests/audit.rs` and the assertions in `scripts/impact-smoke.sh`.
 """
 
 from sample_pkg.models import Animal, Shelter

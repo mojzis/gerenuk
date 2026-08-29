@@ -1,0 +1,50 @@
+---
+source: tests/impacted_tests.rs
+expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serialises\")"
+---
+{
+  "base": "main",
+  "errors": [],
+  "ignored_symbols": [
+    {
+      "file": "src/mypkg/jobs.py",
+      "ignored_by": "registry.transformation",
+      "symbol": "mypkg.jobs:nightly"
+    }
+  ],
+  "impacted_tests": [
+    {
+      "file": "tests/test_core.py",
+      "origin": "mypkg.core:target",
+      "symbol": "tests.test_core:test_target",
+      "via": []
+    },
+    {
+      "file": "tests/test_service.py",
+      "origin": "mypkg.core:target",
+      "symbol": "tests.test_service:test_middle",
+      "via": [
+        "mypkg.service:middle"
+      ]
+    },
+    {
+      "file": "tests/test_settings.py",
+      "origin": "mypkg.core:target",
+      "symbol": null,
+      "via": [
+        "mypkg.settings"
+      ]
+    }
+  ],
+  "merge_base": "<sha>",
+  "reason": null,
+  "stats": {
+    "duration_ms": 0,
+    "max_depth_reached": 1,
+    "seeds": 1,
+    "tyf_calls": 2,
+    "visited": 3
+  },
+  "test_files_changed": [],
+  "verdict": "selected"
+}

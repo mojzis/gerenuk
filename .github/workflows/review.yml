@@ -7,6 +7,8 @@ on:
       - "src/**"
       - "tests/**"
       - "docs/**"
+      - "scripts/**"
+      - "Makefile"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -17,6 +19,8 @@ on:
       - "src/**"
       - "tests/**"
       - "docs/**"
+      - "scripts/**"
+      - "Makefile"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -72,6 +76,23 @@ jobs:
       - name: Run the fixture package's pytest suite
         working-directory: tests/fixtures/sample_pkg
         run: uv run --with pytest --with hatchling python -m pytest -q
+
+  impact:
+    name: impacted-tests against real tyf
+    runs-on: ubuntu-latest
+    # Advisory: this is the only job that drives a real `ty` language server, so
+    # it is the only place upstream drift in tyf's wire format shows up. It must
+    # not block a PR that did not cause the drift.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: astral-sh/setup-uv@v7
+      - name: Install ty and ty-find
+        run: uv tool install ty-find --with ty
+      - run: cargo build
+      - run: make test-impact
 
   docs:
     name: Docs are in sync

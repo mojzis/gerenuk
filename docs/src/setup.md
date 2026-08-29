@@ -1,22 +1,35 @@
 # Setup
 
-## Prerequisites
-
-`gerenuk` shells out to `tyf`, which in turn drives `ty`'s language server.
-
-```sh
-uv add --dev ty ty-find
-```
-
-If `ty` is not on `PATH`, `tyf` falls back to `uvx ty`, so having `uv`
-available is enough.
-
 ## Install
 
 ```sh
-uv add --dev gerenuk       # from PyPI (a maturin-built wheel)
-uvx gerenuk audit pkg/x.py # one-off, no install
+uv add --dev "gerenuk[ty]"        # from PyPI (a maturin-built wheel)
+uvx --from "gerenuk[ty]" gerenuk audit pkg/x.py   # one-off, no install
 ```
+
+From a `pip` world, `pip install "gerenuk[ty]"`.
+
+## What gets installed, and why
+
+`gerenuk` shells out to `tyf` (from
+[ty-find](https://github.com/mojzis/ty-find)), which in turn drives
+[`ty`](https://github.com/astral-sh/ty)'s language server.
+
+| Package | How it arrives |
+|---|---|
+| `ty-find` | a **dependency** — `tyf` is what `gerenuk` drives, so it is never optional |
+| `ty` | the **`[ty]` extra** — recommended, but see below |
+
+`ty` is an extra rather than a dependency deliberately. It is a pre-1.0 type
+checker that projects tend to pin for their own use, and a hard requirement in
+`gerenuk` would compete with that pin for no benefit: when `tyf` finds no `ty`
+on `PATH` it falls back to `uvx ty`. So `uv add --dev gerenuk` works on its own
+if `uv` is around — the first call just pays a download.
+
+Install the extra when you want the version pinned in your lockfile, or when
+the machine running `gerenuk` has no network.
+
+`changed-symbols` needs none of this: it uses `git` and nothing else.
 
 From source:
 
@@ -60,9 +73,14 @@ Run it before deleting Python code, and after a refactor.
 - `gerenuk audit pkg/module.py` — flag symbols nothing references, and symbols
   only tests reach
 - `gerenuk audit --format json pkg/*.py` — same, machine-readable
+- `gerenuk changed-symbols` — which Python symbols the working tree changed
+- `gerenuk impacted-tests` — which tests those changed symbols can reach
 - `gerenuk doctor` — check that `tyf` and the workspace resolve
 
 Exit codes: `0` clean, `1` findings reported, `2` the run could not complete.
+`changed-symbols` and `impacted-tests` never return `1`. When `impacted-tests`
+cannot trust its answer it reports `"verdict": "run_all"` with a `reason` and
+still exits `0` — read the verdict, not the exit code.
 
 Findings are signals, not verdicts: dynamic dispatch, plugin registries, and
 `__all__` re-exports can hide a real usage. Confirm with `tyf refs <symbol>`

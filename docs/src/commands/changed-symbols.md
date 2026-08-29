@@ -8,8 +8,8 @@ gerenuk changed-symbols [--base <REF>]
 
 Unlike [`audit`](audit.md), this command needs only `git` — no `tyf`, no `ty`,
 no Python environment. It is the first stage of impact-based test selection:
-later phases walk the reference graph from these symbols out to the tests that
-reach them.
+[`impacted-tests`](impacted-tests.md) walks the reference graph from these
+symbols out to the tests that reach them.
 
 `git` is taken from `PATH` unless `GERENUK_GIT` points at a specific binary.
 
@@ -27,7 +27,7 @@ ignored symbols (1)
   modified  function  mypkg.daily:normalize_prices         src/mypkg/daily.py  (@transformation)
 
 module-level changes (1)
-  mypkg.pipelines.enrich
+  mypkg.pipelines.enrich  src/mypkg/pipelines/enrich.py
 
 non-Python changes (1)
   schema.sql
@@ -44,6 +44,8 @@ non-Python changes (1)
       "symbol": "mypkg.pipelines.enrich:Enricher.run",
       "file": "src/mypkg/pipelines/enrich.py",
       "kind": "method",
+      "line": 42,
+      "column": 9,
       "change": "modified"
     }
   ],
@@ -52,11 +54,18 @@ non-Python changes (1)
       "symbol": "mypkg.daily:normalize_prices",
       "file": "src/mypkg/daily.py",
       "kind": "function",
+      "line": 17,
+      "column": 5,
       "change": "modified",
       "ignored_by": "transformation"
     }
   ],
-  "module_level_changes": ["mypkg.pipelines.enrich"],
+  "module_level_changes": [
+    {
+      "module": "mypkg.pipelines.enrich",
+      "file": "src/mypkg/pipelines/enrich.py"
+    }
+  ],
   "non_python_changes": ["schema.sql"],
   "test_files_changed": [],
   "errors": []
@@ -64,8 +73,16 @@ non-Python changes (1)
 ```
 
 `kind` is `function`, `method` or `class`; `change` is `added`, `modified` or
-`deleted`. Every array is sorted, so two runs on the same tree produce
-byte-identical output.
+`deleted`; `line` and `column` are where the definition's *name* starts, not its
+first decorator, and both are 1-based. Every array is sorted, so two runs on the
+same tree produce byte-identical output.
+
+The schema is the interface between the phases:
+`impacted-tests --changed report.json` replays a saved report instead of
+diffing the working tree, which is why each entry carries enough to be walked
+from — a definition's exact position, and a file for every module-level change.
+Every field above is required: a saved report is parsed strictly, so one that
+omits `column` is rejected rather than half-read.
 
 ## What gets diffed
 
@@ -124,13 +141,18 @@ the new path `added`, so phase 2 still revisits the callers of the old name.
 
 ## Files that are not analysed
 
+Checked in this order, so the first row that matches wins:
+
 | Kind | Where it goes |
 |---|---|
-| Test files — a `tests/`/`test/` directory, or `test_*.py` / `*_test.py` | `test_files_changed` |
 | Anything that is not `.py`, including `.pyi` stubs and binaries | `non_python_changes` |
+| Test files — a `tests`/`test` directory, or `test_*.py` / `*_test.py` | `test_files_changed` |
 | Files that do not parse | `errors`, and the module is reported as module-level |
 
-A changed test file needs no symbol analysis: it will select itself later.
+The order matters for the phases downstream: a non-Python file *under* `tests/`
+— a fixture `.json`, say — is a non-Python change, which makes
+`impacted-tests` answer `run_all`. A changed test file needs no symbol analysis:
+it will select itself later.
 
 ## Ignoring registry decorators
 

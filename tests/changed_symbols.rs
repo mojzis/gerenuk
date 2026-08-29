@@ -51,6 +51,16 @@ fn src_layout_repo() -> TestRepo {
     repo
 }
 
+/// The module names of the report's `module_level_changes`.
+fn modules(report: &Value) -> Vec<String> {
+    report["module_level_changes"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`module_level_changes` should be an array, got {report}"))
+        .iter()
+        .map(|entry| entry["module"].as_str().expect("each entry names a module").to_string())
+        .collect()
+}
+
 /// `(symbol, change)` pairs from one of the report's symbol arrays.
 fn pairs(report: &Value, key: &str) -> Vec<(String, String)> {
     report[key]
@@ -147,11 +157,7 @@ fn deleting_a_whole_file_deletes_every_symbol_in_it() {
         ],
         "the old blob is parsed so the departed symbols can still be named"
     );
-    assert_eq!(
-        strings(&report, "module_level_changes"),
-        vec!["mypkg.service".to_string()],
-        "its module-level code went with it"
-    );
+    assert_eq!(modules(&report), vec!["mypkg.service".to_string()], "its module-level code too");
 }
 
 #[test]
@@ -181,9 +187,13 @@ fn a_module_level_edit_reports_the_module_rather_than_a_symbol() {
     let report = repo.changed_symbols(&[]);
     assert!(pairs(&report, "changed_symbols").is_empty(), "a constant belongs to no symbol");
     assert_eq!(
-        strings(&report, "module_level_changes"),
+        modules(&report),
         vec!["mypkg.service".to_string()],
         "phase 2 treats this as `the whole module changed`"
+    );
+    assert_eq!(
+        report["module_level_changes"][0]["file"], "src/mypkg/service.py",
+        "and it carries the file, because phase 2 has to outline it"
     );
 }
 
@@ -227,7 +237,7 @@ fn a_syntax_error_is_reported_instead_of_crashing() {
         "the file is named so the user can see why it degraded"
     );
     assert_eq!(
-        strings(&report, "module_level_changes"),
+        modules(&report),
         vec!["mypkg.service".to_string()],
         "an unparseable file is treated as a whole-module change"
     );
