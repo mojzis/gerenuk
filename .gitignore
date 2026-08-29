@@ -76,3 +76,6 @@ htmlcov/
 
 # Fixture package virtualenvs
 tests/fixtures/**/.venv/
+
+# mdBook build output (docs/book.toml build-dir)
+docs/book/

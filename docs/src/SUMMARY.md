@@ -5,6 +5,7 @@
 - [Setup](setup.md)
 - [Commands](commands/overview.md)
   - [audit](commands/audit.md)
+  - [changed-symbols](commands/changed-symbols.md)
   - [doctor](commands/doctor.md)
 - [How it works](how-it-works.md)
 - [Troubleshooting](troubleshooting.md)

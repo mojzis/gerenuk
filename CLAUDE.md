@@ -10,12 +10,17 @@ code in this repository.
 project: a Rust binary packaged as a Python wheel via maturin.
 
 It reports two things per file: symbols nothing references, and symbols only
-tests reach. Architecture details: `docs/dev/ARCHITECTURE.md`.
+tests reach. A second command, `changed-symbols`, maps the working tree's git
+diff to the Python symbols it changed — the first stage of impact-based pytest
+selection, and the one part of the crate that needs `git` rather than `tyf`.
+Architecture details: `docs/dev/ARCHITECTURE.md`.
 
 ## Prerequisites
 
-- **`tyf`** on `PATH` for real runs (`uv add --dev ty ty-find`). Not needed for
-  the test suite — the tests stub it.
+- **`tyf`** on `PATH` for `audit`/`doctor` (`uv add --dev ty ty-find`). Not
+  needed for the test suite — the tests stub it.
+- **`git`** on `PATH` for `changed-symbols` and its tests, or `GERENUK_GIT`
+  pointing at it. That is all it needs.
 - **`uv`** for the fixture package's pytest suite.
 
 ## Common Commands
@@ -55,18 +60,32 @@ When a test fails during implementation:
 
 ## Key Invariants
 
-- **`tyf::Runner::run` is the only function that spawns a process.** Everything
-  downstream takes parsed data. Keep it that way — it is what makes `analyze`
-  and `report` testable without `tyf` or `ty` installed.
+- **`tyf::Runner::run` and `git::Git::run` are the only functions that spawn a
+  process.** Everything downstream takes parsed data. Keep it that way — it is
+  what makes `analyze`, `changed` and `report` testable with no `tyf`, no `ty`,
+  no `git` and no Python. Adding a third seam needs a very good reason.
+- **`changed-symbols` must never construct a `tyf::Runner`.** Discovery happens
+  inside the `Audit` and `Doctor` arms of `Cli::run`, not before the match. A
+  test in `tests/changed_symbols.rs` runs with an empty `PATH` to enforce this.
+- **`changed::Sources` is the seam the classification is tested through.** New
+  inputs go behind that trait, not into `changed::analyze` directly, or the unit
+  tests stop being able to run without a repository.
 - **`main.rs` stays thin.** Argument parsing, tracing setup, exit-code mapping.
   Command bodies belong in `cli.rs`.
 - **Exit codes are part of the contract.** `0` clean, `1` findings, `2` the run
-  could not complete. Do not collapse `1` and `2`.
+  could not complete. Do not collapse `1` and `2`. `changed-symbols` is an
+  inventory rather than a verdict, so it returns `0` or `2` and never `1`.
 - **The fixture package and the canned payloads must agree.** Changing the call
   graph in `tests/fixtures/sample_pkg` means updating both its pytest suite and
   the stub payloads in `tests/audit.rs`.
 - **`clippy::unwrap_used` / `expect_used` are denied outside tests.** Use
   `anyhow::Context` on every `?` that crosses an I/O or parsing boundary.
+- **A symbol's `added`/`modified`/`deleted` verdict comes from whether it exists
+  on each side of the diff, not from which side the hunk touched.** Deleting
+  lines from a function that still exists is a modification; its callers were
+  never orphaned. Renames are deliberately *not* paired — a moved module is a
+  new module, so the old path's symbols are `deleted` and the new path's
+  `added`.
 - **Do not trust `tyf`'s production/test split.** Its heuristic reads the whole
   absolute path, so a project under a `tests/` directory has every reference
   filed as a test. `analyze::split_refs` re-derives the buckets from paths

@@ -30,6 +30,94 @@ pub fn gerenuk(cwd: &Path, tyf: &Path) -> Command {
     cmd
 }
 
+/// A `gerenuk` command with no `tyf` configured at all, run from `cwd`.
+///
+/// `changed-symbols` must never reach for `tyf`, so its tests deliberately
+/// leave the environment variable unset.
+pub fn gerenuk_bare(cwd: &Path) -> Command {
+    let mut cmd = Command::cargo_bin("gerenuk").expect("gerenuk binary should be built for tests");
+    cmd.current_dir(cwd).env_remove("GERENUK_TYF");
+    cmd
+}
+
+/// A throwaway git repository, isolated from the developer's git configuration.
+///
+/// Signing keys, hooks and a different `init.defaultBranch` would all make
+/// these tests fail on someone else's machine, so the global and system config
+/// files are pointed at `/dev/null`.
+pub struct TestRepo {
+    dir: TempDir,
+}
+
+impl TestRepo {
+    /// An initialised repository on branch `main`, with no commits yet.
+    pub fn new() -> Self {
+        let repo = Self { dir: TempDir::new().expect("temp dir") };
+        repo.git(&["init", "--initial-branch=main"]);
+        repo.git(&["config", "user.email", "test@example.com"]);
+        repo.git(&["config", "user.name", "Test"]);
+        repo
+    }
+
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+
+    pub fn git(&self, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(self.path())
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .args(args)
+            .output()
+            .expect("git should be on PATH for the test suite");
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    pub fn write(&self, rel: &str, body: &str) {
+        let path = self.path().join(rel);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create parent dir");
+        }
+        std::fs::write(path, body).expect("write file");
+    }
+
+    pub fn remove(&self, rel: &str) {
+        std::fs::remove_file(self.path().join(rel)).expect("remove file");
+    }
+
+    pub fn commit(&self, message: &str) {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-m", message]);
+    }
+
+    /// Run `gerenuk changed-symbols --format json` and parse the result.
+    pub fn changed_symbols(&self, extra: &[&str]) -> serde_json::Value {
+        let output = gerenuk_bare(self.path())
+            .args(["--format", "json", "changed-symbols"])
+            .args(extra)
+            .output()
+            .expect("gerenuk should run");
+        assert!(
+            output.status.success(),
+            "changed-symbols failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("the output should be valid JSON")
+    }
+}
+
+impl Default for TestRepo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Write an executable stub that stands in for `tyf`.
 ///
 /// The script ignores `--format json` (gerenuk always passes it) and dispatches

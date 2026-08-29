@@ -1,7 +1,11 @@
 # How it works
 
-`gerenuk` does no parsing of its own. It asks `tyf`, which asks `ty`'s language
-server, which does the real name resolution.
+For `audit`, `gerenuk` does no parsing of its own. It asks `tyf`, which asks
+`ty`'s language server, which does the real name resolution.
+
+`changed-symbols` is the exception. It parses Python itself with
+`tree-sitter-python` and needs nothing but `git`, so it works in a checkout that
+has never had `ty` installed — see [changed-symbols](commands/changed-symbols.md).
 
 ```mermaid
 flowchart LR
@@ -53,16 +57,23 @@ among the references. Counting it would mean nothing is ever unreferenced, so
 | Module | Responsibility |
 |---|---|
 | `cli` | Argument parsing and command bodies |
-| `tyf` | Spawning `tyf`, decoding its JSON — the only impure module |
+| `tyf` | Spawning `tyf`, decoding its JSON — one of two impure modules |
+| `git` | Spawning `git` — the other one |
 | `model` | Wire types for what `tyf` emits |
 | `workspace` | Project-root detection, test-path heuristic |
-| `analyze` | The rules — pure, given parsed data |
+| `analyze` | The `audit` rules — pure, given parsed data |
+| `diff` | Unified-diff text → per-file line ranges |
+| `pysource` | Tree-sitter symbol extraction: which symbol owns a line |
+| `modpath` | File path → dotted module path |
+| `config` | `[tool.gerenuk]` in `pyproject.toml` |
+| `changed` | Diff plus sources → the `changed-symbols` report |
 | `report` | Human and JSON rendering |
 
-Only `tyf::Runner::run` touches a subprocess. Everything downstream takes
-already-parsed values, which is why the analysis and rendering tests need
-neither `tyf` nor `ty` installed — the integration tests stub `tyf` with a shell
-script and set `GERENUK_TYF`.
+`tyf::Runner::run` and `git::Git::run` are the only functions that spawn a
+process. Everything downstream takes already-parsed values, which is why the
+analysis and rendering tests need no `tyf`, no `ty`, no `git` and no Python:
+the integration tests stub `tyf` with a shell script and set `GERENUK_TYF`, and
+`changed`'s unit tests substitute a `HashMap` for the `changed::Sources` trait.
 
 ## Why dotted names
 

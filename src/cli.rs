@@ -11,6 +11,12 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 use crate::analyze::{audit, auditable_symbols, outline_size, SymbolUsage};
+use crate::changed::{
+    analyze as analyze_changes, untracked_change, ChangedSymbols, FileChange, GitSources,
+};
+use crate::config::Config;
+use crate::diff;
+use crate::git::Git;
 use crate::model::relative_display;
 use crate::report::{Format, Report};
 use crate::tyf::Runner;
@@ -24,7 +30,10 @@ reports what it finds: symbols nothing references, and symbols only your tests \
 reach.
 
 It shells out to `tyf --format json`, so `tyf` must be on PATH — install it \
-with `uv add --dev ty-find`, or point GERENUK_TYF at the binary.";
+with `uv add --dev ty-find`, or point GERENUK_TYF at the binary.
+
+`changed-symbols` needs none of that: it uses `git` alone, taken from PATH \
+unless GERENUK_GIT names a binary.";
 
 const AFTER_LONG_HELP: &str = "\
 Getting started:
@@ -32,6 +41,7 @@ Getting started:
   1. `gerenuk doctor`             — check that tyf and the workspace resolve.
   2. `gerenuk audit pkg/*.py`     — report unreferenced and test-only symbols.
   3. `gerenuk audit --format json` — same, as JSON for scripting.
+  4. `gerenuk changed-symbols`    — which symbols the working tree changed.
 
 Exit codes:
 
@@ -73,6 +83,15 @@ pub enum Command {
         files: Vec<PathBuf>,
     },
 
+    /// Report the Python symbols the working tree changed against a base ref.
+    ///
+    /// Needs only `git` — no `tyf`, no `ty`, no Python environment.
+    ChangedSymbols {
+        /// Base ref to diff against. Default: origin/main, then main, then master.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+    },
+
     /// Check that `tyf` and the workspace resolve, without running an analysis.
     Doctor,
 }
@@ -96,21 +115,52 @@ impl Cli {
             }
         };
 
-        let runner = Runner::discover(&root)?;
-
+        // `tyf` is discovered per command, not up front: `changed-symbols`
+        // must work in a checkout that has never had `ty` installed.
         match self.command {
             Command::Doctor => {
+                let runner = Runner::discover(&root)?;
                 writeln!(out, "workspace: {}", root.display())?;
                 writeln!(out, "tyf:       {}", runner.binary().display())?;
                 Ok(Outcome::Clean)
             }
             Command::Audit { files } => {
+                let runner = Runner::discover(&root)?;
                 let report = run_audit(&runner, &root, &files)?;
                 write!(out, "{}", report.render(self.format, &root)?)?;
                 Ok(if report.is_clean() { Outcome::Clean } else { Outcome::FindingsReported })
             }
+            Command::ChangedSymbols { base } => {
+                let report = run_changed_symbols(&root, base.as_deref())?;
+                write!(out, "{}", report.render(self.format)?)?;
+                // Changed symbols are an inventory, not a verdict: a non-empty
+                // report is the normal case, so it must not fail the hook.
+                Ok(Outcome::Clean)
+            }
         }
     }
+}
+
+/// Diff the working tree against a base ref and map the result to symbols.
+///
+/// Everything is resolved against the *git* top level rather than `workspace`,
+/// because diff paths are repository-relative — and because the pitch puts
+/// `[tool.gerenuk]` in the repo-root `pyproject.toml`.
+pub fn run_changed_symbols(workspace: &Path, base: Option<&str>) -> Result<ChangedSymbols> {
+    let git = Git::discover(workspace)?;
+    let root = git.top_level()?;
+    let git = git.rebind(&root);
+
+    let base = git.resolve_base(base)?;
+    let config = Config::load(&root)?;
+
+    let raw = git.diff(&base.merge_base)?;
+    let mut changes: Vec<FileChange> =
+        diff::parse(&raw).into_iter().map(FileChange::from).collect();
+    changes.extend(git.untracked()?.into_iter().map(untracked_change));
+
+    let sources = GitSources::new(&git, &root, &base.merge_base);
+    analyze_changes(&base, &changes, &root, &sources, &config)
 }
 
 /// Outline each file, ask `tyf refs` about every auditable symbol, then apply
@@ -175,7 +225,7 @@ mod tests {
                     "both files parse"
                 );
             }
-            other @ Command::Doctor => panic!("expected an audit command, got {other:?}"),
+            other => panic!("expected an audit command, got {other:?}"),
         }
     }
 
@@ -202,6 +252,39 @@ mod tests {
             clap::error::ErrorKind::MissingRequiredArgument,
             "clap should report the missing FILE argument"
         );
+    }
+
+    #[test]
+    fn changed_symbols_defaults_to_no_explicit_base() {
+        let cli = Cli::try_parse_from(["gerenuk", "changed-symbols"])
+            .expect("the subcommand takes no required arguments");
+        match cli.command {
+            Command::ChangedSymbols { base } => {
+                assert_eq!(base, None, "no --base means the default chain is tried");
+            }
+            other => panic!("expected changed-symbols, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn changed_symbols_accepts_an_explicit_base() {
+        let cli = Cli::try_parse_from([
+            "gerenuk",
+            "changed-symbols",
+            "--base",
+            "upstream/release",
+            "--format",
+            "json",
+        ])
+        .expect("valid invocation should parse");
+
+        assert_eq!(cli.format, Format::Json, "--format still applies");
+        match cli.command {
+            Command::ChangedSymbols { base } => {
+                assert_eq!(base.as_deref(), Some("upstream/release"), "the ref is passed through");
+            }
+            other => panic!("expected changed-symbols, got {other:?}"),
+        }
     }
 
     #[test]

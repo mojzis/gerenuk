@@ -1,0 +1,31 @@
+---
+source: tests/changed_symbols.rs
+expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serialises\")"
+---
+{
+  "base": "main",
+  "changed_symbols": [
+    {
+      "change": "added",
+      "file": "src/mypkg/fresh.py",
+      "kind": "function",
+      "symbol": "mypkg.fresh:brand_new"
+    },
+    {
+      "change": "modified",
+      "file": "src/mypkg/service.py",
+      "kind": "method",
+      "symbol": "mypkg.service:Shelter.summary"
+    }
+  ],
+  "errors": [],
+  "ignored_symbols": [],
+  "merge_base": "<sha>",
+  "module_level_changes": [],
+  "non_python_changes": [
+    "data/schema.sql"
+  ],
+  "test_files_changed": [
+    "tests/test_service.py"
+  ]
+}

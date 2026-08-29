@@ -61,6 +61,31 @@ Only callable symbols are audited; `_private` and dunder names are skipped.
 The split between `1` and `2` is what makes it usable in CI: a failing check and
 a broken setup are different problems.
 
+### `changed-symbols`
+
+Maps the working tree's diff to the Python symbols it changed — the first stage
+of impact-based test selection. It needs only `git`; no `tyf`, no `ty`, no
+Python environment.
+
+```
+$ gerenuk changed-symbols
+base main (merge-base 5ddda1f)
+
+changed symbols (2)
+  modified  method    mypkg.pipelines.enrich:Enricher.run  src/mypkg/pipelines/enrich.py
+  added     function  mypkg.utils:parse_date               src/mypkg/utils.py
+
+module-level changes (1)
+  mypkg.pipelines.enrich
+```
+
+`--base` defaults to the first of `origin/main`, `main`, `master` that exists;
+the diff runs from `merge-base(HEAD, base)` to the working tree, staged and
+unstaged alike. `--format json` emits the same data for scripting. Registry
+decorators can be filtered out via `[tool.gerenuk] ignore-decorators` in
+`pyproject.toml`. See the
+[documentation](https://mojzis.github.io/gerenuk/commands/changed-symbols.html).
+
 ### Caveat
 
 `gerenuk` reports *static* references. Dynamic dispatch, plugin registries,

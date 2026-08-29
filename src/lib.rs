@@ -13,8 +13,14 @@
 //! layers are unit-testable without `tyf` (or `ty`) installed.
 
 pub mod analyze;
+pub mod changed;
 pub mod cli;
+pub mod config;
+pub mod diff;
+pub mod git;
 pub mod model;
+pub mod modpath;
+pub mod pysource;
 pub mod report;
 pub mod tyf;
 pub mod workspace;

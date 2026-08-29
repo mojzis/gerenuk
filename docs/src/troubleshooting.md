@@ -10,6 +10,14 @@ uv add --dev ty-find
 GERENUK_TYF=/path/to/tyf gerenuk doctor
 ```
 
+## `` `git` not found on PATH ``
+
+`changed-symbols` looks for `git` on `PATH` unless `GERENUK_GIT` is set.
+
+```sh
+GERENUK_GIT=/path/to/git gerenuk changed-symbols
+```
+
 ## `no Python project root above ...`
 
 Nothing above the current directory holds a `pyproject.toml`, `setup.py`,
