@@ -1,0 +1,44 @@
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "gerenuk"
+description = "Symbol-level Python code intelligence, powered by ty-find"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [
+    {name = "mojzis", email = "mojzisek@gmail.com"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+keywords = ["python", "lsp", "symbols", "static-analysis", "rust"]
+dynamic = ["version"]
+dependencies = [
+    "ty-find>=0.4",
+]
+
+[project.urls]
+homepage = "https://github.com/mojzis/gerenuk"
+repository = "https://github.com/mojzis/gerenuk"
+documentation = "https://mojzis.github.io/gerenuk"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.maturin]
+bindings = "bin"
+strip = true

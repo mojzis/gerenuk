@@ -1,0 +1,23 @@
+[book]
+title = "gerenuk"
+description = "Symbol-level Python code intelligence, powered by ty-find"
+authors = ["mojzis"]
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book/html"
+
+[output.html]
+site-url = "/gerenuk/"
+git-repository-url = "https://github.com/mojzis/gerenuk"
+edit-url-template = "https://github.com/mojzis/gerenuk/edit/main/docs/{path}"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+additional-css = ["custom.css"]
+additional-js = ["mermaid.min.js", "mermaid-init.js", "version.js"]
+
+[preprocessor]
+
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
