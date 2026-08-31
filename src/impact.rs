@@ -24,11 +24,19 @@ use crate::config::Config;
 use crate::modpath::module_path;
 use crate::pysource::{self, imports_module, word_lines};
 use crate::report::{list_section, Format};
+use crate::select;
 use crate::tyf::Runner;
 use crate::workspace::is_test_path;
 
 /// The whole answer for one `gerenuk impacted-tests` run.
+///
+/// Deserialising is what `run --impact report.json` replays, and it is strict
+/// for the reason `ChangedSymbols` is: every field is required and unknown keys
+/// are rejected, so a truncated file or a report from a different gerenuk fails
+/// loudly instead of deserialising into a confident selection of nothing.
+/// See `docs/adr/0010-a-replayed-report-is-parsed-strictly.md`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactReport {
     pub verdict: Verdict,
     /// Why the verdict is `run_all`; `null` when it is `selected`.
@@ -277,15 +285,20 @@ fn relative_to(path: &Path, root: &Path) -> PathBuf {
 /// with it, and the verdict would still say `selected`.
 struct Cached {
     source: String,
-    module: OnceCell<Option<pysource::Module>>,
+    module: OnceCell<Option<Rc<pysource::Module>>>,
 }
 
 impl Cached {
     /// The file's symbol table, parsed on first use.
-    fn module(&self) -> Option<&pysource::Module> {
+    ///
+    /// Shared rather than borrowed because [`select::Tree`] hands whole modules
+    /// to [`crate::fixtures`], which outlives any borrow of the cache.
+    fn module(&self) -> Option<Rc<pysource::Module>> {
         self.module
-            .get_or_init(|| pysource::parse(&self.source).ok().filter(|module| !module.has_error))
-            .as_ref()
+            .get_or_init(|| {
+                pysource::parse(&self.source).ok().filter(|module| !module.has_error).map(Rc::new)
+            })
+            .clone()
     }
 }
 
@@ -346,7 +359,7 @@ impl Index for FsIndex<'_> {
     fn classify(&self, file: &Path, line: u32) -> Result<Site> {
         let Some(cached) = self.load(file)? else { return Ok(Site::Unknown) };
         let Some(module) = cached.module() else { return Ok(Site::Unknown) };
-        Ok(classify_in(module, line))
+        Ok(classify_in(&module, line))
     }
 
     fn module_path(&self, file: &Path) -> Option<String> {
@@ -384,6 +397,32 @@ impl Index for FsIndex<'_> {
             }
         }
         Ok(importers)
+    }
+}
+
+/// The same cache, read the way [`crate::select`] needs it: whole modules
+/// rather than one line's classification.
+///
+/// An I/O failure comes back as "not there" rather than as an error. By the
+/// time a selection is being built the walk has already succeeded, and a file
+/// that vanished between the two is a file with no tests to run — degrading it
+/// to the coarser fallbacks is what the rest of the module already does with an
+/// unparseable file.
+impl select::Tree for FsIndex<'_> {
+    fn test_files(&self) -> Vec<PathBuf> {
+        self.files.iter().filter(|file| self.is_test(file)).cloned().collect()
+    }
+
+    fn module(&self, file: &Path) -> Option<Rc<pysource::Module>> {
+        self.load(file).ok().flatten().and_then(|cached| cached.module())
+    }
+
+    fn exists(&self, file: &Path) -> bool {
+        self.load(file).ok().flatten().is_some()
+    }
+
+    fn module_path(&self, file: &Path) -> Option<String> {
+        module_path(self.root, file)
     }
 }
 

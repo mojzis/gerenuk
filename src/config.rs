@@ -14,6 +14,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::pysource::suffix_matches;
+
 /// Everything gerenuk reads out of `pyproject.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default, rename_all = "kebab-case")]
@@ -31,6 +33,13 @@ pub struct Config {
     pub max_symbols: Option<usize>,
     /// Wall-clock budget for the whole walk, in milliseconds.
     pub budget_ms: Option<u64>,
+
+    /// How `gerenuk run` invokes pytest.
+    ///
+    /// An argv rather than a string, because the common real-world value is a
+    /// multi-word runner: `["uv", "run", "pytest"]`. Empty means "work it out",
+    /// which is `GERENUK_PYTEST` and then `pytest` on `PATH`.
+    pub pytest_command: Vec<String>,
 }
 
 /// Wrapper types mirroring `pyproject.toml`'s nesting: `[tool.gerenuk]`.
@@ -74,17 +83,9 @@ impl Config {
     pub fn matching_decorator(&self, decorator: &str) -> Option<&str> {
         self.ignore_decorators
             .iter()
-            .find(|entry| decorator_matches(decorator, entry))
+            .find(|entry| suffix_matches(decorator, entry))
             .map(String::as_str)
     }
-}
-
-/// True when the dotted decorator name ends with `entry` on a component boundary.
-fn decorator_matches(decorator: &str, entry: &str) -> bool {
-    if decorator == entry {
-        return true;
-    }
-    decorator.strip_suffix(entry).is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 #[cfg(test)]

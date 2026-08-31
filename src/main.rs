@@ -27,6 +27,9 @@ fn main() -> ExitCode {
     match result {
         Ok(Outcome::Clean) => ExitCode::SUCCESS,
         Ok(Outcome::FindingsReported) => ExitCode::FAILURE,
+        // pytest's own code, propagated verbatim — that is the hook contract.
+        // Only reachable where the process could not be replaced outright.
+        Ok(Outcome::Code(code)) => ExitCode::from(code),
         Err(err) => {
             eprintln!("gerenuk: {err:#}");
             ExitCode::from(EXIT_ERROR)

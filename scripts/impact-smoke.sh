@@ -25,6 +25,11 @@ fi
 gerenuk="$repo_root/target/debug/gerenuk"
 [[ -x "$gerenuk" ]] || { echo "build gerenuk first: cargo build"; exit 1; }
 
+# The flip side of the stable path: the daemon holds an index of the previous
+# run's copy, so a changed fixture comes back with stale line numbers — which
+# looks exactly like gerenuk mapping the wrong symbol.
+tyf daemon restart > /dev/null 2>&1 || true
+
 work="$repo_root/target/impact-smoke"
 rm -rf "$work"
 mkdir -p "$work"

@@ -28,8 +28,10 @@ Two things fall out of that:
 
 Turned around, the same reference graph answers the opposite question — *which
 tests could this change break?* — which is what
-[`changed-symbols`](commands/changed-symbols.md) and
-[`impacted-tests`](commands/impacted-tests.md) are for.
+[`changed-symbols`](commands/changed-symbols.md),
+[`impacted-tests`](commands/impacted-tests.md) and
+[`run`](commands/run.md) are for: the last one turns the answer into a pytest
+invocation and becomes pytest.
 
 ## What it is not
 

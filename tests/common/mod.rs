@@ -242,6 +242,34 @@ pub fn failing_tyf(dir: &TempDir, message: &str) -> PathBuf {
     path
 }
 
+/// Write an executable stub that stands in for pytest.
+///
+/// It records the argv it was handed — one element per line, argv[0] excluded —
+/// and exits with `code`. The recording file is the assertion: a run that
+/// selects nothing must never create it, because it must never spawn anything.
+///
+/// `GERENUK_PYTEST` takes a single binary, the same shape as `GERENUK_TYF`, so
+/// the whole stub has to fit in one script.
+pub fn fake_pytest(dir: &TempDir, record: &Path, code: u8) -> PathBuf {
+    let path = dir.path().join("fake-pytest");
+    std::fs::write(
+        &path,
+        format!(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{}'\nexit {code}\n",
+            record.display()
+        ),
+    )
+    .expect("write fake pytest script");
+    make_executable(&path);
+    path
+}
+
+/// The argv the pytest stub recorded, or `None` when it never ran.
+pub fn recorded_argv(record: &Path) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(record).ok()?;
+    Some(text.lines().map(ToString::to_string).collect())
+}
+
 fn make_executable(path: &Path) {
     #[cfg(unix)]
     {

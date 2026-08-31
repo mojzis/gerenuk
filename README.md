@@ -45,6 +45,7 @@ gerenuk audit --format json pkg/*.py   # machine-readable
 gerenuk audit --workspace ../other pkg/module.py
 gerenuk changed-symbols                # what the working tree changed
 gerenuk impacted-tests                 # and which tests that reaches
+gerenuk run -- -q                      # and run exactly those, under pytest
 ```
 
 | Severity | Rule |
@@ -91,7 +92,8 @@ decorators can be filtered out via `[tool.gerenuk] ignore-decorators` in
 ### `impacted-tests`
 
 Walks the reference graph from those changed symbols out to the tests that
-reach them — impact-based test selection, minus the `pytest` invocation.
+reach them — impact-based test selection, minus the `pytest` invocation, which
+is [`run`](#run)'s job.
 
 ```
 $ gerenuk impacted-tests
@@ -120,6 +122,42 @@ see through becomes "run everything" rather than a short list.
 See the
 [documentation](https://mojzis.github.io/gerenuk/commands/impacted-tests.html).
 
+### `run`
+
+Turns that selection into a pytest invocation and runs it. gerenuk says one line
+for itself and then *becomes* pytest, so Ctrl-C, colours and the exit code are
+pytest's own.
+
+```
+$ gerenuk run -- -q
+gerenuk: 5 node id(s) from 1 origin(s) in 152 ms — details: gerenuk impacted-tests
+.........                                                                [100%]
+9 passed in 0.02s
+```
+
+gerenuk owns the invocation rather than printing node ids for a shell to
+interpolate, because a selection has three answers and an argument list has only
+two: an empty `pytest` argv **is** "run everything". So `pytest $(gerenuk …)`
+would run the entire suite in precisely the best case — the diff that impacts no
+tests. Here that case spawns nothing and exits `0`.
+
+`run` is also where pytest's own rules get applied. A recorded symbol is often a
+helper or a fixture rather than a test, so each name is checked against pytest's
+collection conventions and trimmed — or widened to the whole file — until it is
+one pytest will accept. And because pytest injects fixtures by *name*, which no
+type checker can follow, `conftest.py` is parsed for its fixtures and their
+consumers; the expansion keeps its audit trail:
+
+```
+tests/test_service.py::test_summary
+  ← tests.conftest:shelter ← sample_pkg.service:describe
+```
+
+`--dry-run` prints the decision and the exact argv without spawning anything.
+`pytest-command = ["uv", "run", "pytest"]` under `[tool.gerenuk]` names the
+runner. See the
+[documentation](https://mojzis.github.io/gerenuk/commands/run.html).
+
 ### Caveat
 
 `gerenuk` reports *static* references. Dynamic dispatch, plugin registries,
@@ -142,12 +180,17 @@ Run it before deleting Python code, and after a refactor.
 - `gerenuk audit --format json pkg/*.py` — same, machine-readable
 - `gerenuk changed-symbols` — which Python symbols the working tree changed
 - `gerenuk impacted-tests` — which tests those changed symbols can reach
+- `gerenuk run -- -q` — run pytest on exactly those tests
 - `gerenuk doctor` — check that `tyf` and the workspace resolve
 
 Exit codes: `0` clean, `1` findings reported, `2` the run could not complete.
 `changed-symbols` and `impacted-tests` never return `1`. When `impacted-tests`
 cannot trust its answer it reports `"verdict": "run_all"` with a `reason` and
 still exits `0` — read the verdict, not the exit code.
+
+`run` is the exception: once pytest starts, the exit code is pytest's own. Use
+`gerenuk run --dry-run` to see the decision and the exact argv without running
+anything.
 
 Findings are signals, not verdicts: dynamic dispatch, plugin registries, and
 `__all__` re-exports can hide a real usage. Confirm with `tyf refs <symbol>`
@@ -161,12 +204,13 @@ before deleting anything.
 make review        # fmt + clippy + rust tests + fixture pytest + audit + deny
 make review-quick  # skip the network checks
 make test-impact   # impacted-tests against the fixture, with a real tyf
+make test-run      # the whole pipeline, with a real tyf and a real pytest
 make docs          # build the mdBook site and llms.txt into docs/book/html
 ```
 
-The test suite is hermetic: `tests/common/mod.rs` stubs `tyf` with a shell
-script and points `GERENUK_TYF` at it, so neither `tyf` nor `ty` is needed to
-run `cargo test`. See [`docs/dev/ARCHITECTURE.md`](docs/dev/ARCHITECTURE.md)
+The test suite is hermetic: `tests/common/mod.rs` stubs `tyf` and pytest with
+shell scripts and points `GERENUK_TYF` and `GERENUK_PYTEST` at them, so none of
+`tyf`, `ty` or pytest is needed to run `cargo test`. See [`docs/dev/ARCHITECTURE.md`](docs/dev/ARCHITECTURE.md)
 for the shape and [`docs/adr/`](docs/adr/README.md) for why it is that shape.
 
 ## License
