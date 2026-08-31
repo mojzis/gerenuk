@@ -153,5 +153,10 @@ The mdBook site under `docs/` deploys to GitHub Pages on push to `main`
   `docs/src/setup.md` by `docs/inject-shared.sh`. Edit the shared file, then run
   the script — never edit between the `<!-- BEGIN SHARED:... -->` markers.
 - `docs/gen-version.sh` syncs the docs version badge with `Cargo.toml`.
+- `docs/toolchain.sh` pins the `mdbook` / `mdbook-mermaid` pair and is the one
+  source of truth for both `make docs` and the workflow. The two share a
+  preprocessor protocol that changed between mdbook 0.4 and 0.5, and a
+  mismatched pair fails with `Unable to parse the input`, naming neither tool —
+  `make docs` runs the check first so it names both.
 - Adding a page means adding it to `docs/src/SUMMARY.md`; the `llms.txt`
   generator reads that file.
