@@ -170,7 +170,9 @@ So gerenuk resolves the name edge itself, with tree-sitter and no `tyf`:
 **Recognising a fixture.** A def whose decorators suffix-match `pytest.fixture`
 or `fixture` — the same syntactic matcher `ignore-decorators` uses, with import
 aliases deliberately unresolved. The fixture's name is the def's name unless a
-string-literal `name="…"` overrides it; `autouse=True` is recorded.
+string-literal `name="…"` overrides it. `autouse=` is recorded, and an
+`autouse=` whose value is not a literal is read as *on*: the widening direction,
+since an autouse fixture nothing names would otherwise reach no test at all.
 
 **Scope.** A fixture in a test module is visible in that module. A fixture in a
 `conftest.py` is visible in every test file in that directory's subtree. A
@@ -184,6 +186,9 @@ it shadows, so the shadowed one still reaches that subtree.
 - test functions and methods whose parameter list names the fixture;
 - anything carrying `@pytest.mark.usefixtures("name")` with string-literal
   arguments, and the methods of a `Test*` class so decorated;
+- any test whose `usefixtures` arguments could *not* all be read —
+  `usefixtures(*NAMES)` — since it may be asking for the fixture under a name
+  gerenuk cannot see;
 - other fixtures whose parameters name it — followed transitively, with cycles
   terminating on the visited set;
 - every test in scope when the fixture is `autouse=True`.
@@ -193,6 +198,8 @@ it shadows, so the shadowed one still reaches that subtree.
 | Situation | Selection |
 |---|---|
 | Fixture with a dynamic `name=` | every test file in its scope |
+| Fixture with a dynamic `autouse=` | every test in its scope |
+| Test with an unreadable `usefixtures` argument | consumes every fixture visible to it |
 | A changed `conftest.py` | every test file in its subtree |
 | A `conftest.py` that cannot be parsed | every test file in its subtree |
 
@@ -276,8 +283,12 @@ hook that is exactly what it is.
   unexpanded. The walk still reaches the *definition* module when it is in the
   repo, so the miss is narrower than it sounds.
 - **`usefixtures` beyond string literals** — variables, `pytestmark` lists —
-  is not read, so those consumers are not found by name. A `usefixtures` mark
-  on any *enclosing* class is read, nested classes included.
+  is not read, so the names cannot be matched. A test whose `usefixtures` call
+  carries an unreadable argument is treated as a consumer of every fixture
+  visible to it rather than of none, so the gap over-selects rather than
+  missing a test. A `pytestmark` list assigned at module level is a different
+  shape and is not read at all. A `usefixtures` mark on any *enclosing* class
+  is read, nested classes included.
 - **Deep fixture-override chains.** `def shelter(shelter)` in a nearer
   `conftest.py` is followed, so a change to the shadowed fixture still selects
   the overriding subtree. The chain is followed by name through successive

@@ -357,7 +357,7 @@ fn impacted_run(
     // the same list, and asking git twice is a second process for one answer.
     let mut untracked = None;
     let changed = if let Some(path) = changed_file {
-        load_changed(path)?
+        load_report::<ChangedSymbols>(path, "changed", "a changed-symbols report")?
     } else {
         let listed = git.untracked()?;
         let report = changed_report(git, root, &git.resolve_base(base)?, config, &listed)?;
@@ -414,7 +414,10 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
     let repo = repo_context(workspace)?;
 
     let ImpactRun { mut report, files } = match options.impact {
-        Some(path) => ImpactRun { report: load_impact(path)?, files: None },
+        Some(path) => ImpactRun {
+            report: load_report::<ImpactReport>(path, "impact", "an impacted-tests report")?,
+            files: None,
+        },
         None => impacted_run(&repo, options.base, None, options.budgets)?,
     };
 
@@ -453,11 +456,19 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
         return Ok(Outcome::Clean);
     }
 
-    let runner = pytest::Runner::resolve(&repo.config, &repo.root)?;
+    let runner = pytest::Runner::resolve(pytest_override(), &repo.config, &repo.root)?;
     let argv = runner.argv(&selection, options.pytest_args);
     // Nothing of ours may still be buffered: the next call replaces us.
     out.flush().context("could not flush gerenuk's own output before running pytest")?;
     runner.exec(&argv).map(Outcome::Code)
+}
+
+/// The `GERENUK_PYTEST` override, read here rather than inside
+/// [`pytest::Runner::resolve`] so that resolution stays a pure function of its
+/// arguments — and so a developer who exports the variable can still run the
+/// test suite.
+fn pytest_override() -> Option<std::ffi::OsString> {
+    std::env::var_os(pytest::PYTEST_BIN_ENV)
 }
 
 /// Print the decision and the argv gerenuk would have run.
@@ -470,7 +481,8 @@ fn dry_run(
 ) -> Result<Outcome> {
     // A missing pytest must not fail a dry run: the interesting half of the
     // answer is the selection, and reporting it is more use than an error.
-    let argv = match (selection.decision, pytest::Runner::resolve(&repo.config, &repo.root)) {
+    let resolved = pytest::Runner::resolve(pytest_override(), &repo.config, &repo.root);
+    let argv = match (selection.decision, resolved) {
         (Decision::Nothing, _) => Vec::new(),
         (_, Ok(runner)) => runner.argv(selection, options.pytest_args),
         (_, Err(err)) => {
@@ -497,28 +509,19 @@ fn workspace_files(git: &Git, untracked: Option<Vec<PathBuf>>) -> Result<Vec<Pat
     Ok(files)
 }
 
-/// Replay a saved `impacted-tests --format json` report.
+/// Replay a saved `--format json` report from an earlier phase.
 ///
-/// Strict, for the same reason `--changed` is: a report that half-parses would
-/// become a confident selection of the wrong tests, and a wrong selection is
-/// the one failure this command must not have.
+/// This is what pins each phase's schema as the interface to the next: a report
+/// written by one gerenuk has to be readable by another. Strict, for the same
+/// reason the schemas are: a report that half-parses would become a confident
+/// selection of the wrong tests, and a wrong selection is the one failure `run`
+/// must not have.
 /// See `docs/adr/0010-a-replayed-report-is-parsed-strictly.md`.
-fn load_impact(path: &Path) -> Result<ImpactReport> {
+fn load_report<T: serde::de::DeserializeOwned>(path: &Path, flag: &str, what: &str) -> Result<T> {
     let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read --impact {}", path.display()))?;
+        .with_context(|| format!("cannot read --{flag} {}", path.display()))?;
     serde_json::from_str(&text)
-        .with_context(|| format!("cannot parse {} as an impacted-tests report", path.display()))
-}
-
-/// Replay a saved `changed-symbols --format json` report.
-///
-/// This is what pins the phase-1 schema as the interface between the phases:
-/// a report written by one gerenuk has to be walkable by the next.
-fn load_changed(path: &Path) -> Result<ChangedSymbols> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("cannot read --changed {}", path.display()))?;
-    serde_json::from_str(&text)
-        .with_context(|| format!("cannot parse {} as a changed-symbols report", path.display()))
+        .with_context(|| format!("cannot parse {} as {what}", path.display()))
 }
 
 /// Outline each file, ask `tyf refs` about every auditable symbol, then apply

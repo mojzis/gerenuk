@@ -66,6 +66,11 @@ pub struct TestItem {
     /// Fixture names it requests, from its parameters and from `usefixtures`
     /// on it or on its class.
     pub requests: BTreeSet<String>,
+    /// A `usefixtures` argument that could not be read as a string literal, so
+    /// [`Self::requests`] is short by an unknown number of names. The test
+    /// counts as a consumer of every fixture visible to it, because it might
+    /// be one.
+    pub opaque_requests: bool,
 }
 
 /// How much of a qualified name pytest can actually collect.
@@ -90,6 +95,9 @@ struct FileFacts {
     /// Every definition's qualname, and whether pytest can collect that
     /// segment on its own.
     segments: BTreeMap<String, bool>,
+    /// Whether the file's module has been read in yet. `false` does not mean
+    /// "contributes nothing" but "not asked yet" — see [`FixtureMap::paths`].
+    loaded: bool,
 }
 
 /// The fixture and collection facts of a whole test tree.
@@ -107,16 +115,41 @@ impl FixtureMap {
     pub fn build<'a>(modules: impl IntoIterator<Item = (PathBuf, Option<&'a Module>)>) -> Self {
         let mut files = BTreeMap::new();
         for (path, module) in modules {
-            let facts = module.map(|module| facts_of(&path, module)).unwrap_or_default();
+            let facts = facts_of(&path, module);
             files.insert(path, facts);
         }
         Self { files }
     }
 
-    /// Whether the map has heard of this file at all.
+    /// A map that knows which files the test tree holds but has read none of
+    /// them.
+    ///
+    /// The path-only queries — [`Self::subtree`], [`Self::conftests_above`],
+    /// [`Self::scope_of`] — answer straight away. Everything else reads the
+    /// three per-file fact sets, and answers as if the file were empty until it
+    /// has been [`Self::load`]ed; [`Self::is_loaded`] is how a caller knows.
+    /// That is what keeps `gerenuk run` from parsing every test file in the
+    /// repository to answer a report about one of them.
     #[must_use]
-    pub fn has(&self, file: &Path) -> bool {
-        self.files.contains_key(file)
+    pub fn paths(files: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self { files: files.into_iter().map(|path| (path, FileFacts::default())).collect() }
+    }
+
+    /// Whether this file's module has been read into the map.
+    #[must_use]
+    pub fn is_loaded(&self, file: &Path) -> bool {
+        self.files.get(file).is_some_and(|facts| facts.loaded)
+    }
+
+    /// Read one file's facts in, `None` for a file that would not parse.
+    ///
+    /// A path the map has never heard of is ignored: the file list is the map's
+    /// whole idea of the test tree, and a query about anything outside it
+    /// answers "nothing" by design.
+    pub fn load(&mut self, file: &Path, module: Option<&Module>) {
+        if let Some(slot) = self.files.get_mut(file) {
+            *slot = facts_of(file, module);
+        }
     }
 
     /// The tests pytest would collect from one file.
@@ -158,7 +191,7 @@ impl FixtureMap {
     /// the test module shadows one of the same name in any `conftest.py`, and a
     /// nearer `conftest.py` shadows a further one.
     #[must_use]
-    pub fn visible(&self, file: &Path, name: &str) -> Option<&Fixture> {
+    pub(crate) fn visible(&self, file: &Path, name: &str) -> Option<&Fixture> {
         if let Some(found) = self.files.get(file).and_then(|facts| facts.fixtures.get(name)) {
             return Some(found);
         }
@@ -202,7 +235,10 @@ impl FixtureMap {
             let visible = self.visible_fixtures(&file);
             let names = requesting_names(&visible, &fixture.name);
             for test in self.tests_in(&file) {
-                if fixture.autouse || test.requests.iter().any(|name| names.contains(name)) {
+                if fixture.autouse
+                    || test.opaque_requests
+                    || test.requests.iter().any(|name| names.contains(name))
+                {
                     consumers.tests.push(test.clone());
                 }
             }
@@ -249,8 +285,27 @@ impl FixtureMap {
         }
     }
 
+    /// Every `conftest.py` in the map that scopes over `file`, nearest first.
+    ///
+    /// Path-only, so it answers before anything has been loaded — which is what
+    /// lets a caller work out the minimum set of files to read.
+    #[must_use]
+    pub fn conftests_above(&self, file: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut dir = file.parent();
+        while let Some(current) = dir {
+            let conftest = current.join(CONFTEST);
+            if conftest != file && self.files.contains_key(&conftest) {
+                found.push(conftest);
+            }
+            dir = current.parent();
+        }
+        found
+    }
+
     /// The files a fixture could possibly be injected into.
-    fn scope_of(&self, fixture: &Fixture) -> Vec<PathBuf> {
+    #[must_use]
+    pub fn scope_of(&self, fixture: &Fixture) -> Vec<PathBuf> {
         if is_conftest(&fixture.file) {
             self.subtree(fixture.file.parent().unwrap_or_else(|| Path::new("")))
         } else if collects_tests(&fixture.file) {
@@ -384,23 +439,33 @@ pub fn is_conftest(file: &Path) -> bool {
 }
 
 /// Read one parsed module's fixtures, tests and collectible segments.
-fn facts_of(file: &Path, module: &Module) -> FileFacts {
-    let mut facts = FileFacts::default();
+///
+/// `None` is a file that is present but would not parse: it contributes no
+/// facts, and is still marked loaded so nothing tries to read it again.
+fn facts_of(file: &Path, module: Option<&Module>) -> FileFacts {
+    let mut facts = FileFacts { loaded: true, ..FileFacts::default() };
+    let Some(module) = module else { return facts };
 
     let defines_init: BTreeSet<&str> =
         module.spans.iter().filter_map(|span| span.qualname.strip_suffix(".__init__")).collect();
 
     for span in &module.spans {
         let last = last_segment(&span.qualname);
-        let collectible = match span.kind {
-            // pytest skips a `Test*` class with an `__init__`: it cannot
-            // instantiate it, and collecting it is a warning, not a test.
-            Kind::Class => {
-                last.starts_with(TEST_CLASS_PREFIX)
-                    && !defines_init.contains(span.qualname.as_str())
-            }
-            Kind::Function | Kind::Method => last.starts_with(TEST_FUNCTION_PREFIX),
-        };
+        // pytest never collects a `@pytest.fixture` def as a test, whatever it
+        // is called — and `test_client`, `test_db` and `test_app` are ordinary
+        // fixture names. Deciding on the prefix alone would hand pytest
+        // `conftest.py::test_client` and never follow the name edge to the
+        // tests that actually use it.
+        let collectible = span.decorator(FIXTURE_DECORATOR).is_none()
+            && match span.kind {
+                // pytest skips a `Test*` class with an `__init__`: it cannot
+                // instantiate it, and collecting it is a warning, not a test.
+                Kind::Class => {
+                    last.starts_with(TEST_CLASS_PREFIX)
+                        && !defines_init.contains(span.qualname.as_str())
+                }
+                Kind::Function | Kind::Method => last.starts_with(TEST_FUNCTION_PREFIX),
+            };
         facts.segments.insert(span.qualname.clone(), collectible);
     }
 
@@ -414,10 +479,12 @@ fn facts_of(file: &Path, module: &Module) -> FileFacts {
         if matches!(span.kind, Kind::Function | Kind::Method)
             && longest_collectible(&facts.segments, &span.qualname) == Collect::All
         {
+            let (requests, opaque_requests) = requests_of(module, span);
             facts.tests.push(TestItem {
                 file: file.to_path_buf(),
                 qualname: span.qualname.clone(),
-                requests: requests_of(module, span),
+                requests,
+                opaque_requests,
             });
         }
     }
@@ -442,7 +509,12 @@ fn fixture_of(file: &Path, span: &SymbolSpan) -> Option<Fixture> {
         file: file.to_path_buf(),
         qualname: span.qualname.clone(),
         name,
-        autouse: decorator.kwarg("autouse").is_some_and(Literal::is_true),
+        // A non-literal `autouse=` is unreadable, and the widening direction
+        // is to assume it is on: an autouse fixture nothing names by hand
+        // would otherwise reach no test at all and be dropped.
+        autouse: decorator
+            .kwarg("autouse")
+            .is_some_and(|value| !matches!(value, Literal::Bool(false))),
         // `self` is not a fixture request, and neither is `request`; both are
         // harmless here because no fixture is ever named either.
         requests: span.params.clone(),
@@ -452,9 +524,14 @@ fn fixture_of(file: &Path, span: &SymbolSpan) -> Option<Fixture> {
 
 /// Every fixture name a definition asks for: its parameters, plus the
 /// string-literal arguments of `usefixtures` on it and on its class.
-fn requests_of(module: &Module, span: &SymbolSpan) -> BTreeSet<String> {
+///
+/// The second half of the answer is whether any `usefixtures` argument was not
+/// readable, which is what stops `@pytest.mark.usefixtures(*NAMES)` quietly
+/// shortening the list and dropping a fixture as unconsumed.
+fn requests_of(module: &Module, span: &SymbolSpan) -> (BTreeSet<String>, bool) {
     let mut requests: BTreeSet<String> = span.params.iter().cloned().collect();
-    requests.extend(usefixtures(span));
+    let (names, mut opaque) = usefixtures(span);
+    requests.extend(names);
 
     // A `usefixtures` on a class applies to every method in it, and pytest
     // collects nested `Test*` classes — so every enclosing definition counts,
@@ -462,20 +539,33 @@ fn requests_of(module: &Module, span: &SymbolSpan) -> BTreeSet<String> {
     let mut owner = span.qualname.as_str();
     while let Some((prefix, _)) = owner.rsplit_once('.') {
         if let Some(enclosing) = module.spans.iter().find(|other| other.qualname == prefix) {
-            requests.extend(usefixtures(enclosing));
+            let (names, lost) = usefixtures(enclosing);
+            requests.extend(names);
+            opaque |= lost;
         }
         owner = prefix;
     }
-    requests
+    (requests, opaque)
 }
 
-/// String-literal fixture names from `@pytest.mark.usefixtures(...)`.
-fn usefixtures(span: &SymbolSpan) -> Vec<String> {
-    span.decorators
-        .iter()
-        .filter(|decorator| crate::pysource::suffix_matches(&decorator.name, USEFIXTURES_DECORATOR))
-        .flat_map(|decorator| decorator.string_args().map(ToString::to_string))
-        .collect()
+/// String-literal fixture names from `@pytest.mark.usefixtures(...)`, and
+/// whether the decorator was called with anything that is not one.
+///
+/// `usefixtures` takes only positional string literals, so a keyword argument
+/// counts as unreadable too rather than as something to ignore.
+fn usefixtures(span: &SymbolSpan) -> (Vec<String>, bool) {
+    let mut names = Vec::new();
+    let mut opaque = false;
+
+    for decorator in &span.decorators {
+        if !crate::pysource::suffix_matches(&decorator.name, USEFIXTURES_DECORATOR) {
+            continue;
+        }
+        let readable: Vec<String> = decorator.string_args().map(ToString::to_string).collect();
+        opaque |= readable.len() != decorator.args.len() || !decorator.kwargs.is_empty();
+        names.extend(readable);
+    }
+    (names, opaque)
 }
 
 /// The last dotted component — `test_bar` for `TestFoo.test_bar`.
@@ -876,10 +966,156 @@ def _make_shelter():
     }
 
     #[test]
+    fn a_fixture_named_like_a_test_is_not_collectible() {
+        // `test_client`, `test_db`, `test_app` are ordinary fixture names, and
+        // pytest collects none of them: it injects them. Calling one
+        // collectible would emit `conftest.py::test_client` as a node id and
+        // never follow the name edge to the test that consumes it.
+        let map = map(&[
+            (
+                "tests/conftest.py",
+                "import pytest\n\n\n@pytest.fixture\ndef test_client():\n    return 1\n",
+            ),
+            ("tests/test_a.py", "def test_x(test_client):\n    pass\n"),
+        ]);
+        assert_eq!(
+            map.collect(Path::new("tests/conftest.py"), "test_client"),
+            Collect::None,
+            "a fixture is never a node id, whatever it is called"
+        );
+        assert_eq!(
+            reached(&map, "tests/conftest.py", "test_client"),
+            (vec!["tests/test_a.py::test_x".to_string()], Vec::new()),
+            "and the name edge is followed instead"
+        );
+    }
+
+    #[test]
+    fn a_fixture_defined_in_a_test_module_is_not_collected_there_either() {
+        let map = map(&[(
+            "tests/test_a.py",
+            r"import pytest
+
+
+@pytest.fixture
+def test_client():
+    return 1
+
+
+def test_x(test_client):
+    pass
+",
+        )]);
+        assert_eq!(map.collect(Path::new("tests/test_a.py"), "test_client"), Collect::None);
+        assert_eq!(
+            reached(&map, "tests/test_a.py", "test_client"),
+            (vec!["tests/test_a.py::test_x".to_string()], Vec::new())
+        );
+    }
+
+    #[test]
+    fn an_unreadable_usefixtures_argument_widens_to_every_visible_fixture() {
+        // `usefixtures(*NAMES)` yields no readable names, so the test looks
+        // like it asks for nothing. Believing that would drop `shelter` as
+        // unconsumed and select no tests at all — the one degrade direction
+        // this module must not have.
+        let map = map(&[
+            (
+                "tests/conftest.py",
+                "import pytest\n\n\n@pytest.fixture\ndef shelter():\n    return 1\n",
+            ),
+            (
+                "tests/test_a.py",
+                r#"import pytest
+
+NAMES = ["shelter"]
+
+
+@pytest.mark.usefixtures(*NAMES)
+def test_x():
+    pass
+"#,
+            ),
+        ]);
+        assert_eq!(
+            reached(&map, "tests/conftest.py", "shelter"),
+            (vec!["tests/test_a.py::test_x".to_string()], Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_readable_usefixtures_still_only_reaches_what_it_names() {
+        let map = map(&[
+            (
+                "tests/conftest.py",
+                "import pytest\n\n\n@pytest.fixture\ndef shelter():\n    return 1\n",
+            ),
+            (
+                "tests/test_a.py",
+                r#"import pytest
+
+
+@pytest.mark.usefixtures("other")
+def test_x():
+    pass
+"#,
+            ),
+        ]);
+        assert_eq!(
+            reached(&map, "tests/conftest.py", "shelter"),
+            (Vec::new(), Vec::new()),
+            "a fully readable list is still trusted"
+        );
+    }
+
+    #[test]
+    fn an_unreadable_autouse_is_treated_as_autouse() {
+        // The fixture may run for every test in scope; assuming it does not
+        // would select none of them.
+        let map = map(&[
+            (
+                "tests/conftest.py",
+                r"import pytest
+
+STRICT = True
+
+
+@pytest.fixture(autouse=STRICT)
+def shelter():
+    return 1
+",
+            ),
+            ("tests/test_a.py", "def test_x():\n    pass\n"),
+        ]);
+        assert_eq!(
+            reached(&map, "tests/conftest.py", "shelter"),
+            (vec!["tests/test_a.py::test_x".to_string()], Vec::new())
+        );
+    }
+
+    #[test]
+    fn a_literal_false_autouse_is_still_believed() {
+        let map = map(&[
+            (
+                "tests/conftest.py",
+                r"import pytest
+
+
+@pytest.fixture(autouse=False)
+def shelter():
+    return 1
+",
+            ),
+            ("tests/test_a.py", "def test_x():\n    pass\n"),
+        ]);
+        assert_eq!(reached(&map, "tests/conftest.py", "shelter"), (Vec::new(), Vec::new()));
+    }
+
+    #[test]
     fn a_file_that_does_not_parse_still_exists_for_subtree_expansion() {
         let map = map(&[("tests/test_a.py", "def test_x(:\n    pass\n")]);
         let file = Path::new("tests/test_a.py");
-        assert!(map.has(file), "the file is in the tree");
+        assert!(map.is_loaded(file), "the file was read, it just did not parse");
         assert!(map.tests_in(file).is_empty(), "but a partial tree names no tests");
         assert_eq!(
             map.subtree(Path::new("tests")),
