@@ -1,4 +1,4 @@
-.PHONY: review fmt-check lint test test-fixture test-impact test-run audit deny coverage mutants review-quick docs docs-serve
+.PHONY: review fmt-check lint test test-fixture test-impact test-run audit deny coverage mutants review-quick docs docs-serve docs-toolchain
 
 # Full review — run before pushing or merging
 review: fmt-check lint test test-fixture audit deny
@@ -76,13 +76,18 @@ test-run:
 	@cargo build --quiet
 	@bash scripts/run-smoke.sh
 
+# Check that mdbook and mdbook-mermaid are the pair CI pins. They share a
+# preprocessor protocol, and a mismatch fails with an error naming neither.
+docs-toolchain:
+	@bash docs/toolchain.sh
+
 # Build the mdBook site plus llms.txt into docs/book/html
-docs:
+docs: docs-toolchain
 	@echo "📚 Building docs..."
 	@bash docs/gen-version.sh
 	@mdbook build docs
 	@bash docs/generate-llms-txt.sh
 
 # Serve the docs locally with live reload
-docs-serve:
+docs-serve: docs-toolchain
 	@mdbook serve docs --open
