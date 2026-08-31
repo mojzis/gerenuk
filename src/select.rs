@@ -192,11 +192,10 @@ pub fn select(report: &ImpactReport, tree: &impl Tree) -> Selection {
         };
     }
 
-    let files = tree.test_files();
-    let parsed: Vec<(PathBuf, Option<Rc<Module>>)> =
-        files.into_iter().map(|file| (file.clone(), tree.module(&file))).collect();
-    let map =
-        FixtureMap::build(parsed.iter().map(|(file, module)| (file.clone(), module.as_deref())));
+    // Paths now, facts on demand. A report about one test must not cost a
+    // parse of every test file in the repository — the same reason
+    // `impacted-tests` never lists the tree it does not need.
+    let map = FixtureMap::paths(tree.test_files());
 
     Mapper { tree, map, selected: BTreeMap::new(), expanded: Vec::new(), dropped: Vec::new() }
         .run(report)
@@ -272,18 +271,53 @@ impl<T: Tree> Mapper<'_, T> {
             self.whole_file(file, chain);
             return;
         };
+        self.load(file);
+
+        // The name edge first: pytest injects a fixture rather than collecting
+        // it, so a fixture is never a node id however collectible its name
+        // looks.
+        if let Some(fixture) = self.map.fixture_at(file, qualname).cloned() {
+            self.expand_fixture(&fixture, symbol, chain);
+            return;
+        }
+        // Only a file pytest collects tests from can yield a `file::name` node
+        // id at all; in a `conftest.py` or a helper module the file — or what
+        // it configures — is the honest answer.
+        if !collects_tests(file) {
+            self.whole_file(file, chain);
+            return;
+        }
 
         match self.map.collect(file, qualname) {
             Collect::All => self.push(node_id(file, qualname), chain),
             Collect::Prefix(prefix) => self.push(node_id(file, &prefix), chain),
-            Collect::None => {
-                // A helper or a fixture. A fixture has a name edge pytest would
-                // have followed; anything else degrades to the whole file.
-                match self.map.fixture_at(file, qualname).cloned() {
-                    Some(fixture) => self.expand_fixture(&fixture, symbol, chain),
-                    None => self.whole_file(file, chain),
-                }
+            // A helper nested somewhere pytest cannot name: the whole file.
+            Collect::None => self.whole_file(file, chain),
+        }
+    }
+
+    /// Read one file's facts into the map, if they are not there already.
+    ///
+    /// [`FixtureMap::paths`] hands out a map that knows every test file's path
+    /// and none of their contents, so every query that reads facts goes through
+    /// here or [`Self::load_scope`] first.
+    fn load(&mut self, file: &Path) {
+        if self.map.is_loaded(file) {
+            return;
+        }
+        let module = self.tree.module(file);
+        self.map.load(file, module.as_deref());
+    }
+
+    /// Load everything a fixture's consumer resolution reads: every file it
+    /// could be injected into, and the `conftest.py` chain above each of them
+    /// that decides which definition of the name wins.
+    fn load_scope(&mut self, fixture: &Fixture) {
+        for file in self.map.scope_of(fixture) {
+            for conftest in self.map.conftests_above(&file) {
+                self.load(&conftest);
             }
+            self.load(&file);
         }
     }
 
@@ -324,6 +358,7 @@ impl<T: Tree> Mapper<'_, T> {
 
     /// The tests a fixture reaches, resolved by name because `tyf` cannot.
     fn expand_fixture(&mut self, fixture: &Fixture, symbol: &str, chain: &Chain) {
+        self.load_scope(fixture);
         let consumers = self.map.consumers(fixture);
         if consumers.is_empty() {
             self.drop_entry(symbol, DropReason::NoConsumers);
@@ -445,6 +480,40 @@ mod tests {
         }
     }
 
+    /// A [`Tree`] that records which files were actually parsed.
+    ///
+    /// The laziness is a property of `select`, not of any one answer, so it
+    /// needs a `Tree` that can be asked afterwards what it was made to read.
+    struct Counting {
+        tree: MapTree,
+        parsed: std::cell::RefCell<BTreeSet<PathBuf>>,
+    }
+
+    impl Counting {
+        fn new(tree: MapTree) -> Self {
+            Self { tree, parsed: std::cell::RefCell::default() }
+        }
+    }
+
+    impl Tree for Counting {
+        fn test_files(&self) -> Vec<PathBuf> {
+            self.tree.test_files()
+        }
+
+        fn module(&self, file: &Path) -> Option<Rc<Module>> {
+            self.parsed.borrow_mut().insert(file.to_path_buf());
+            self.tree.module(file)
+        }
+
+        fn exists(&self, file: &Path) -> bool {
+            self.tree.exists(file)
+        }
+
+        fn module_path(&self, file: &Path) -> Option<String> {
+            self.tree.module_path(file)
+        }
+    }
+
     fn report(tests: Vec<ImpactedTest>, changed_tests: Vec<&str>) -> ImpactReport {
         ImpactReport {
             verdict: Verdict::Selected,
@@ -516,6 +585,110 @@ def shelter():
             .with("tests/test_b.py", "def test_b():\n    pass\n")
             .with("tests/__init__.py", "")
             .with("src/pkg/core.py", "def target():\n    pass\n")
+    }
+
+    #[test]
+    fn a_fixture_named_like_a_test_expands_instead_of_becoming_a_node_id() {
+        // The whole-pipeline form of the fixtures.rs regression: pytest cannot
+        // collect `tests/conftest.py::test_client`, so emitting it would fail
+        // the run *and* miss `test_x` — a confident selection that misses a
+        // test, which is the one failure this module must not have.
+        let tree = MapTree::default()
+            .with(
+                "tests/conftest.py",
+                r"import pytest
+
+
+@pytest.fixture
+def test_client():
+    return 1
+",
+            )
+            .with("tests/test_a.py", "def test_x(test_client):\n    pass\n");
+
+        let selection = select(
+            &report(
+                vec![impacted("tests/conftest.py", Some("tests.conftest:test_client"))],
+                vec![],
+            ),
+            &tree,
+        );
+        assert_eq!(ids(&selection), vec!["tests/test_a.py::test_x"]);
+        assert_eq!(selection.expanded[0].kind, ExpansionKind::Fixture);
+    }
+
+    #[test]
+    fn a_test_named_helper_in_a_conftest_never_becomes_a_node_id() {
+        // Not a fixture, so no name edge — but `conftest.py` collects nothing,
+        // and handing pytest `tests/conftest.py::test_helper` is a usage error.
+        let tree = MapTree::default()
+            .with("tests/conftest.py", "def test_helper():\n    pass\n")
+            .with("tests/test_a.py", "def test_x():\n    pass\n");
+
+        let selection = select(
+            &report(
+                vec![impacted("tests/conftest.py", Some("tests.conftest:test_helper"))],
+                vec![],
+            ),
+            &tree,
+        );
+        assert_eq!(
+            ids(&selection),
+            vec!["tests/test_a.py"],
+            "the conftest widens to its subtree instead"
+        );
+    }
+
+    #[test]
+    fn only_the_files_the_report_needs_are_parsed() {
+        // `impacted-tests` refuses to list a tree it does not need; `run` must
+        // not undo that by parsing every test file to answer one entry.
+        let counting = Counting::new(tree());
+        let selection = select(
+            &report(
+                vec![impacted("tests/test_a.py", Some("tests.test_a:TestGood.test_ok"))],
+                vec![],
+            ),
+            &counting,
+        );
+        assert_eq!(ids(&selection), vec!["tests/test_a.py::TestGood::test_ok"]);
+        assert_eq!(
+            counting.parsed.into_inner(),
+            [PathBuf::from("tests/test_a.py")].into(),
+            "one collectible test needs one file, not the whole tree"
+        );
+    }
+
+    #[test]
+    fn a_fixture_expansion_parses_its_scope_and_nothing_further() {
+        // A fixture in `tests/unit/conftest.py` scopes over `tests/unit` only:
+        // `tests/test_a.py` is outside it and must stay unread.
+        let inner = MapTree::default()
+            .with("tests/conftest.py", CONFTEST)
+            .with("tests/test_a.py", TESTS)
+            .with("tests/unit/conftest.py", CONFTEST)
+            .with("tests/unit/test_c.py", "def test_c(shelter):\n    pass\n");
+        let counting = Counting::new(inner);
+
+        let selection = select(
+            &report(
+                vec![impacted("tests/unit/conftest.py", Some("tests.unit.conftest:shelter"))],
+                vec![],
+            ),
+            &counting,
+        );
+        assert_eq!(ids(&selection), vec!["tests/unit/test_c.py::test_c"]);
+
+        let parsed = counting.parsed.into_inner();
+        assert!(parsed.contains(Path::new("tests/unit/test_c.py")), "the scope was read");
+        assert!(
+            parsed.contains(Path::new("tests/conftest.py")),
+            "and the conftest chain above it, which decides which `shelter` wins"
+        );
+        assert!(
+            !parsed.contains(Path::new("tests/test_a.py")),
+            "but nothing outside the scope: {parsed:?}"
+        );
     }
 
     #[test]

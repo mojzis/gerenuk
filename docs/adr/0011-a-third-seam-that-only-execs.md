@@ -46,6 +46,13 @@ decision — it is deliberately not a bare interpolatable list.
 - After the exec, gerenuk cannot distinguish its own never-happened failures
   from pytest's exit `2`. Acceptable: every pre-exec failure has already exited
   before pytest existed.
+- On Windows there is no `exec`, so the seam spawns and waits — and two
+  outcomes there have no exit code of pytest's to propagate: a signal-terminated
+  child, which has none at all, and a code outside a byte, since a Windows exit
+  code is a full `i32` and a crashed pytest arrives as something like
+  `0xC0000005`. Both become `2`, aliasing gerenuk's own operational failure.
+  Acceptable for the same reason as above, and the Unix path — the one the hook
+  contract is written for — has neither case.
 - `exec` has no test that proves the process was replaced. The integration
   tests assert on the argv a stubbed pytest recorded and on the propagated exit
   code, which is the observable half.

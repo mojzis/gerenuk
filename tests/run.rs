@@ -360,7 +360,9 @@ fn a_dry_run_still_answers_when_pytest_cannot_be_found() {
         .success()
         .stdout(predicates::str::contains("decision: selected"))
         .stdout(predicates::str::contains("tests/test_core.py::test_target"))
-        .stdout(predicates::str::contains("argv: none"))
+        // Not "nothing would be run": the decision line above says `selected`,
+        // and the two must not contradict each other.
+        .stdout(predicates::str::contains("argv: unknown — pytest could not be resolved"))
         .stderr(predicates::str::contains("pytest"));
 }
 

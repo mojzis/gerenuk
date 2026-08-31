@@ -113,9 +113,11 @@ impl Decorator {
 
     /// Every positional argument that was a string literal.
     ///
-    /// Non-literal arguments are dropped rather than approximated: the callers
-    /// that need to know something was lost check the count against
-    /// [`Self::args`].
+    /// Non-literal arguments are dropped rather than approximated, so the
+    /// iterator can be shorter than [`Self::args`]. A caller that would narrow
+    /// its answer on a short list has to compare the two counts and widen
+    /// instead — [`crate::fixtures`]'s `usefixtures` reader is the one that
+    /// does.
     pub fn string_args(&self) -> impl Iterator<Item = &str> {
         self.args.iter().filter_map(Literal::as_str)
     }

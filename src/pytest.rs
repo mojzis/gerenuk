@@ -43,12 +43,23 @@ pub struct Runner {
 }
 
 impl Runner {
-    /// Resolve the runner: `GERENUK_PYTEST`, then `pytest-command` from
+    /// Resolve the runner: `override_bin`, then `pytest-command` from
     /// `pyproject.toml`, then `pytest` on `PATH`.
-    pub fn resolve(config: &Config, root: impl Into<PathBuf>) -> Result<Self> {
+    ///
+    /// The override arrives as an argument rather than being read from
+    /// `GERENUK_PYTEST` here: reading the environment mid-resolution would make
+    /// this function's own tests depend on the machine running them, and a
+    /// developer who exports the variable this feature documents could not run
+    /// `cargo test`. [`crate::cli`] does the lookup, the way every other seam
+    /// keeps its impurity at the edge.
+    pub fn resolve(
+        override_bin: Option<OsString>,
+        config: &Config,
+        root: impl Into<PathBuf>,
+    ) -> Result<Self> {
         let root = root.into();
 
-        if let Some(explicit) = std::env::var_os(PYTEST_BIN_ENV) {
+        if let Some(explicit) = override_bin {
             return Ok(Self { command: vec![explicit], root });
         }
         // An empty list in the config is a mistake, not a request to run
@@ -117,8 +128,13 @@ impl Runner {
             let status = command
                 .status()
                 .with_context(|| format!("failed to run `{}`", render_argv(argv).join(" ")))?;
-            // A signal-terminated child has no code; call that an operational
-            // failure rather than inventing a pytest verdict for it.
+            // Two cases land here with no verdict of pytest's to report: a
+            // signal-terminated child, which has no code at all, and a code
+            // outside a byte — Windows exit codes are a full `i32`, so a
+            // crashed pytest arrives as something like `0xC0000005`. Both are
+            // operational failures rather than a pytest result, which is
+            // exactly what `2` means; it does alias gerenuk's own failure code,
+            // and ADR 0011 records that.
             Ok(status.code().and_then(|code| u8::try_from(code).ok()).unwrap_or(2))
         }
     }
@@ -195,7 +211,13 @@ impl DryRun<'_> {
         }
 
         if self.argv.is_empty() {
-            let _ = writeln!(out, "\nargv: none — nothing would be run");
+            // An empty argv means two different things, and the decision line
+            // above says which: nothing was impacted, or pytest could not be
+            // resolved to say what would have run.
+            let _ = match self.selection.decision {
+                Decision::Nothing => writeln!(out, "\nargv: none — nothing would be run"),
+                _ => writeln!(out, "\nargv: unknown — pytest could not be resolved"),
+            };
         } else {
             let _ = writeln!(out, "\nargv");
             for part in render_argv(&self.argv) {
@@ -209,11 +231,14 @@ impl DryRun<'_> {
         // Built by hand rather than through a `#[serde(flatten)]` wrapper: a
         // wrapper would need `Selection` to be `Deserialize` too, which it has
         // no reason to be.
-        let mut value = serde_json::to_value(self.selection)?;
+        let mut value =
+            serde_json::to_value(self.selection).context("could not serialise the selection")?;
         if let Some(object) = value.as_object_mut() {
-            object.insert("argv".to_string(), serde_json::to_value(render_argv(&self.argv))?);
+            let argv = serde_json::to_value(render_argv(&self.argv))
+                .context("could not serialise the pytest argv")?;
+            object.insert("argv".to_string(), argv);
         }
-        Ok(serde_json::to_string_pretty(&value)?)
+        serde_json::to_string_pretty(&value).context("could not render the dry run as JSON")
     }
 }
 
@@ -393,9 +418,21 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_command_beats_the_config_and_the_path() {
+    fn the_override_beats_the_config_and_the_path() {
         let config = Config { pytest_command: vec!["hatch".to_string()], ..Config::default() };
-        let runner = Runner::resolve(&config, "/repo").expect("the config names a command");
+        let runner = Runner::resolve(Some("/usr/bin/pytest".into()), &config, "/repo")
+            .expect("the override names a command");
+        assert_eq!(
+            render_argv(&runner.command),
+            vec!["/usr/bin/pytest"],
+            "the override is consulted before the config"
+        );
+    }
+
+    #[test]
+    fn the_configured_command_is_used_before_path() {
+        let config = Config { pytest_command: vec!["hatch".to_string()], ..Config::default() };
+        let runner = Runner::resolve(None, &config, "/repo").expect("the config names a command");
         assert_eq!(
             render_argv(&runner.command),
             vec!["hatch"],
@@ -406,10 +443,17 @@ mod tests {
     #[test]
     fn an_empty_config_command_falls_through_rather_than_exec_ing_nothing() {
         let config = Config { pytest_command: Vec::new(), ..Config::default() };
-        // Resolution may or may not find pytest on this machine; what matters
-        // is that it never resolves to the empty argv.
-        if let Ok(runner) = Runner::resolve(&config, "/repo") {
-            assert!(!runner.command.is_empty(), "an empty argv is not a runnable command");
+        // Resolution may or may not find pytest on this machine; either way it
+        // must never resolve to the empty argv, and a failure has to say what
+        // the user could set instead.
+        match Runner::resolve(None, &config, "/repo") {
+            Ok(runner) => assert!(!runner.command.is_empty(), "an empty argv is not runnable"),
+            Err(err) => {
+                let text = format!("{err:#}");
+                assert!(text.contains("PATH"), "got: {text}");
+                assert!(text.contains("pytest-command"), "got: {text}");
+                assert!(text.contains(PYTEST_BIN_ENV), "got: {text}");
+            }
         }
     }
 

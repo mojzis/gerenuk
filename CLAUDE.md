@@ -124,7 +124,21 @@ When a test fails during implementation:
   longer-prefix node id or the whole file; a fixture becomes its consumers. The
   one failure mode `run` must not have is a confident list of node ids that
   misses a test, so a rule that could narrow the selection is a bug, not a
-  precision win. `fixtures.rs` holds pytest's conventions and no I/O.
+  precision win. `fixtures.rs` holds pytest's conventions and no I/O. That
+  includes the unreadable cases: a dynamic `autouse=` reads as *on*, and a
+  `usefixtures(*NAMES)` makes the test a consumer of everything visible to it.
+- **A `@pytest.fixture` is never collectible, whatever it is called.**
+  `test_client` is an ordinary fixture name; deciding on the `test` prefix alone
+  emits `conftest.py::test_client` as a node id, which pytest cannot collect,
+  and skips the name edge to the tests that use it. Only a file
+  `collects_tests` says yes to can yield a `file::name` node id at all.
+- **`FixtureMap` is built from paths and loaded file by file.**
+  `FixtureMap::paths` knows the test tree's shape and none of its contents;
+  `select::Mapper::load` and `load_scope` read exactly the files an entry
+  needs. A report about one test must not cost a parse of every test file —
+  the same reason `impacted-tests` refuses to list a tree it does not need. A
+  new query that reads facts needs a matching `load` call, or it silently
+  answers as if the file were empty.
 - **An empty selection must short-circuit before any spawn.** An empty pytest
   argv *is* "run everything", so `Decision::Nothing` exits `0` having started no
   process. `tests/run.rs` asserts the stub's recording file does not exist,
