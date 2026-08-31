@@ -161,6 +161,69 @@ pub(crate) fn indexed(span: &crate::pysource::SymbolSpan) -> IndexedSymbol {
     }
 }
 
+/// Decorators that do not hand the function to anything: they wrap it, mark it
+/// or change how attribute access works, but the callers stay ordinary callers
+/// that `tyf` can already see. Chasing a registrar for these would be noise.
+const INERT_DECORATORS: &[&str] = &[
+    "property",
+    "staticmethod",
+    "classmethod",
+    "abstractmethod",
+    "abstractproperty",
+    "cached_property",
+    "override",
+    "overload",
+    "dataclass",
+    "final",
+    "wraps",
+    "cache",
+    "lru_cache",
+    "cache_readonly",
+    "contextmanager",
+    "asynccontextmanager",
+    "setter",
+    "getter",
+    "deleter",
+];
+
+/// Whether a decorator only wraps its target rather than registering it.
+///
+/// Matched on the last dotted segment, so `functools.wraps` and a bare `wraps`
+/// are the same answer — the same suffix rule `ignore-decorators` uses.
+#[must_use]
+pub(crate) fn is_inert(decorator: &str) -> bool {
+    let last = decorator.rsplit('.').next().unwrap_or(decorator);
+    INERT_DECORATORS.contains(&last)
+}
+
+/// The object a decorator hangs its target on: `app.command` -> `app`.
+///
+/// This is the edge a type checker cannot draw. `@app.command()` makes `show`
+/// reachable from everything that reaches `app`, but nothing *references*
+/// `show`, so the walk dead-ends there and reports an empty selection under
+/// `selected` — a silent miss. The registrar is an ordinary name, and the
+/// tests that drive the CLI or the HTTP app do mention it.
+///
+/// A bare decorator (`@register`) has no registrar: that line already
+/// references `register` by name, so `tyf` draws the edge itself.
+///
+/// The first segment is the local name — for `a.b.command` it is `a` that the
+/// test imports.
+#[must_use]
+pub(crate) fn registrar_of(decorator: &str) -> Option<&str> {
+    let (receiver, _) = decorator.rsplit_once('.')?;
+    Some(receiver.split('.').next().unwrap_or(receiver))
+}
+
+/// Word-boundary hits above this are treated as an unresolvable registrar.
+///
+/// A name like `pytest` or `np` occurs everywhere and says nothing about who
+/// drives the decorated function. Rather than absorb thousands of sites — or
+/// keep a blocklist of every module people import — a registrar this common is
+/// declared unresolvable, which escalates to `run_all`. Over-running is the
+/// safe direction; over-selecting on a common word is not.
+const REGISTRAR_SITE_CAP: usize = 400;
+
 /// The [`Site`] a line falls in, given an already-parsed module.
 ///
 /// The enclosing definition wins; only a line that belongs to no definition is
@@ -184,6 +247,9 @@ pub trait Index {
     fn is_test(&self, file: &Path) -> bool;
     /// Module-scope definitions of one file.
     fn top_level(&self, file: &Path) -> Result<Vec<IndexedSymbol>>;
+    /// The local name `name` was bound to by the import on `line`, and where
+    /// that name sits, when the import renames it.
+    fn import_alias(&self, file: &Path, line: u32, name: &str) -> Result<Option<(String, u32)>>;
     /// Word-boundary occurrences of a bare name across the workspace's Python
     /// files, as `(file, line)` pairs.
     fn word_hits(&self, name: &str) -> Result<Vec<(PathBuf, u32)>>;
@@ -211,6 +277,10 @@ pub enum Reason {
     MaxSymbols,
     /// The wall-clock budget ran out between levels.
     Budget,
+    /// A changed symbol is registered by a decorator whose registrar could not
+    /// be resolved, so the tests that reach it through the framework cannot be
+    /// seen. Selecting nothing here would be a silent miss, so we run all.
+    DecoratorDispatch,
 }
 
 impl Reason {
@@ -225,6 +295,9 @@ impl Reason {
             Self::MaxDepth => "the depth limit was reached",
             Self::MaxSymbols => "the symbol limit was reached",
             Self::Budget => "the time budget ran out",
+            Self::DecoratorDispatch => {
+                "a changed symbol is dispatched by an unresolvable decorator"
+            }
         }
     }
 }
@@ -394,6 +467,7 @@ pub fn walk(
         errors: Vec::new(),
         tyf_calls: 0,
         max_depth_reached: 0,
+        unresolved_dispatch: false,
     }
     .run(seeds)
 }
@@ -452,6 +526,9 @@ struct Walk<'a, R, I> {
     errors: Vec<String>,
     tyf_calls: usize,
     max_depth_reached: u32,
+    /// Set when a dead-ended symbol is decorated by something whose registrar
+    /// could not be resolved. The selection is then known to be incomplete.
+    unresolved_dispatch: bool,
 }
 
 impl<R: Refs, I: Index> Walk<'_, R, I> {
@@ -463,6 +540,9 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
                 self.errors.extend(stop.message);
                 (Verdict::RunAll, Some(stop.reason))
             }
+            // A walk that finished but could not see past a decorator has not
+            // finished at all — it just does not know what it missed.
+            None if self.unresolved_dispatch => (Verdict::RunAll, Some(Reason::DecoratorDispatch)),
             None => (Verdict::Selected, None),
         };
 
@@ -573,10 +653,111 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
                 self.errors.push(format!("unexpected `refs` answer for `{}`", answer.id));
                 continue;
             };
+            let before = self.progress(&next);
             self.absorb(query, Some(&query.declaration()), &answer.sites, &mut next)?;
+            // Only a dead end is worth a registrar scan: a symbol with real
+            // callers is already on a path to its tests.
+            if self.progress(&next) == before {
+                self.chase_registrar(query, &mut next)?;
+            }
         }
         next.sort_by(|a, b| a.id.cmp(&b.id));
         Ok(next)
+    }
+
+    /// How much answer exists so far: tests recorded plus nodes queued.
+    ///
+    /// Compared either side of one symbol's sites to tell "this went nowhere"
+    /// from "this moved the walk forward".
+    fn progress(&self, next: &[SymbolQuery]) -> (usize, usize) {
+        (self.impacted.len(), next.len())
+    }
+
+    /// Follow a decorated dead end out through the object it is registered on.
+    ///
+    /// `@app.command()` on `show` means the CLI runner calls `show`, but the
+    /// only *reference* to `show` is its own definition, so the walk stops with
+    /// an empty answer it presents as `selected`. The registrar (`app`) is an
+    /// ordinary name that the tests do mention, so its occurrences are absorbed
+    /// as if they were references to the decorated symbol — which, through the
+    /// framework, is what they are.
+    ///
+    /// Word-boundary matching, like the deleted-symbol path: no type checker
+    /// can resolve this edge, and over-selection is the safe direction. When no
+    /// registrar can be resolved, the miss is recorded so the verdict degrades
+    /// to `run_all` instead of quietly claiming nothing is impacted.
+    fn chase_registrar(
+        &mut self,
+        query: &SymbolQuery,
+        next: &mut Vec<SymbolQuery>,
+    ) -> Result<(), Stop> {
+        let site = self
+            .index
+            .classify(&query.file, query.line)
+            .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
+        let Site::Symbol(found) = site else { return Ok(()) };
+
+        let mut candidates: Vec<&str> = Vec::new();
+        let mut resolved = false;
+
+        for decorator in &found.decorators {
+            if is_inert(decorator) {
+                continue;
+            }
+            // An explicitly ignored decorator is a deliberate dead end; phase 1
+            // already decided there is nothing worth chasing past it.
+            if self.config.matching_decorator(decorator).is_some() {
+                continue;
+            }
+            let Some(registrar) = registrar_of(decorator) else { continue };
+            candidates.push(decorator.as_str());
+
+            let hits = self
+                .index
+                .word_hits(registrar)
+                .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
+            if hits.len() > REGISTRAR_SITE_CAP {
+                continue;
+            }
+
+            // Every `@app.command` line mentions `app`, so a scan is never
+            // empty and "non-empty" cannot mean resolved. What counts is a
+            // mention that is *not* one of the definitions this registrar
+            // registers: `app.add_typer(journal_app)`, a module-level
+            // `include_router`, or a test driving the app. That is the code
+            // that wires or exercises the registry, and the route to its
+            // tests. A registrar mentioned nowhere but its own decorator lines
+            // has no visible driver, and guessing is what this exists to stop.
+            for (file, line) in &hits {
+                let site = self
+                    .index
+                    .classify(file, *line)
+                    .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
+                let is_own_registration = matches!(&site, Site::Symbol(symbol)
+                    if symbol.decorators.iter().any(|d| registrar_of(d) == Some(registrar)));
+                if !is_own_registration {
+                    resolved = true;
+                    break;
+                }
+            }
+
+            let sites: Vec<RefSite> =
+                hits.into_iter().map(|(file, line)| RefSite { file, line }).collect();
+            self.absorb(query, None, &sites, next)?;
+        }
+
+        if !candidates.is_empty() && !resolved {
+            // Name it: "run everything" is only actionable if the reader can
+            // see which decorator the walk could not see through.
+            self.errors.push(format!(
+                "`{}` is registered by @{} and nothing referencing `{}` could be resolved",
+                query.id,
+                candidates.join(", @"),
+                candidates.iter().filter_map(|d| registrar_of(d)).collect::<Vec<_>>().join("`, `"),
+            ));
+            self.unresolved_dispatch = true;
+        }
+        Ok(())
     }
 
     /// A deleted symbol has no definition left for `tyf` to resolve, so its
@@ -619,10 +800,41 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
             if self.index.is_test(&site.file) {
                 self.test_site(&query.id, site, &class);
             } else {
-                self.code_site(&query.id, site, &class, next)?;
+                self.code_site(&query.id, query.bare_name(), site, &class, next)?;
             }
         }
         Ok(())
+    }
+
+    /// An import that renames what it imports: `from x import y as z`.
+    ///
+    /// Ordinary imports are dropped because the module's real uses of the
+    /// symbol answer for themselves. A rename breaks that: the code below says
+    /// `z`, a binding `tyf` will not return for a query about `y`, so dropping
+    /// this line severs the graph — and everything past the alias, including
+    /// whole layers of a re-exporting package, becomes invisible.
+    ///
+    /// The alias is queried in its own right. Its id carries the local name, so
+    /// a `via` chain shows where the rename happened.
+    fn alias_site(
+        &mut self,
+        from: &str,
+        site: &RefSite,
+        alias: &str,
+        column: u32,
+        next: &mut Vec<SymbolQuery>,
+    ) {
+        let Some(module) = self.index.module_path(&site.file) else { return };
+        let id = symbol_id(&module, alias);
+        if self.record_visit(&id, from) {
+            next.push(SymbolQuery {
+                id,
+                name: alias.to_string(),
+                file: site.file.clone(),
+                line: site.line,
+                column,
+            });
+        }
     }
 
     /// A reference inside test code: record it and stop. Tests are the answer,
@@ -649,12 +861,24 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
     fn code_site(
         &mut self,
         from: &str,
+        name: &str,
         site: &RefSite,
         class: &Site,
         next: &mut Vec<SymbolQuery>,
     ) -> Result<(), Stop> {
         match class {
-            Site::Import => Ok(()),
+            Site::Import => {
+                // Dropped only when the import keeps the name: then the
+                // module's own uses answer for themselves. A rename does not.
+                let renamed = self
+                    .index
+                    .import_alias(&site.file, site.line, name)
+                    .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
+                if let Some((alias, column)) = renamed {
+                    self.alias_site(from, site, &alias, column, next);
+                }
+                Ok(())
+            }
             Site::Unknown => {
                 // Not Python we can attribute. Say so rather than pretending.
                 self.errors.push(format!(
@@ -846,6 +1070,17 @@ mod tests {
             Ok(module.top_level().map(indexed).collect())
         }
 
+        fn import_alias(
+            &self,
+            file: &Path,
+            line: u32,
+            name: &str,
+        ) -> Result<Option<(String, u32)>> {
+            self.check()?;
+            let Some(module) = self.parse(file) else { return Ok(None) };
+            Ok(module.alias_on_line(line, name).map(|a| (a.alias.clone(), a.column)))
+        }
+
         fn word_hits(&self, name: &str) -> Result<Vec<(PathBuf, u32)>> {
             self.check()?;
             let mut hits = Vec::new();
@@ -1010,6 +1245,153 @@ def test_middle():
         );
         assert_eq!(closure.stats.max_depth_reached, 1, "two levels were expanded");
         assert_eq!(closure.stats.visited, 2, "the seed and the intermediate symbol");
+    }
+
+    const CLI: &str = "import typer\n\napp = typer.Typer()\n\n\n@app.command()\ndef show(entry_id: int):\n    return entry_id\n";
+
+    const CLI_TEST: &str = "from pkg.cli import app\nfrom typer.testing import CliRunner\n\nrunner = CliRunner()\n\n\ndef test_show():\n    assert runner.invoke(app, [\"show\", \"1\"]).exit_code == 0\n";
+
+    #[test]
+    fn a_command_registered_by_a_decorator_reaches_the_tests_that_drive_it() {
+        // `tyf` has nothing to say about `show`: Typer holds the only handle on
+        // it, so its own definition is the only reference that exists.
+        let index =
+            MapIndex::default().with("src/pkg/cli.py", CLI).with("tests/test_cli.py", CLI_TEST);
+        let refs = MapRefs::default().with("pkg.cli:show", &[]);
+
+        let closure = run(&[seed("pkg.cli:show", "src/pkg/cli.py", 7)], &refs, &index);
+
+        assert_eq!(
+            closure.verdict,
+            Verdict::Selected,
+            "the registrar resolved, so the answer is trustworthy"
+        );
+        assert!(
+            closure.impacted.iter().any(|test| test.file == "tests/test_cli.py"),
+            "the test that invokes `app` must be selected, got {:?}",
+            closure.impacted
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_registrar_runs_everything_rather_than_selecting_nothing() {
+        // Same shape, but nothing in the tree mentions `app` apart from the
+        // decorator itself — the walk cannot see who drives `show`.
+        let index = MapIndex::default()
+            .with("src/pkg/cli.py", "@app.command()\ndef show():\n    return 1\n");
+        let refs = MapRefs::default().with("pkg.cli:show", &[]);
+
+        let closure = run(&[seed("pkg.cli:show", "src/pkg/cli.py", 2)], &refs, &index);
+
+        assert_eq!(
+            closure.verdict,
+            Verdict::RunAll,
+            "an invisible dispatch is not the same as no impact"
+        );
+        assert_eq!(closure.reason, Some(Reason::DecoratorDispatch));
+        assert!(
+            closure.errors.iter().any(|e| e.contains("@app.command")),
+            "the reason must name the decorator it could not see through, got {:?}",
+            closure.errors
+        );
+    }
+
+    #[test]
+    fn a_wrapping_decorator_is_not_treated_as_a_registrar() {
+        // `@functools.wraps` does not hand `helper` to anyone; a dead end here
+        // is a real dead end, and escalating would run the suite for nothing.
+        let index = MapIndex::default().with(
+            "src/pkg/util.py",
+            "import functools\n\n\n@functools.wraps(print)\ndef helper():\n    return 1\n",
+        );
+        let refs = MapRefs::default().with("pkg.util:helper", &[]);
+
+        let closure = run(&[seed("pkg.util:helper", "src/pkg/util.py", 5)], &refs, &index);
+
+        assert_eq!(closure.verdict, Verdict::Selected, "an inert decorator changes nothing");
+        assert!(closure.impacted.is_empty(), "and nothing is impacted");
+    }
+
+    #[test]
+    fn a_symbol_with_real_callers_never_pays_for_a_registrar_scan() {
+        // The decorated symbol is reached normally, so the dead-end path — and
+        // the over-selection a word scan brings — must not run at all.
+        let index = MapIndex::default()
+            .with("src/pkg/cli.py", CLI)
+            .with("tests/test_cli.py", CLI_TEST)
+            .with(
+                "tests/test_direct.py",
+                "from pkg.cli import show\n\n\ndef test_direct():\n    assert show(1) == 1\n",
+            );
+        let refs = MapRefs::default().with("pkg.cli:show", &[("tests/test_direct.py", 5)]);
+
+        let closure = run(&[seed("pkg.cli:show", "src/pkg/cli.py", 7)], &refs, &index);
+
+        assert_eq!(
+            selected(&closure).into_iter().map(|(file, ..)| file).collect::<Vec<_>>(),
+            vec!["tests/test_direct.py".to_string()],
+            "a resolvable reference wins; the registrar scan stays unused"
+        );
+    }
+
+    #[test]
+    fn an_aliased_import_carries_the_walk_into_the_importing_module() {
+        // `tyf` answers a query about `handler` with the import line and
+        // nothing else: the call below spells `_handler`, a different binding.
+        // Dropping that line as "redundant" would sever the graph here.
+        let index = MapIndex::default()
+            .with("src/pkg/handlers.py", "def handler():\n    return 1\n")
+            .with(
+                "src/pkg/routes.py",
+                "from pkg.handlers import handler as _handler\n\n\ndef route():\n    return _handler()\n",
+            )
+            .with("tests/test_route.py", "from pkg.routes import route\n\n\ndef test_route():\n    assert route() == 1\n");
+        let refs = MapRefs::default()
+            .with("pkg.handlers:handler", &[("src/pkg/routes.py", 1)])
+            .with("pkg.routes:_handler", &[("src/pkg/routes.py", 5)])
+            .with("pkg.routes:route", &[("tests/test_route.py", 5)]);
+
+        let closure = run(&[seed("pkg.handlers:handler", "src/pkg/handlers.py", 1)], &refs, &index);
+
+        assert_eq!(
+            selected(&closure).into_iter().map(|(file, ..)| file).collect::<Vec<_>>(),
+            vec!["tests/test_route.py".to_string()],
+            "the rename must not end the walk"
+        );
+        assert!(
+            closure.impacted[0].via.contains(&"pkg.routes:_handler".to_string()),
+            "and the chain names where the rename happened, got {:?}",
+            closure.impacted[0].via
+        );
+    }
+
+    #[test]
+    fn a_plain_import_is_still_dropped() {
+        // No rename: the importing module's own use of `handler` is its own
+        // reference, so following the import line too would select every module
+        // that merely imports it.
+        let index =
+            MapIndex::default().with("src/pkg/handlers.py", "def handler():\n    return 1\n").with(
+                "src/pkg/routes.py",
+                "from pkg.handlers import handler\n\n\ndef route():\n    return handler()\n",
+            );
+        let refs = MapRefs::default().with("pkg.handlers:handler", &[("src/pkg/routes.py", 1)]);
+
+        let closure = run(&[seed("pkg.handlers:handler", "src/pkg/handlers.py", 1)], &refs, &index);
+
+        assert_eq!(closure.stats.visited, 1, "the import line alone adds no node");
+        assert!(closure.impacted.is_empty());
+    }
+
+    #[test]
+    fn the_registrar_helpers_split_a_dotted_decorator() {
+        assert_eq!(registrar_of("app.command"), Some("app"));
+        assert_eq!(registrar_of("router.get"), Some("router"));
+        assert_eq!(registrar_of("a.b.tool"), Some("a"), "the local name is the first segment");
+        assert_eq!(registrar_of("register"), None, "a bare decorator is its own reference");
+        assert!(is_inert("property"));
+        assert!(is_inert("functools.wraps"), "matched on the last segment");
+        assert!(!is_inert("app.command"));
     }
 
     #[test]

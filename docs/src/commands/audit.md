@@ -31,13 +31,22 @@ directory, or its name matches `test_*.py` / `*_test.py`.
 
 ## What gets audited
 
-Only **callable** symbols — functions and methods. Within those, two groups are
-skipped deliberately:
+Only **callable** symbols — functions and methods. Within those, three groups
+are skipped deliberately:
 
 - names starting with `_`, including dunder methods: private by convention, or
   invoked implicitly by the interpreter;
 - classes, variables and constants: their reference patterns are noisy enough
-  that flagging them produces more false positives than signal.
+  that flagging them produces more false positives than signal;
+- functions carrying a **registering decorator** — `@app.command()`,
+  `@router.get(...)`, `@mcp.tool()`. A framework holds the reference and calls
+  them, so "no references" says nothing about whether they are dead. Flagging
+  them means flagging every CLI command and every route in the project, which
+  buries the findings that are real: on one project this rule alone cut 48
+  warnings to 5 while keeping both genuine ones. Decorators that merely wrap
+  (`@property`, `@staticmethod`, `@functools.wraps`) do not count, and those
+  functions are still audited. See
+  [ADR 0012](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0012-a-decorator-is-a-reference.md).
 
 The `N symbol(s) checked` count in the summary reports every symbol in the
 outline, including the skipped ones, so you can see how much of the file the

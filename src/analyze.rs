@@ -52,6 +52,9 @@ pub struct SymbolUsage {
     pub kind: SymbolKind,
     pub line: u32,
     pub refs: ReferencesResult,
+    /// Dotted names of the decorators applied to it, when the file could be
+    /// parsed. A registering decorator is what makes "no references" a lie.
+    pub decorators: Vec<String>,
 }
 
 /// Flatten a `tyf list` outline into the callable symbols worth auditing.
@@ -149,6 +152,15 @@ fn classify(usage: &SymbolUsage, file: &Path, root: &Path) -> Option<(Severity, 
         return None;
     }
 
+    // A framework holds the reference to a registered function: `@app.command`
+    // and `@router.get` are called by Typer and FastAPI, and no reference to
+    // them exists to be counted. Reporting these as dead is not a near-miss —
+    // it is every CLI command and every route in the project, which buries the
+    // findings that are real. Skipped for the same reason `_private` names are.
+    if usage.decorators.iter().any(|d| !crate::closure::is_inert(d)) {
+        return None;
+    }
+
     if tests == 0 {
         Some((Severity::Warn, format!("`{}` has no references", usage.name)))
     } else {
@@ -186,7 +198,13 @@ mod tests {
     }
 
     fn usage(name: &str, refs: ReferencesResult) -> SymbolUsage {
-        SymbolUsage { name: name.to_string(), kind: SymbolKind::Function, line: 10, refs }
+        SymbolUsage {
+            name: name.to_string(),
+            kind: SymbolKind::Function,
+            line: 10,
+            refs,
+            decorators: Vec::new(),
+        }
     }
 
     fn span(line: u32) -> Range {

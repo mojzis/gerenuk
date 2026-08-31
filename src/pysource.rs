@@ -165,12 +165,40 @@ pub struct Module {
     /// Lines covered by an `import` or `from ... import` statement, wherever it
     /// sits. Parenthesised imports span several lines, hence ranges.
     pub imports: Vec<(u32, u32)>,
+    /// Every `… import X as Y` binding in the file.
+    pub aliases: Vec<ImportAlias>,
     /// The source did not parse cleanly. Callers treat the whole file as
     /// module-level rather than trusting a partial tree.
     pub has_error: bool,
 }
 
+/// One `import X as Y`: the name that was imported, and where the new name it
+/// was bound to sits.
+///
+/// The rename matters because a reference query answers for `X` and the code
+/// then calls `Y`. Nothing links the two but this line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportAlias {
+    /// The original name, as the exporting module spells it.
+    pub imported: String,
+    /// The local name it was bound to.
+    pub alias: String,
+    /// Line of the alias identifier, 1-based.
+    pub line: u32,
+    /// 1-based column of the alias identifier, as `tyf refs file:line:col` wants.
+    pub column: u32,
+}
+
 impl Module {
+    /// The alias `name` was bound to on `line`, when that import renames it.
+    ///
+    /// `None` for a plain `from x import name`: there the callers spell the
+    /// symbol the same way, so its own reference query already finds them.
+    #[must_use]
+    pub fn alias_on_line(&self, line: u32, name: &str) -> Option<&ImportAlias> {
+        self.aliases.iter().find(|a| a.line == line && a.imported == name)
+    }
+
     /// The innermost definition containing `line`, if any.
     ///
     /// Spans nest only class-inside-class and member-inside-class, so "deepest"
@@ -214,7 +242,10 @@ pub fn parse(source: &str) -> Result<Module> {
     collect_imports(root, &mut imports);
     imports.sort_unstable();
 
-    Ok(Module { spans, imports, has_error: root.has_error() })
+    let mut aliases = Vec::new();
+    collect_aliases(root, source.as_bytes(), &mut aliases);
+
+    Ok(Module { spans, imports, aliases, has_error: root.has_error() })
 }
 
 /// Line ranges of every import statement in the tree, at any nesting depth.
@@ -232,6 +263,35 @@ fn collect_imports(node: Node, out: &mut Vec<(u32, u32)>) {
             out.push((one_based(child.start_position().row), one_based(child.end_position().row)));
         } else {
             collect_imports(child, out);
+        }
+    }
+}
+
+/// Every `import X as Y` in the tree, at any nesting depth.
+///
+/// tree-sitter spells both `import a.b as c` and `from a import b as c` with an
+/// `aliased_import` node holding a `name` and an `alias`.
+fn collect_aliases(node: Node, src: &[u8], out: &mut Vec<ImportAlias>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        if child.kind() == "aliased_import" {
+            let (Some(name), Some(alias)) =
+                (child.child_by_field_name("name"), child.child_by_field_name("alias"))
+            else {
+                continue;
+            };
+            let Ok(imported) = name.utf8_text(src) else { continue };
+            let Ok(local) = alias.utf8_text(src) else { continue };
+            out.push(ImportAlias {
+                // `import a.b as c` names a module; the last segment is what a
+                // symbol query would have been asked about.
+                imported: imported.rsplit('.').next().unwrap_or(imported).to_string(),
+                alias: local.to_string(),
+                line: one_based(alias.start_position().row),
+                column: one_based(alias.start_position().column),
+            });
+        } else {
+            collect_aliases(child, src, out);
         }
     }
 }
@@ -911,6 +971,26 @@ x = 1
         assert!(parsed.is_import_line(2), "`from ... import ...`");
         assert!(!parsed.is_import_line(3), "a blank line is not an import");
         assert!(!parsed.is_import_line(4), "an assignment is not an import");
+    }
+
+    #[test]
+    fn an_aliased_import_records_where_the_new_name_sits() {
+        let source = "\
+from pkg.handlers import handler as _handler
+import numpy as np
+from pkg import plain
+";
+        let parsed = module(source);
+
+        let renamed = parsed.alias_on_line(1, "handler").expect("line 1 renames `handler`");
+        assert_eq!(renamed.alias, "_handler");
+        assert_eq!(renamed.column, 37, "the column points at the alias, not the original");
+
+        let dotted = parsed.alias_on_line(2, "numpy").expect("`import numpy as np`");
+        assert_eq!(dotted.alias, "np", "a dotted module alias is keyed by its last segment");
+
+        assert!(parsed.alias_on_line(3, "plain").is_none(), "an unrenamed import is not an alias");
+        assert!(parsed.alias_on_line(1, "other").is_none(), "and only the named import matches");
     }
 
     #[test]

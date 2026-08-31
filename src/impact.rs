@@ -376,6 +376,12 @@ impl Index for FsIndex<'_> {
         Ok(module.top_level().map(indexed).collect())
     }
 
+    fn import_alias(&self, file: &Path, line: u32, name: &str) -> Result<Option<(String, u32)>> {
+        let Some(cached) = self.load(file)? else { return Ok(None) };
+        let Some(module) = cached.module() else { return Ok(None) };
+        Ok(module.alias_on_line(line, name).map(|a| (a.alias.clone(), a.column)))
+    }
+
     fn word_hits(&self, name: &str) -> Result<Vec<(PathBuf, u32)>> {
         let mut hits = Vec::new();
         for file in &self.files {
