@@ -304,8 +304,7 @@ fn analyze_file(
         let (span, side) = surviving(new.as_ref(), module, &span.qualname).unwrap_or((span, side));
 
         let ignored_by = span
-            .decorators
-            .iter()
+            .decorator_names()
             .find_map(|decorator| config.matching_decorator(decorator))
             .map(ToString::to_string);
 

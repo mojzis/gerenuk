@@ -28,19 +28,32 @@ src/
   # impacted-tests
   closure.rs    BFS over the reverse reference graph (pure)
   impact.rs     tyf + working tree behind closure's traits, ImpactReport
+
+  # run
+  fixtures.rs   pytest fixture map + collection conventions (pure)
+  select.rs     ImpactReport + working tree -> Selection, node ids (pure)
+  pytest.rs     the third seam: runner resolution, argv assembly, exec
 ```
 
 Decisions worth their own page live in [`../adr/`](../adr/README.md); this file
 describes the shape, those record why it is that shape.
 
-## The two impure seams
+## The three impure seams
 
-`tyf` and `git` are the only two modules that spawn a process. The spawn sites
-are `tyf::Runner::run` and the private `git::Git::output` — reached only through
-`git::Git::run` and `git::Git::try_run`, which differ in whether a non-zero exit
-is an error or an answer. Everything downstream takes parsed values. That is deliberate: it means
+`tyf`, `git` and `pytest` are the only three modules that spawn a process. The
+spawn sites are `tyf::Runner::run`, the private `git::Git::output` — reached
+only through `git::Git::run` and `git::Git::try_run`, which differ in whether a
+non-zero exit is an error or an answer — and `pytest::Runner::exec`. Everything
+downstream takes parsed values. That is deliberate: it means
 the rules and the renderers are unit-testable with no `tyf`, no `ty`, no `git`
 and no Python environment.
+
+The third seam is a different shape from the other two, and that is the whole
+reason it is allowed ([ADR 0011](../adr/0011-a-third-seam-that-only-execs.md)).
+It is exec-and-replace rather than run-and-parse: on Unix gerenuk's process
+*becomes* pytest, so there is nothing to capture, nothing to parse and no
+caller left to return to. Runner resolution, argv assembly and the one-line
+summary around it are ordinary pure functions.
 
 `ty-find` ships a binary and no `[lib]` target, so the integration is over
 stdout with `--format json` rather than a crate dependency. `tyf` prefixes some
@@ -53,17 +66,37 @@ wrong, and `changed-symbols` runs them a handful of times per invocation.
 `changed::Sources` is the trait that hides it — `GitSources` is the real
 implementation, and the unit tests supply a `HashMap` instead.
 
-## Three commands, three data sources
+## Four commands, four data sources
 
 `audit` asks `tyf` about symbols that exist now. `changed-symbols` asks `git`
 what moved and `tree-sitter` who owns those lines; it never constructs a
 `tyf::Runner`, which is why it works in a checkout with no `ty` installed.
 `impacted-tests` is the one that needs both — but only after the verdicts that
 need neither (`non_python_changes`, `parse_errors`) have been settled, so a
-diff of a `pyproject.toml` alone still answers with no `ty` installed.
+diff of a `pyproject.toml` alone still answers with no `ty` installed. `run`
+adds a fourth source that is neither `tyf` nor `git`: the test files themselves,
+parsed for their fixtures and their collectible names.
 
 They share `workspace.rs` (root detection, the test-path heuristic),
 `pysource.rs` and `report::Format`.
+
+`run` calls `impacted-tests`'s body as a library function rather than as a
+subprocess of itself, and reuses the `git ls-files` listing that walk already
+needed. Its own reach into the working tree is `select::Tree`, a third trait
+that `impact::FsIndex` implements alongside `closure::Index` — same cache, read
+as whole parsed modules rather than one line's classification.
+
+## The selection
+
+`select.rs` turns an `ImpactReport` into pytest node ids and is where every
+pytest-shaped rule lives: the collectibility gate, fixture expansion, and the
+collapse of per-test ids into a whole file that supersedes them. `fixtures.rs`
+underneath it is the fixture map — pytest injects by *name*, which no type
+checker can follow, so the name edge is reconstructed from the parse.
+
+Both are pure. Every degrade in them widens the selection rather than narrowing
+it, because the one failure mode the command must not have is a confident list
+that misses a test.
 
 ## The closure's two traits
 
@@ -108,10 +141,19 @@ import and line-attribution rules under test are the ones the binary uses.
 | End-to-end (audit) | `tests/cli.rs`, `tests/audit.rs` | no — stubbed | no |
 | End-to-end (changed-symbols) | `tests/changed_symbols.rs` | no | yes |
 | End-to-end (impacted-tests) | `tests/impacted_tests.rs` | no — stubbed | yes |
+| Fixture map / collection rules | `src/fixtures.rs` unit tests | no | no |
+| Node-id mapping | `src/select.rs` unit tests | no | no |
+| Runner resolution, argv | `src/pytest.rs` unit tests | no | no |
+| End-to-end (run) | `tests/run.rs` | no — stubbed | yes |
 | Real LSP output | `make test-impact` (`scripts/impact-smoke.sh`) | **yes** | yes |
+| Real LSP output *and* real pytest | `make test-run` (`scripts/run-smoke.sh`) | **yes** | yes |
 
 `tests/common/mod.rs` writes a small shell script that answers `list` and `refs`
-with canned JSON, then points `GERENUK_TYF` at it. The canned payloads mirror
+with canned JSON, then points `GERENUK_TYF` at it. `fake_pytest` is the same
+trick for the third seam: a script that records the argv it was handed and exits
+with a chosen code, so `tests/run.rs` can assert both what pytest was asked to
+run and — for the empty selection — that the recording file was never created,
+which is the only way to prove nothing was spawned. The canned payloads mirror
 what real `tyf` returns for `tests/fixtures/sample_pkg`, so the fixture package
 and the expectations stay in step.
 
@@ -136,6 +178,15 @@ stubs `tyf`, so that chain is exercised against real LSP output by
 fixture lives inside gerenuk's own checkout, so running in place would diff
 gerenuk instead).
 
+`tests/conftest.py` adds the shape phase 3 needs: `described` is a fixture that
+calls `describe` and is consumed only by `tests/test_fixtures.py`, which never
+mentions `describe` itself. That edge exists nowhere in the reference graph, so
+selecting those tests is proof the fixture map ran. `make test-run` exercises it
+with a real `tyf` *and* a real pytest. It deliberately does **not** import
+`sample_pkg.cli`: doing so would put the conftest among the test importers of a
+module that already has a module-level edge, and the whole subtree would be
+selected wholesale, burying the thing under test.
+
 Changing the fixture's call graph means updating both the pytest suite and the
 canned payloads in `tests/audit.rs`.
 
@@ -155,6 +206,17 @@ never attempted.
    and its canned `tyf` payloads to match.
 4. Document the rule in `docs/src/commands/impacted-tests.md`, and record the
    decision in `docs/adr/` if it was a close call.
+
+## Adding a selection rule
+
+1. Add it to `select.rs` or `fixtures.rs`, with a unit test against `MapTree` /
+   the map-backed `FixtureMap`. Check which way it degrades: wider is safe,
+   narrower is the bug this command must not have.
+2. If it needs something new from the working tree, add it to `select::Tree` —
+   not a fourth seam.
+3. Extend `tests/run.rs`'s repository with a file in the new shape, and assert
+   on the argv the pytest stub records.
+4. Document it in `docs/src/commands/run.md`.
 
 ## Adding a rule
 

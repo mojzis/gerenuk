@@ -57,8 +57,13 @@ pub struct SymbolSpan {
     /// Byte-based, which matches character positions for every prefix Python
     /// allows here — indentation, `def `, `class `, `async def ` are all ASCII.
     pub name_column: u32,
-    /// Dotted names of the decorators applied to this definition.
-    pub decorators: Vec<String>,
+    /// The decorators applied to this definition, in source order.
+    pub decorators: Vec<Decorator>,
+    /// Parameter names of a `def`, splats and separators excluded.
+    ///
+    /// Empty for a class. This is how a pytest fixture request is recognised:
+    /// pytest injects by parameter *name*, so the list is the whole edge.
+    pub params: Vec<String>,
 }
 
 impl SymbolSpan {
@@ -66,6 +71,89 @@ impl SymbolSpan {
     pub const fn contains(&self, line: u32) -> bool {
         line >= self.start_line && line <= self.end_line
     }
+
+    /// Dotted names of the decorators applied to this definition.
+    pub fn decorator_names(&self) -> impl Iterator<Item = &str> {
+        self.decorators.iter().map(|decorator| decorator.name.as_str())
+    }
+
+    /// The first decorator whose dotted name suffix-matches `entry`.
+    ///
+    /// The same syntactic matcher `ignore-decorators` uses — bare, called or
+    /// dotted, with import aliases deliberately unresolved.
+    #[must_use]
+    pub fn decorator(&self, entry: &str) -> Option<&Decorator> {
+        self.decorators.iter().find(|decorator| suffix_matches(&decorator.name, entry))
+    }
+}
+
+/// One `@decorator`, reduced to the dotted name plus whatever literals it was
+/// called with.
+///
+/// `@pytest.fixture`, `@pytest.fixture()` and `@pytest.fixture(name="x")` all
+/// carry the same [`Self::name`]; only the last has arguments. Anything that is
+/// not a string or a bool arrives as [`Literal::Other`], which is what makes a
+/// dynamic `name=` distinguishable from an absent one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Decorator {
+    /// Dotted name being referenced: `registry.transformation`.
+    pub name: String,
+    /// Positional arguments, in order.
+    pub args: Vec<Literal>,
+    /// Keyword arguments, in order.
+    pub kwargs: Vec<(String, Literal)>,
+}
+
+impl Decorator {
+    /// The value passed for `key`, if the decorator was called with it.
+    #[must_use]
+    pub fn kwarg(&self, key: &str) -> Option<&Literal> {
+        self.kwargs.iter().find(|(name, _)| name == key).map(|(_, value)| value)
+    }
+
+    /// Every positional argument that was a string literal.
+    ///
+    /// Non-literal arguments are dropped rather than approximated: the callers
+    /// that need to know something was lost check the count against
+    /// [`Self::args`].
+    pub fn string_args(&self) -> impl Iterator<Item = &str> {
+        self.args.iter().filter_map(Literal::as_str)
+    }
+}
+
+/// An argument value, as far as reading the source can tell.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Literal {
+    Str(String),
+    Bool(bool),
+    /// A name, a call, an f-string — anything whose value needs running Python.
+    Other,
+}
+
+impl Literal {
+    #[must_use]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Str(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Whether this is the literal `True`.
+    #[must_use]
+    pub const fn is_true(&self) -> bool {
+        matches!(self, Self::Bool(true))
+    }
+}
+
+/// True when the dotted name ends with `entry` on a component boundary.
+///
+/// Shared by [`SymbolSpan::decorator`] and [`crate::config::Config`] so the
+/// fixture rules and `ignore-decorators` cannot drift apart on what `@fixture`
+/// matches.
+#[must_use]
+pub fn suffix_matches(dotted: &str, entry: &str) -> bool {
+    dotted == entry || dotted.strip_suffix(entry).is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 /// Every definition in one module, plus whether the parse was clean.
@@ -174,7 +262,7 @@ fn collect(node: Node, src: &[u8], prefix: &[String], in_class: bool, out: &mut 
 fn emit(
     def: Node,
     outer: Node,
-    decorators: Vec<String>,
+    decorators: Vec<Decorator>,
     src: &[u8],
     prefix: &[String],
     in_class: bool,
@@ -207,6 +295,7 @@ fn emit(
         name_line,
         name_column,
         decorators,
+        params: parameters(def, src),
     });
 
     if defines_class {
@@ -216,13 +305,99 @@ fn emit(
     }
 }
 
-/// Dotted names of every `@decorator` attached to a `decorated_definition`.
-fn decorators(node: Node, src: &[u8]) -> Vec<String> {
+/// Every `@decorator` attached to a `decorated_definition`.
+fn decorators(node: Node, src: &[u8]) -> Vec<Decorator> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor)
         .filter(|child| child.kind() == "decorator")
         .filter_map(|decorator| decorator.named_child(0))
-        .filter_map(|expr| dotted_name(expr, src))
+        .filter_map(|expr| decorator(expr, src))
+        .collect()
+}
+
+/// Reduce one decorator expression to its name and its literal arguments.
+///
+/// Arguments only exist for the call form; `@pytest.fixture` and
+/// `@pytest.fixture()` differ in nothing else.
+fn decorator(expr: Node, src: &[u8]) -> Option<Decorator> {
+    let name = dotted_name(expr, src)?;
+    let mut args = Vec::new();
+    let mut kwargs = Vec::new();
+
+    if expr.kind() == "call" {
+        if let Some(list) = expr.child_by_field_name("arguments") {
+            let mut cursor = list.walk();
+            for child in list.named_children(&mut cursor) {
+                if child.kind() == "keyword_argument" {
+                    let key = child.child_by_field_name("name").and_then(|n| n.utf8_text(src).ok());
+                    let value = child.child_by_field_name("value").map(|v| literal(v, src));
+                    if let (Some(key), Some(value)) = (key, value) {
+                        kwargs.push((key.to_string(), value));
+                    }
+                } else {
+                    args.push(literal(child, src));
+                }
+            }
+        }
+    }
+
+    Some(Decorator { name, args, kwargs })
+}
+
+/// The value of an expression, when reading it is enough to know it.
+fn literal(node: Node, src: &[u8]) -> Literal {
+    match node.kind() {
+        "true" => Literal::Bool(true),
+        "false" => Literal::Bool(false),
+        "string" => string_value(node, src).map_or(Literal::Other, Literal::Str),
+        _ => Literal::Other,
+    }
+}
+
+/// The text inside a string literal, prefixes and quotes stripped.
+///
+/// `None` for anything interpolated: an f-string's `string_content` is only
+/// part of its value, and half a name is worse than no name.
+fn string_value(node: Node, src: &[u8]) -> Option<String> {
+    let mut cursor = node.walk();
+    let children: Vec<Node> = node.named_children(&mut cursor).collect();
+    if children.iter().any(|child| child.kind() == "interpolation") {
+        return None;
+    }
+    let content: Vec<&str> = children
+        .iter()
+        .filter(|child| child.kind() == "string_content")
+        .filter_map(|child| child.utf8_text(src).ok())
+        .collect();
+    match content.as_slice() {
+        // An empty literal has no `string_content` child at all.
+        [] => Some(String::new()),
+        [single] => Some((*single).to_string()),
+        _ => None,
+    }
+}
+
+/// Parameter names of a `def`, in order.
+///
+/// `*args`, `**kwargs` and the `/` and `*` separators are skipped: none of them
+/// can carry a pytest fixture request. A class has no parameter list, and so no
+/// parameters.
+fn parameters(def: Node, src: &[u8]) -> Vec<String> {
+    let Some(list) = def.child_by_field_name("parameters") else { return Vec::new() };
+    let mut cursor = list.walk();
+    list.named_children(&mut cursor)
+        .filter_map(|param| match param.kind() {
+            "identifier" => param.utf8_text(src).ok().map(ToString::to_string),
+            "default_parameter" | "typed_default_parameter" => param
+                .child_by_field_name("name")
+                .and_then(|n| n.utf8_text(src).ok())
+                .map(ToString::to_string),
+            // `x: int` — the name is the first child, there is no `name` field.
+            "typed_parameter" => {
+                param.named_child(0).and_then(|n| n.utf8_text(src).ok()).map(ToString::to_string)
+            }
+            _ => None,
+        })
         .collect()
 }
 
@@ -498,21 +673,21 @@ class C:
     pass
 ";
         let spans = module(source).spans;
-        let decorators = |name: &str| {
+        let names = |name: &str| {
             spans
                 .iter()
                 .find(|s| s.qualname == name)
-                .map(|s| s.decorators.clone())
+                .map(|s| s.decorator_names().map(ToString::to_string).collect::<Vec<_>>())
                 .unwrap_or_default()
         };
-        assert_eq!(decorators("a"), vec!["transformation".to_string()], "bare decorator");
+        assert_eq!(names("a"), vec!["transformation".to_string()], "bare decorator");
         assert_eq!(
-            decorators("b"),
+            names("b"),
             vec!["registry.transformation".to_string()],
-            "call parentheses and arguments are dropped"
+            "call parentheses do not change the name"
         );
         assert_eq!(
-            decorators("C"),
+            names("C"),
             vec!["registry.sub.thing".to_string()],
             "classes carry decorators too"
         );
@@ -529,12 +704,8 @@ def a():
 ";
         let spans = module(source).spans;
         assert_eq!(
-            spans[0].decorators,
-            vec![
-                "staticmethod".to_string(),
-                "transformation".to_string(),
-                "functools.cache".to_string()
-            ],
+            spans[0].decorator_names().collect::<Vec<_>>(),
+            vec!["staticmethod", "transformation", "functools.cache"],
             "all three must be visible so the ignore list can match any of them"
         );
         assert_eq!(spans[0].start_line, 1, "the span starts at the first decorator");
@@ -554,6 +725,133 @@ def a():
             spans[0].decorators
         );
         assert_eq!(spans[0].qualname, "a", "the definition itself is still found");
+    }
+
+    /// The span for `qualname`, which every fixture-rule test starts from.
+    fn span(source: &str, qualname: &str) -> SymbolSpan {
+        module(source)
+            .spans
+            .into_iter()
+            .find(|s| s.qualname == qualname)
+            .unwrap_or_else(|| panic!("`{qualname}` should be in the source"))
+    }
+
+    #[test]
+    fn a_string_keyword_argument_is_read_off_the_decorator() {
+        let source = "\
+@pytest.fixture(name=\"shelter\", autouse=True, scope=\"session\")
+def _make_shelter():
+    pass
+";
+        let decorator = &span(source, "_make_shelter").decorators[0];
+        assert_eq!(decorator.name, "pytest.fixture");
+        assert_eq!(
+            decorator.kwarg("name").and_then(Literal::as_str),
+            Some("shelter"),
+            "the injected name is the one the rules match on"
+        );
+        assert!(decorator.kwarg("autouse").is_some_and(Literal::is_true), "`autouse=True`");
+        assert_eq!(decorator.kwarg("missing"), None, "an absent kwarg is absent");
+    }
+
+    #[test]
+    fn a_non_literal_keyword_argument_is_recorded_as_unreadable() {
+        // The distinction that matters: `Other` means "there is a name and we
+        // cannot know it", which is a coarser fallback, not an absent kwarg.
+        let source = "\
+@pytest.fixture(name=NAME, autouse=flag)
+def f():
+    pass
+";
+        let decorator = &span(source, "f").decorators[0];
+        assert_eq!(decorator.kwarg("name"), Some(&Literal::Other), "a variable is not a literal");
+        assert!(
+            !decorator.kwarg("autouse").is_some_and(Literal::is_true),
+            "and a non-literal autouse is not True"
+        );
+    }
+
+    #[test]
+    fn positional_string_arguments_are_read_in_order() {
+        let source = "\
+@pytest.mark.usefixtures(\"shelter\", \"clock\")
+def test_x():
+    pass
+";
+        let decorator = &span(source, "test_x").decorators[0];
+        assert_eq!(decorator.name, "pytest.mark.usefixtures");
+        assert_eq!(decorator.string_args().collect::<Vec<_>>(), vec!["shelter", "clock"]);
+    }
+
+    #[test]
+    fn an_f_string_argument_is_not_mistaken_for_its_literal_half() {
+        let source = "\
+@pytest.fixture(name=f\"{prefix}_shelter\")
+def f():
+    pass
+";
+        let decorator = &span(source, "f").decorators[0];
+        assert_eq!(
+            decorator.kwarg("name"),
+            Some(&Literal::Other),
+            "half an interpolated name is worse than no name"
+        );
+    }
+
+    #[test]
+    fn a_bare_decorator_has_no_arguments_at_all() {
+        let decorator = &span("@fixture\ndef f():\n    pass\n", "f").decorators[0];
+        assert!(decorator.args.is_empty() && decorator.kwargs.is_empty(), "nothing was called");
+        assert_eq!(decorator.kwarg("name"), None, "so there is no name override");
+    }
+
+    #[test]
+    fn parameters_are_listed_in_order_without_splats_or_separators() {
+        let source = "\
+def f(shelter, clock: Clock, seed=1, count: int = 2, /, *args, key=None, **kwargs):
+    pass
+";
+        assert_eq!(
+            span(source, "f").params,
+            vec!["shelter", "clock", "seed", "count", "key"],
+            "a splat cannot carry a fixture request; a named parameter can"
+        );
+    }
+
+    #[test]
+    fn a_method_lists_self_like_any_other_parameter() {
+        let source = "\
+class TestThing:
+    def test_x(self, shelter):
+        pass
+";
+        assert_eq!(span(source, "TestThing.test_x").params, vec!["self", "shelter"]);
+        assert!(span(source, "TestThing").params.is_empty(), "a class has no parameter list");
+    }
+
+    #[test]
+    fn the_decorator_matcher_is_the_one_the_ignore_list_uses() {
+        let source = "\
+@pytest.fixture
+def a():
+    pass
+
+
+@fixture
+def b():
+    pass
+
+
+@other.thing
+def c():
+    pass
+";
+        assert!(span(source, "a").decorator("pytest.fixture").is_some(), "the dotted form");
+        assert!(span(source, "a").decorator("fixture").is_some(), "and its suffix");
+        assert!(span(source, "b").decorator("fixture").is_some(), "the bare form");
+        assert!(span(source, "b").decorator("pytest.fixture").is_none(), "but not the other way");
+        assert!(span(source, "c").decorator("fixture").is_none(), "an unrelated decorator");
+        assert!(!suffix_matches("prefixture", "fixture"), "the boundary must be a dot");
     }
 
     #[test]

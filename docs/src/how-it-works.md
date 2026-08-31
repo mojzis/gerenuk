@@ -11,6 +11,11 @@ has never had `ty` installed — see [changed-symbols](commands/changed-symbols.
 `tree-sitter` to find the changed symbols, then `tyf` to walk outwards from
 them.
 
+[`run`](commands/run.md) adds a third source that is neither: the test files
+themselves, parsed for pytest's collection conventions and for the fixture
+edges pytest resolves by *name* — which no type checker can follow. It then
+execs pytest.
+
 ```mermaid
 flowchart LR
     H[gerenuk impacted-tests] --> I[changed-symbols<br/>git + tree-sitter]
@@ -22,6 +27,11 @@ flowchart LR
     N -- import --> P[dropped]
     N -- definition --> L
     N -- test --> O[impacted test<br/>+ why-chain]
+    O --> Q[select<br/>node ids + fixtures]
+    K --> Q
+    Q --> R{anything to run?}
+    R -- yes --> S[exec pytest]
+    R -- no --> T[exit 0<br/>nothing spawned]
 ```
 
 
@@ -75,8 +85,9 @@ among the references. Counting it would mean nothing is ever unreferenced, so
 | Module | Responsibility |
 |---|---|
 | `cli` | Argument parsing and command bodies |
-| `tyf` | Spawning `tyf`, decoding its JSON — one of two impure modules |
-| `git` | Spawning `git` — the other one |
+| `tyf` | Spawning `tyf`, decoding its JSON — one of three impure modules |
+| `git` | Spawning `git` — the second |
+| `pytest` | Exec'ing pytest — the third, and it only execs ([ADR 0011](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0011-a-third-seam-that-only-execs.md)) |
 | `model` | Wire types for what `tyf` emits |
 | `workspace` | Project-root detection, test-path heuristic |
 | `analyze` | The `audit` rules — pure, given parsed data |
@@ -87,13 +98,21 @@ among the references. Counting it would mean nothing is ever unreferenced, so
 | `changed` | Diff plus sources → the `changed-symbols` report |
 | `closure` | BFS over the reverse reference graph — pure, behind two traits |
 | `impact` | `tyf` and the working tree behind those traits; the impact report |
+| `fixtures` | pytest's fixture map and collection conventions — pure |
+| `select` | Impact report plus the working tree → pytest node ids — pure |
 | `report` | Human and JSON rendering |
 
-`tyf::Runner::run` and `git::Git::run` are the only functions that spawn a
-process. Everything downstream takes already-parsed values, which is why the
-analysis and rendering tests need no `tyf`, no `ty`, no `git` and no Python:
-the integration tests stub `tyf` with a shell script and set `GERENUK_TYF`, and
-`changed`'s unit tests substitute a `HashMap` for the `changed::Sources` trait.
+`tyf::Runner::run`, `git::Git::run` and `pytest::Runner::exec` are the only
+functions that spawn a process. Everything downstream takes already-parsed
+values, which is why the analysis and rendering tests need no `tyf`, no `ty`,
+no `git`, no pytest and no Python: the integration tests stub `tyf` and pytest
+with shell scripts and set `GERENUK_TYF` and `GERENUK_PYTEST`, and `changed`'s
+unit tests substitute a `HashMap` for the `changed::Sources` trait.
+
+The third seam is a different shape from the other two, which is why it was
+allowed. It is exec-and-replace rather than run-and-parse: gerenuk's process
+*becomes* pytest, so there is nothing to capture and no caller left to return
+to.
 
 ## Why dotted names
 

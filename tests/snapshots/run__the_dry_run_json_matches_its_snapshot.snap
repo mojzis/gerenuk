@@ -1,0 +1,38 @@
+---
+source: tests/run.rs
+expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serialises\")"
+---
+{
+  "argv": [
+    "<pytest>",
+    "tests/test_core.py::test_target",
+    "tests/test_core.py::test_with_fixture"
+  ],
+  "decision": "selected",
+  "dropped": [],
+  "expanded": [
+    {
+      "from": "tests.conftest:shelter",
+      "into": [
+        "tests/test_core.py::test_with_fixture"
+      ],
+      "kind": "fixture"
+    }
+  ],
+  "node_ids": [
+    {
+      "node_id": "tests/test_core.py::test_target",
+      "origin": "mypkg.core:target",
+      "via": []
+    },
+    {
+      "node_id": "tests/test_core.py::test_with_fixture",
+      "origin": "mypkg.core:target",
+      "via": [
+        "tests.conftest:shelter"
+      ]
+    }
+  ],
+  "reason": null,
+  "verdict": "selected"
+}

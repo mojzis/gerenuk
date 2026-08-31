@@ -4,24 +4,27 @@
 //! does its I/O here, then hands pure data to [`crate::analyze`] and
 //! [`crate::report`].
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 use crate::analyze::{audit, auditable_symbols, outline_size, SymbolUsage};
 use crate::changed::{
     analyze as analyze_changes, untracked_change, ChangedSymbols, FileChange, GitSources,
 };
-use crate::closure::Reason;
+use crate::closure::{Reason, Verdict};
 use crate::config::Config;
 use crate::diff;
 use crate::git::{Base, Git};
 use crate::impact::{self, Budgets, FsIndex, ImpactReport, TyfRefs};
 use crate::model::relative_display;
+use crate::pytest;
 use crate::report::{Format, Report};
+use crate::select::{self, Decision, Selection};
 use crate::tyf::Runner;
 use crate::workspace::detect_root;
 
@@ -46,12 +49,15 @@ Getting started:
   3. `gerenuk audit --format json` — same, as JSON for scripting.
   4. `gerenuk changed-symbols`    — which symbols the working tree changed.
   5. `gerenuk impacted-tests`     — which tests those changed symbols reach.
+  6. `gerenuk run -- -x`          — run exactly those tests under pytest.
 
 Exit codes:
 
   0  no findings
   1  findings reported
   2  the run could not complete (tyf missing, bad workspace, ...)
+
+`run` is the exception: once pytest starts, the exit code is pytest's own, because gerenuk's process has become pytest.
 
 `changed-symbols` and `impacted-tests` never return 1: they are inventories \
 rather than verdicts. When `impacted-tests` cannot trust its own answer it \
@@ -81,6 +87,32 @@ pub struct Cli {
 
     #[command(subcommand)]
     pub command: Command,
+}
+
+/// The three walk budgets, shared by `impacted-tests` and `run`.
+#[derive(Args, Debug, Default)]
+pub struct BudgetFlags {
+    /// BFS levels to walk before giving up and saying `run_all`.
+    #[arg(long, value_name = "N")]
+    pub max_depth: Option<u32>,
+
+    /// Symbols to visit before giving up and saying `run_all`.
+    #[arg(long, value_name = "N")]
+    pub max_symbols: Option<usize>,
+
+    /// Wall-clock budget for the walk. `0` disables it.
+    #[arg(long, value_name = "MS")]
+    pub budget_ms: Option<u64>,
+}
+
+impl From<&BudgetFlags> for Budgets {
+    fn from(flags: &BudgetFlags) -> Self {
+        Self {
+            max_depth: flags.max_depth,
+            max_symbols: flags.max_symbols,
+            budget_ms: flags.budget_ms,
+        }
+    }
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,17 +147,43 @@ pub enum Command {
         #[arg(long, value_name = "FILE", conflicts_with = "base")]
         changed: Option<PathBuf>,
 
-        /// BFS levels to walk before giving up and saying `run_all`.
-        #[arg(long, value_name = "N")]
-        max_depth: Option<u32>,
+        #[command(flatten)]
+        budgets: BudgetFlags,
+    },
 
-        /// Symbols to visit before giving up and saying `run_all`.
-        #[arg(long, value_name = "N")]
-        max_symbols: Option<usize>,
+    /// Run pytest on exactly the tests the working tree's changes impact.
+    ///
+    /// Computes the impact report in-process — never as a subprocess of
+    /// itself — maps it to pytest node ids, and then *becomes* pytest. The
+    /// exit code from there on is pytest's own.
+    ///
+    /// Three outcomes, only two of which an argument list can express: run
+    /// these tests, run the whole suite, or run nothing at all. The last is why
+    /// this is a command and not a list of node ids for a shell to interpolate.
+    Run {
+        /// Base ref to diff against. Default: origin/main, then main, then master.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
 
-        /// Wall-clock budget for the walk. `0` disables it.
-        #[arg(long, value_name = "MS")]
-        budget_ms: Option<u64>,
+        /// Replay a saved `impacted-tests --format json` report instead of
+        /// walking the working tree.
+        #[arg(
+            long,
+            value_name = "FILE",
+            conflicts_with_all = ["base", "max_depth", "max_symbols", "budget_ms"],
+        )]
+        impact: Option<PathBuf>,
+
+        #[command(flatten)]
+        budgets: BudgetFlags,
+
+        /// Print the decision and the exact argv; spawn nothing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Everything after `--`, appended to the pytest argv verbatim.
+        #[arg(last = true, value_name = "PYTEST_ARGS", allow_hyphen_values = true)]
+        pytest_args: Vec<OsString>,
     },
 
     /// Check that `tyf` and the workspace resolve, without running an analysis.
@@ -137,6 +195,12 @@ pub enum Command {
 pub enum Outcome {
     Clean,
     FindingsReported,
+    /// A child process's exit code, propagated verbatim.
+    ///
+    /// Only reachable where [`pytest::Runner::exec`] cannot replace the
+    /// process — on Unix it never returns on success, because there is no
+    /// gerenuk left for it to return to.
+    Code(u8),
 }
 
 impl Cli {
@@ -173,15 +237,30 @@ impl Cli {
                 // report is the normal case, so it must not fail the hook.
                 Ok(Outcome::Clean)
             }
-            Command::ImpactedTests { base, changed, max_depth, max_symbols, budget_ms } => {
-                let budgets = Budgets { max_depth, max_symbols, budget_ms };
-                let report =
-                    run_impacted_tests(&root, base.as_deref(), changed.as_deref(), budgets)?;
+            Command::ImpactedTests { base, changed, budgets } => {
+                let report = run_impacted_tests(
+                    &root,
+                    base.as_deref(),
+                    changed.as_deref(),
+                    Budgets::from(&budgets),
+                )?;
                 write!(out, "{}", report.render(self.format)?)?;
                 // Either verdict is an answer. Only a run that could not
                 // produce one at all is a failure, and that arrives as an Err.
                 Ok(Outcome::Clean)
             }
+            Command::Run { base, impact, budgets, dry_run, pytest_args } => run_pytest(
+                out,
+                &root,
+                &RunOptions {
+                    base: base.as_deref(),
+                    impact: impact.as_deref(),
+                    budgets: Budgets::from(&budgets),
+                    dry_run,
+                    format: self.format,
+                    pytest_args: &pytest_args,
+                },
+            ),
         }
     }
 }
@@ -192,19 +271,27 @@ impl Cli {
 /// because diff paths are repository-relative — and because the pitch puts
 /// `[tool.gerenuk]` in the repo-root `pyproject.toml`.
 pub fn run_changed_symbols(workspace: &Path, base: Option<&str>) -> Result<ChangedSymbols> {
-    let (git, root, config) = repo_context(workspace)?;
-    let base = git.resolve_base(base)?;
-    let untracked = git.untracked()?;
-    changed_report(&git, &root, &base, &config, &untracked)
+    let repo = repo_context(workspace)?;
+    let base = repo.git.resolve_base(base)?;
+    let untracked = repo.git.untracked()?;
+    changed_report(&repo.git, &repo.root, &base, &repo.config, &untracked)
 }
 
 /// The repository the command runs against, plus its configuration.
-fn repo_context(workspace: &Path) -> Result<(Git, PathBuf, Config)> {
+struct Repo {
+    git: Git,
+    /// Absolute path of the git top level. Diff paths are relative to it, and
+    /// so is `[tool.gerenuk]` in the repo-root `pyproject.toml`.
+    root: PathBuf,
+    config: Config,
+}
+
+fn repo_context(workspace: &Path) -> Result<Repo> {
     let git = Git::discover(workspace)?;
     let root = git.top_level()?;
     let git = git.rebind(&root);
     let config = Config::load(&root)?;
-    Ok((git, root, config))
+    Ok(Repo { git, root, config })
 }
 
 /// Diff the working tree against `base` and map the result to symbols.
@@ -241,9 +328,30 @@ pub fn run_impacted_tests(
     changed_file: Option<&Path>,
     budgets: Budgets,
 ) -> Result<ImpactReport> {
+    Ok(impacted_run(&repo_context(workspace)?, base, changed_file, budgets)?.report)
+}
+
+/// One impact run, plus the working-tree file list it happened to need.
+///
+/// `gerenuk run` maps the report onto node ids against the same tree, and one
+/// `git ls-files` per invocation is enough.
+struct ImpactRun {
+    report: ImpactReport,
+    /// Every path in the repository, or `None` when the run answered before it
+    /// had to ask.
+    files: Option<Vec<PathBuf>>,
+}
+
+fn impacted_run(
+    repo: &Repo,
+    base: Option<&str>,
+    changed_file: Option<&Path>,
+    budgets: Budgets,
+) -> Result<ImpactRun> {
     let started = Instant::now();
-    let (git, root, config) = repo_context(workspace)?;
-    let limits = impact::resolve_limits(budgets, &config, started);
+    let Repo { git, root, config } = repo;
+    let root = root.as_path();
+    let limits = impact::resolve_limits(budgets, config, started);
 
     // Kept from the phase-1 diff when there was one: the file index below needs
     // the same list, and asking git twice is a second process for one answer.
@@ -252,35 +360,131 @@ pub fn run_impacted_tests(
         load_changed(path)?
     } else {
         let listed = git.untracked()?;
-        let report = changed_report(&git, &root, &git.resolve_base(base)?, &config, &listed)?;
+        let report = changed_report(git, root, &git.resolve_base(base)?, config, &listed)?;
         untracked = Some(listed);
         report
     };
 
+    let unwalked = |reason, errors| ImpactRun {
+        report: impact::run_all(&changed, reason, errors),
+        files: None,
+    };
+
     if let Some(reason) = impact::upfront_reason(&changed) {
-        return Ok(impact::run_all(&changed, reason, Vec::new()));
+        return Ok(unwalked(reason, Vec::new()));
     }
 
-    let runner = match Runner::discover(&root) {
+    let runner = match Runner::discover(root) {
         Ok(runner) => runner,
-        Err(err) => {
-            return Ok(impact::run_all(&changed, Reason::TyfUnavailable, vec![format!("{err:#}")]))
-        }
+        Err(err) => return Ok(unwalked(Reason::TyfUnavailable, vec![format!("{err:#}")])),
     };
 
     // Past the gate every failure is a verdict, not an exit code: a repository
     // that stops answering here still gets `run_all`.
     // See `docs/adr/0009-run-all-is-a-success.md`.
-    let files = match workspace_files(&git, untracked) {
+    let files = match workspace_files(git, untracked) {
         Ok(files) => files,
-        Err(err) => {
-            return Ok(impact::run_all(&changed, Reason::IndexFailed, vec![format!("{err:#}")]))
+        Err(err) => return Ok(unwalked(Reason::IndexFailed, vec![format!("{err:#}")])),
+    };
+
+    let index = FsIndex::new(root, &files);
+    let refs = TyfRefs::new(&runner, root);
+    let report = impact::analyze(&changed, &refs, &index, config, &limits);
+    Ok(ImpactRun { report, files: Some(files) })
+}
+
+/// Everything `gerenuk run` was asked for.
+struct RunOptions<'a> {
+    base: Option<&'a str>,
+    impact: Option<&'a Path>,
+    budgets: Budgets,
+    dry_run: bool,
+    format: Format,
+    pytest_args: &'a [OsString],
+}
+
+/// Map the impact report onto pytest node ids, then become pytest.
+///
+/// The order is the contract: the selection is built and announced *before*
+/// anything is spawned, so a run that decides nothing is impacted exits `0`
+/// having started no process at all — and after the exec there is no gerenuk
+/// left to report anything anyway.
+fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> Result<Outcome> {
+    let started = Instant::now();
+    let repo = repo_context(workspace)?;
+
+    let ImpactRun { mut report, files } = match options.impact {
+        Some(path) => ImpactRun { report: load_impact(path)?, files: None },
+        None => impacted_run(&repo, options.base, None, options.budgets)?,
+    };
+
+    // A `run_all` verdict needs no tree: the whole suite runs either way, and
+    // listing the repository to prove it would be work for nothing. On the
+    // replay path there is no listing yet, and a failure to get one degrades
+    // rather than fails — the walk path already treats it that way, and the
+    // same broken repository must not answer differently.
+    // See `docs/adr/0009-run-all-is-a-success.md`.
+    let files = match (files, report.verdict) {
+        (Some(files), _) => files,
+        (None, Verdict::RunAll) => Vec::new(),
+        (None, Verdict::Selected) => match workspace_files(&repo.git, None) {
+            Ok(files) => files,
+            Err(err) => {
+                report.verdict = Verdict::RunAll;
+                report.reason = Some(Reason::IndexFailed);
+                report.errors.push(format!("{err:#}"));
+                Vec::new()
+            }
+        },
+    };
+    let index = FsIndex::new(&repo.root, &files);
+    let selection = select::select(&report, &index);
+
+    let elapsed = started.elapsed().as_millis();
+    if options.dry_run {
+        return dry_run(out, &repo, &selection, elapsed, options);
+    }
+
+    // Said before the exec, because after it there is no gerenuk to say it.
+    eprintln!("gerenuk: {}", pytest::summary(&selection, elapsed));
+    if selection.decision == Decision::Nothing {
+        // Deliberately indistinguishable from a green suite: for a pre-commit
+        // hook, that is exactly what it is.
+        return Ok(Outcome::Clean);
+    }
+
+    let runner = pytest::Runner::resolve(&repo.config, &repo.root)?;
+    let argv = runner.argv(&selection, options.pytest_args);
+    // Nothing of ours may still be buffered: the next call replaces us.
+    out.flush().context("could not flush gerenuk's own output before running pytest")?;
+    runner.exec(&argv).map(Outcome::Code)
+}
+
+/// Print the decision and the argv gerenuk would have run.
+fn dry_run(
+    out: &mut impl Write,
+    repo: &Repo,
+    selection: &Selection,
+    elapsed_ms: u128,
+    options: &RunOptions,
+) -> Result<Outcome> {
+    // A missing pytest must not fail a dry run: the interesting half of the
+    // answer is the selection, and reporting it is more use than an error.
+    let argv = match (selection.decision, pytest::Runner::resolve(&repo.config, &repo.root)) {
+        (Decision::Nothing, _) => Vec::new(),
+        (_, Ok(runner)) => runner.argv(selection, options.pytest_args),
+        (_, Err(err)) => {
+            eprintln!("gerenuk: {err:#}");
+            Vec::new()
         }
     };
 
-    let index = FsIndex::new(&root, &files);
-    let refs = TyfRefs::new(&runner, &root);
-    Ok(impact::analyze(&changed, &refs, &index, &config, &limits))
+    let report = pytest::DryRun { selection, argv, elapsed_ms };
+    match options.format {
+        Format::Human => write!(out, "{}", report.render_human())?,
+        Format::Json => write!(out, "{}", report.render_json()?)?,
+    }
+    Ok(Outcome::Clean)
 }
 
 /// Every path in the repository, tracked and untracked alike.
@@ -291,6 +495,19 @@ fn workspace_files(git: &Git, untracked: Option<Vec<PathBuf>>) -> Result<Vec<Pat
         None => files.extend(git.untracked()?),
     }
     Ok(files)
+}
+
+/// Replay a saved `impacted-tests --format json` report.
+///
+/// Strict, for the same reason `--changed` is: a report that half-parses would
+/// become a confident selection of the wrong tests, and a wrong selection is
+/// the one failure this command must not have.
+/// See `docs/adr/0010-a-replayed-report-is-parsed-strictly.md`.
+fn load_impact(path: &Path) -> Result<ImpactReport> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("cannot read --impact {}", path.display()))?;
+    serde_json::from_str(&text)
+        .with_context(|| format!("cannot parse {} as an impacted-tests report", path.display()))
 }
 
 /// Replay a saved `changed-symbols --format json` report.
@@ -433,11 +650,11 @@ mod tests {
         let cli = Cli::try_parse_from(["gerenuk", "impacted-tests"])
             .expect("the subcommand should be usable bare");
         match cli.command {
-            Command::ImpactedTests { base, changed, max_depth, max_symbols, budget_ms } => {
+            Command::ImpactedTests { base, changed, budgets } => {
                 assert_eq!(base, None, "the default base chain applies");
                 assert_eq!(changed, None, "and the diff is computed, not replayed");
                 assert_eq!(
-                    (max_depth, max_symbols, budget_ms),
+                    (budgets.max_depth, budgets.max_symbols, budgets.budget_ms),
                     (None, None, None),
                     "unset budgets fall through to the config and then the defaults"
                 );
@@ -461,8 +678,11 @@ mod tests {
         .expect("valid invocation should parse");
 
         match cli.command {
-            Command::ImpactedTests { max_depth, max_symbols, budget_ms, .. } => {
-                assert_eq!((max_depth, max_symbols, budget_ms), (Some(3), Some(40), Some(1500)));
+            Command::ImpactedTests { budgets, .. } => {
+                assert_eq!(
+                    (budgets.max_depth, budgets.max_symbols, budgets.budget_ms),
+                    (Some(3), Some(40), Some(1500))
+                );
             }
             other => panic!("expected impacted-tests, got {other:?}"),
         }

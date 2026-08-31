@@ -13,8 +13,9 @@ It reports two things per file: symbols nothing references, and symbols only
 tests reach. `changed-symbols` maps the working tree's git diff to the Python
 symbols it changed — the one part of the crate that needs `git` rather than
 `tyf`. `impacted-tests` walks the reverse reference graph from those symbols out
-to the tests that reach them. Together they are impact-based pytest selection,
-minus the pytest invocation (phase 3).
+to the tests that reach them. `run` maps that to pytest node ids — applying
+pytest's collection rules and resolving the fixture edges no type checker can
+see — and then becomes pytest. Together they are impact-based pytest selection.
 
 Architecture details: `docs/dev/ARCHITECTURE.md`. Decisions and their costs:
 `docs/adr/`.
@@ -26,6 +27,9 @@ Architecture details: `docs/dev/ARCHITECTURE.md`. Decisions and their costs:
 - **`git`** on `PATH` for `changed-symbols` and its tests, or `GERENUK_GIT`
   pointing at it. That is all `changed-symbols` needs; `impacted-tests` needs
   `tyf` as well.
+- **pytest** for `run`, resolved from `GERENUK_PYTEST`, then `pytest-command`
+  under `[tool.gerenuk]`, then `PATH`. Not needed for the test suite — the tests
+  stub it.
 - **`uv`** for the fixture package's pytest suite.
 
 ## Common Commands
@@ -38,6 +42,7 @@ make review        # the above, plus the fixture pytest suite, audit and deny
 make review-quick  # skip the network checks
 make test-fixture  # just the Python fixture package's pytest suite
 make test-impact   # impacted-tests against the fixture with a REAL tyf
+make test-run      # the whole pipeline with a REAL tyf and a REAL pytest
 make docs          # build the mdBook site + llms.txt
 ```
 
@@ -66,12 +71,18 @@ When a test fails during implementation:
 
 ## Key Invariants
 
-- **`tyf` and `git` are the only two modules that spawn a process.** The literal
-  spawn sites are `tyf::Runner::run` and the private `git::Git::output`, which
-  `git::Git::run` and `git::Git::try_run` are the only ways into. Everything
-  downstream takes parsed data. Keep it that way — it is what makes `analyze`,
-  `changed`, `closure` and `report` testable with no `tyf`, no `ty`, no `git`
-  and no Python. Adding a third seam needs a very good reason (ADR 0001).
+- **`tyf`, `git` and `pytest` are the only three modules that spawn a process.**
+  The literal spawn sites are `tyf::Runner::run`, the private `git::Git::output`
+  (which `git::Git::run` and `git::Git::try_run` are the only ways into) and
+  `pytest::Runner::exec`. Everything downstream takes parsed data. Keep it that
+  way — it is what makes `analyze`, `changed`, `closure`, `select`, `fixtures`
+  and `report` testable with no `tyf`, no `ty`, no `git`, no pytest and no
+  Python. A fourth seam needs a very good reason (ADR 0001, amended by 0011).
+- **The pytest seam only ever execs.** On Unix `pytest::Runner::exec` is
+  `CommandExt::exec` and never returns on success — gerenuk's process *becomes*
+  pytest. Nothing captures its output, nothing parses it, nothing retries it.
+  Adding any of those is a different seam with a different argument, and
+  supersedes ADR 0011 rather than stretching it.
 - **`changed-symbols` must never construct a `tyf::Runner`.** Discovery happens
   inside the `Audit` and `Doctor` arms of `Cli::run`, not before the match. A
   test in `tests/changed_symbols.rs` runs with an empty `PATH` to enforce this.
@@ -82,10 +93,17 @@ When a test fails during implementation:
   Command bodies belong in `cli.rs`.
 - **Exit codes are part of the contract.** `0` clean, `1` findings, `2` the run
   could not complete. Do not collapse `1` and `2`. `changed-symbols` is an
-  inventory rather than a verdict, so it returns `0` or `2` and never `1`.
+  inventory rather than a verdict, so it returns `0` or `2` and never `1`. `run`
+  is the one command that returns a code gerenuk did not choose: after the exec
+  it is pytest's, verbatim, which is the hook contract.
 - **The fixture package and the canned payloads must agree.** Changing the call
   graph in `tests/fixtures/sample_pkg` means updating both its pytest suite and
-  the stub payloads in `tests/audit.rs`.
+  the stub payloads in `tests/audit.rs` — the payloads carry literal line
+  numbers, so inserting a line in `tests/conftest.py` breaks them.
+- **The fixture's `tests/conftest.py` must not import `sample_pkg.cli`.**
+  `cli.py` has a module-level edge, so importing it would make the conftest a
+  test importer of that module, select the whole subtree wholesale, and bury the
+  fixture edge `make test-run` exists to prove.
 - **`closure.rs` reaches the world only through `Refs` and `Index`.** New inputs
   go behind one of those traits, not into `walk` directly, or the unit tests
   stop being able to run without `tyf`. `impact.rs` is glue and holds no rules.
@@ -101,6 +119,16 @@ When a test fails during implementation:
 - **A symbol id with no colon is a module.** That convention carries the
   module-level edge and the whole-file test selection (`"symbol": null`) through
   `via`, `origin` and `impacted_tests[].symbol` alike (ADR 0008).
+- **`select.rs` reaches the world only through `select::Tree`, and every
+  degrade in it widens the selection.** A symbol pytest cannot collect becomes a
+  longer-prefix node id or the whole file; a fixture becomes its consumers. The
+  one failure mode `run` must not have is a confident list of node ids that
+  misses a test, so a rule that could narrow the selection is a bug, not a
+  precision win. `fixtures.rs` holds pytest's conventions and no I/O.
+- **An empty selection must short-circuit before any spawn.** An empty pytest
+  argv *is* "run everything", so `Decision::Nothing` exits `0` having started no
+  process. `tests/run.rs` asserts the stub's recording file does not exist,
+  which is the only way to prove it (ADR 0011).
 - **`clippy::unwrap_used` / `expect_used` warn outside tests, and the documented
   `cargo clippy … -D warnings` makes them fatal.** Use
   `anyhow::Context` on every `?` that crosses an I/O or parsing boundary.

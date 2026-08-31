@@ -157,7 +157,7 @@ pub(crate) fn indexed(span: &crate::pysource::SymbolSpan) -> IndexedSymbol {
         qualname: span.qualname.clone(),
         line: span.name_line,
         column: span.name_column,
-        decorators: span.decorators.clone(),
+        decorators: span.decorator_names().map(ToString::to_string).collect(),
     }
 }
 
@@ -241,6 +241,7 @@ pub enum Verdict {
 
 /// One test the change can reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImpactedTest {
     /// Repository-relative path of the test file.
     pub file: String,
@@ -256,6 +257,7 @@ pub struct ImpactedTest {
 
 /// A symbol the walk refused to expand because of `ignore-decorators`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct IgnoredSymbol {
     /// `module.path:QualName` of the symbol that was not expanded.
     pub symbol: String,
@@ -267,6 +269,7 @@ pub struct IgnoredSymbol {
 
 /// Cost of one walk.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Stats {
     /// Symbols the walk started from.
     pub seeds: usize,
