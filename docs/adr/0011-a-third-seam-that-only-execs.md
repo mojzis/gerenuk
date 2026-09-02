@@ -2,6 +2,8 @@
 
 Status: accepted. Amends [0001](0001-two-impure-seams.md), which stays in force
 for everything else.
+Amended by [0014](0014-run-all-delegates-to-a-fallback.md), which lets the
+same seam exec a configured fallback command with a payload on its stdin.
 
 ## Decision
 

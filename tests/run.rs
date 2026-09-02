@@ -14,11 +14,11 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::cargo::CommandCargoExt;
 use assert_cmd::prelude::*;
-use common::{fake_pytest, fake_tyf, gerenuk, json_output, recorded_argv, TestRepo};
+use common::{fake_fallback, fake_pytest, fake_tyf, gerenuk, json_output, recorded_argv, TestRepo};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -444,6 +444,343 @@ fn the_dry_run_json_matches_its_snapshot() {
     // The stub's path is a fresh temp directory on every run.
     report["argv"][0] = Value::from("<pytest>");
 
+    insta::assert_snapshot!(
+        serde_json::to_string_pretty(&report).expect("the report re-serialises")
+    );
+}
+
+/// A stub fallback command, and the files it records into.
+struct FallbackStub {
+    script: PathBuf,
+    prefix: PathBuf,
+}
+
+impl FallbackStub {
+    /// The stub, written into `dir` as `name`, exiting with `code`.
+    fn new(dir: &Path, name: &str, prefix: &Path, code: u8) -> Self {
+        Self { script: fake_fallback(dir, name, prefix, code), prefix: prefix.to_path_buf() }
+    }
+
+    fn recorded(&self, what: &str) -> Option<String> {
+        std::fs::read_to_string(self.prefix.with_extension(what)).ok()
+    }
+
+    /// The argv the stub was handed, or `None` when it never ran.
+    fn argv(&self) -> Option<Vec<String>> {
+        recorded_argv(&self.prefix.with_extension("argv"))
+    }
+
+    fn payload(&self) -> Value {
+        let text = self.recorded("stdin").expect("the stub should have read its stdin");
+        serde_json::from_str(&text)
+            .unwrap_or_else(|err| panic!("stdin is not JSON ({err}): {text}"))
+    }
+
+    /// `fallback-command = [<script>, <args>…]`, as TOML.
+    fn config(&self, args: &[&str]) -> String {
+        let command: Vec<String> = std::iter::once(self.script.display().to_string())
+            .chain(args.iter().map(ToString::to_string))
+            .collect();
+        format!(
+            "fallback-command = {}\n",
+            serde_json::to_string(&command).expect("strings serialise")
+        )
+    }
+}
+
+impl Fixture {
+    /// A fallback stub living in the fixture's temp dir, exiting with `code`.
+    fn fallback(&self, name: &str, code: u8) -> FallbackStub {
+        let prefix = self.tmp.path().join(format!("{name}-record"));
+        FallbackStub::new(self.tmp.path(), name, &prefix, code)
+    }
+
+    /// Rewrite the repo's `pyproject.toml` with `body` under `[tool.gerenuk]`,
+    /// and commit it: a configuration change is a non-Python change, and left
+    /// in the working tree it would force every outcome to `run_all`.
+    fn configure(&self, body: &str) {
+        self.repo.write(
+            "pyproject.toml",
+            &format!("[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\n{body}"),
+        );
+        self.repo.commit("configure");
+    }
+
+    /// A change gerenuk cannot reason about at all: the `run_all` outcome.
+    fn touch_non_python(&self) {
+        self.repo.write("requirements.txt", "requests==2.0\n");
+    }
+}
+
+#[test]
+fn a_run_all_outcome_delegates_to_the_configured_fallback() {
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&["--from-gerenuk"]));
+    fixture.touch_non_python();
+
+    let output = fixture.run(&["--", "-q"]);
+    assert!(
+        output.status.success(),
+        "the stub exited 0: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.argv(), None, "pytest is not spawned when the fallback owns the run");
+    assert_eq!(
+        stub.argv().expect("the fallback should have been exec'd"),
+        vec!["--from-gerenuk"],
+        "the configured argv, verbatim — the pytest passthrough is not appended to it"
+    );
+    assert_eq!(
+        stub.recorded("reason").as_deref(),
+        Some("non_python_changes"),
+        "GERENUK_FALLBACK_REASON lets a shell script branch without parsing JSON"
+    );
+
+    let payload = stub.payload();
+    assert_eq!(
+        payload["gerenuk_fallback_payload_version"], 1,
+        "the payload is versioned: {payload}"
+    );
+    assert_eq!(payload["reason"], "non_python_changes");
+    assert_eq!(
+        payload["report"]["non_python_changes"],
+        serde_json::json!(["requirements.txt"]),
+        "the report is the changed-symbols report the run was computed from: {payload}"
+    );
+    assert_eq!(payload["report"]["base"], "main", "with the base it was taken against");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("fallback"), "the hook's log says the run was delegated: {stderr}");
+    assert!(stderr.contains("non-Python files changed"), "and why: {stderr}");
+}
+
+#[test]
+fn the_fallbacks_exit_code_is_the_commands_exit_code() {
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 3);
+    fixture.configure(&stub.config(&[]));
+    fixture.touch_non_python();
+
+    fixture.command().arg("run").assert().code(3);
+    assert!(stub.argv().is_some(), "the code is the stub's own, propagated verbatim");
+}
+
+#[test]
+fn a_fallback_that_never_reads_stdin_still_exits_cleanly() {
+    // The payload is delivered from a file, not a pipe: a script that ignores
+    // it must neither block gerenuk nor fail.
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&["--skip-stdin"]));
+    fixture.touch_non_python();
+
+    fixture.command().arg("run").assert().success();
+    assert_eq!(stub.argv().expect("the stub ran"), vec!["--skip-stdin"]);
+    assert_eq!(stub.recorded("stdin"), None, "the stub never read its stdin");
+    assert_eq!(stub.recorded("reason").as_deref(), Some("non_python_changes"));
+}
+
+#[test]
+fn a_repo_relative_fallback_is_resolved_against_the_repo_root_not_the_cwd() {
+    let fixture = Fixture::new(0);
+    let prefix = fixture.tmp.path().join("relative-record");
+    let stub = FallbackStub::new(fixture.repo.path(), "scripts/fallback.sh", &prefix, 0);
+    fixture.configure("fallback-command = [\"scripts/fallback.sh\"]\n");
+    fixture.touch_non_python();
+
+    // Run from a subdirectory: `scripts/fallback.sh` does not exist relative
+    // to it, so finding the script proves it was resolved against the root.
+    fixture.command().current_dir(fixture.repo.path().join("src")).arg("run").assert().success();
+
+    let root = fixture.repo.path().canonicalize().expect("the repo exists");
+    assert_eq!(
+        stub.recorded("cwd").map(PathBuf::from),
+        Some(root),
+        "and it runs from the repo root, like pytest does"
+    );
+    assert!(stub.script.exists(), "the stub is inside the repository");
+}
+
+#[test]
+fn the_fallback_is_not_invoked_for_a_selected_outcome() {
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&[]));
+    touch_target(&fixture.repo);
+
+    fixture.command().arg("run").assert().success();
+    assert_eq!(
+        fixture.argv().expect("pytest should have been spawned"),
+        vec!["tests/test_core.py::test_target", "tests/test_core.py::test_with_fixture"],
+        "a selection is pytest's, exactly as without a fallback"
+    );
+    assert_eq!(stub.argv(), None, "the fallback's marker must not exist");
+}
+
+#[test]
+fn the_fallback_is_not_invoked_for_an_empty_selection() {
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&[]));
+
+    fixture.command().arg("run").assert().success();
+    assert_eq!(fixture.argv(), None, "nothing impacted spawns no pytest");
+    assert_eq!(stub.argv(), None, "and no fallback either");
+}
+
+#[test]
+fn the_flag_beats_the_env_var_which_beats_the_config() {
+    let fixture = Fixture::new(0);
+    let from_config = fixture.fallback("from-config", 0);
+    let from_env = fixture.fallback("from-env", 0);
+    let from_flag = fixture.fallback("from-flag", 0);
+    fixture.configure(&from_config.config(&[]));
+    fixture.touch_non_python();
+
+    let as_json = |stub: &FallbackStub| {
+        serde_json::to_string(&[stub.script.display().to_string()]).expect("strings serialise")
+    };
+
+    fixture.command().env("GERENUK_FALLBACK", as_json(&from_env)).arg("run").assert().success();
+    assert!(from_env.argv().is_some(), "the environment beats pyproject.toml");
+    assert_eq!(from_config.argv(), None);
+
+    fixture
+        .command()
+        .env("GERENUK_FALLBACK", as_json(&from_env))
+        .args(["run", "--fallback-command", &as_json(&from_flag)])
+        .assert()
+        .success();
+    assert!(from_flag.argv().is_some(), "and the flag beats the environment");
+}
+
+#[test]
+fn an_empty_fallback_command_fails_at_startup_whatever_the_outcome() {
+    // The outcome here would be `selected`, so the fallback would never have
+    // been needed. It fails anyway: a config error is found when the config is
+    // read, not on the day the bail-out first happens.
+    let fixture = Fixture::new(0);
+    fixture.configure("fallback-command = []\n");
+    touch_target(&fixture.repo);
+
+    fixture
+        .command()
+        .arg("run")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("fallback-command"))
+        .stderr(predicates::str::contains("empty"));
+    assert_eq!(fixture.argv(), None, "nothing was spawned on the way out");
+
+    fixture.configure("");
+    fixture
+        .command()
+        .env("GERENUK_FALLBACK", "[]")
+        .arg("run")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("GERENUK_FALLBACK"));
+    assert_eq!(fixture.argv(), None, "the environment is checked the same way");
+}
+
+#[test]
+fn a_fallback_that_is_not_a_json_array_is_a_config_error() {
+    let fixture = Fixture::new(0);
+    fixture.touch_non_python();
+
+    fixture
+        .command()
+        .args(["run", "--fallback-command", "scripts/pick.sh --from-gerenuk"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("--fallback-command"))
+        .stderr(predicates::str::contains("JSON array"));
+    assert_eq!(fixture.argv(), None, "a shell string is not accepted, so nothing ran");
+}
+
+#[test]
+fn a_dry_run_never_executes_the_fallback() {
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&["--from-gerenuk"]));
+    fixture.touch_non_python();
+
+    fixture
+        .command()
+        .args(["run", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicates::str::contains("decision: run_all"))
+        .stdout(predicates::str::contains("would exec fallback: "))
+        .stdout(predicates::str::contains("--from-gerenuk"))
+        .stdout(predicates::str::contains("(reason: non_python_changes)"));
+    assert_eq!(stub.argv(), None, "a dry run spawns nothing");
+    assert_eq!(fixture.argv(), None);
+}
+
+#[test]
+fn a_missing_fallback_binary_is_an_operational_failure_that_names_it() {
+    let fixture = Fixture::new(0);
+    fixture.configure("fallback-command = [\"scripts/missing.sh\", \"--from-gerenuk\"]\n");
+    fixture.touch_non_python();
+
+    let resolved = fixture.repo.path().join("scripts/missing.sh");
+    fixture
+        .command()
+        .arg("run")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains(resolved.display().to_string()))
+        .stderr(predicates::str::contains("pyproject.toml"));
+    assert_eq!(fixture.argv(), None, "pytest did not run in its place");
+}
+
+#[test]
+fn a_replayed_run_all_report_has_no_changed_symbols_to_hand_over() {
+    // `--impact` replays a phase-2 report and never diffs the tree, so there is
+    // no phase-1 report to put in the payload. The field is null rather than a
+    // fabricated empty report, which would read as "nothing changed".
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&[]));
+    fixture.touch_non_python();
+    let saved = fixture.save_impact();
+
+    fixture.command().args(["run", "--impact", &saved]).assert().success();
+    let payload = stub.payload();
+    assert_eq!(payload["reason"], "non_python_changes", "the reason is the report's");
+    assert!(payload["report"].is_null(), "and there is no report to hand over: {payload}");
+}
+
+/// The dry-run JSON with every per-run value pinned, so it can be snapshotted.
+fn pinned_dry_run(fixture: &Fixture) -> String {
+    let mut report = json_output(fixture.command().args(["--format", "json", "run", "--dry-run"]));
+    let root = fixture.repo.path().display().to_string();
+    let mut text = serde_json::to_string_pretty(&report).expect("the report re-serialises");
+    if let Some(sha) = report["fallback"]["payload"]["report"]["merge_base"].as_str() {
+        text = text.replace(sha, "<sha>");
+    }
+    report = serde_json::from_str(&text.replace(&root, "<repo>")).expect("still JSON");
+    serde_json::to_string_pretty(&report).expect("the report re-serialises")
+}
+
+#[test]
+fn the_dry_run_json_with_a_fallback_matches_its_snapshot() {
+    let fixture = Fixture::new(0);
+    fixture.configure("fallback-command = [\"scripts/pick.sh\", \"--from-gerenuk\"]\n");
+    fixture.touch_non_python();
+
+    insta::assert_snapshot!(pinned_dry_run(&fixture));
+}
+
+#[test]
+fn the_dry_run_json_without_a_fallback_matches_its_snapshot() {
+    let fixture = Fixture::new(0);
+    fixture.touch_non_python();
+
+    let mut report = json_output(fixture.command().args(["--format", "json", "run", "--dry-run"]));
+    report["argv"][0] = Value::from("<pytest>");
     insta::assert_snapshot!(
         serde_json::to_string_pretty(&report).expect("the report re-serialises")
     );

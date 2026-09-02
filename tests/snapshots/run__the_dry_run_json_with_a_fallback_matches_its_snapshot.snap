@@ -1,0 +1,40 @@
+---
+source: tests/run.rs
+expression: pinned_dry_run(&fixture)
+---
+{
+  "argv": [
+    "<repo>/scripts/pick.sh",
+    "--from-gerenuk"
+  ],
+  "decision": "run_all",
+  "dropped": [],
+  "expanded": [],
+  "fallback": {
+    "argv": [
+      "<repo>/scripts/pick.sh",
+      "--from-gerenuk"
+    ],
+    "payload": {
+      "gerenuk_fallback_payload_version": 1,
+      "reason": "non_python_changes",
+      "report": {
+        "base": "main",
+        "changed_symbols": [],
+        "errors": [],
+        "ignored_symbols": [],
+        "merge_base": "<sha>",
+        "module_level_changes": [],
+        "non_python_changes": [
+          "requirements.txt"
+        ],
+        "test_files_changed": []
+      }
+    },
+    "reason": "non_python_changes",
+    "source": "config"
+  },
+  "node_ids": [],
+  "reason": "non_python_changes",
+  "verdict": "run_all"
+}

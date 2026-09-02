@@ -5,6 +5,7 @@ Run pytest on exactly the tests the working tree's changes impact.
 ```
 gerenuk run [--base <REF> | --impact <FILE>]
             [--max-depth <N>] [--max-symbols <N>] [--budget-ms <MS>]
+            [--fallback-command <JSON_ARRAY>]
             [--dry-run] [-- <pytest args>…]
 ```
 
@@ -34,11 +35,13 @@ to short-circuit before a shell ever interpolates it.
 |---|---|---|
 | `selected`, non-empty | `pytest <node ids> <passthrough>` | pytest's |
 | `selected`, empty | **nothing is spawned**, one line to stderr | `0` |
-| `run_all` (any reason) | `pytest <passthrough>` — the full suite | pytest's |
+| `run_all` (any reason) | `pytest <passthrough>` — the full suite, or the [fallback command](#the-fallback-command) when one is configured | pytest's, or the fallback's |
 
 The `run_all` row is [the safety
 argument](impacted-tests.md#the-verdict) carried to its conclusion: gerenuk
-degrading mid-walk still produces a correct hook, just not a fast one.
+degrading mid-walk still produces a correct hook, just not a fast one. In a
+large repository "the full suite" can be a painful default, which is what the
+fallback command is for.
 
 ## Example
 
@@ -87,9 +90,24 @@ argv
 
 One argv element per line, deliberately: it is for reading, not for `$(…)`.
 
+When the outcome is `run_all` and a [fallback command](#the-fallback-command)
+is configured, the dry run says so instead, and the argv is the fallback's:
+
+```
+decision: run_all
+gerenuk: full suite — non-Python files changed
+
+would exec fallback: ["/home/you/proj/scripts/pick-subprojects.sh","--from-gerenuk"] (reason: non_python_changes)
+  from: fallback-command in pyproject.toml
+
+argv
+  /home/you/proj/scripts/pick-subprojects.sh
+  --from-gerenuk
+```
+
 `--format json` emits the selection as one object — the verdict and reason
-carried through from the impact report, plus `node_ids`, `expanded`, `dropped`
-and the assembled `argv`:
+carried through from the impact report, plus `node_ids`, `expanded`, `dropped`,
+the assembled `argv`, and `fallback`:
 
 ```json
 {
@@ -111,12 +129,41 @@ and the assembled `argv`:
     }
   ],
   "dropped": [],
-  "argv": ["uv", "run", "pytest", "tests/test_fixtures.py::test_described_marks_the_senior"]
+  "argv": ["uv", "run", "pytest", "tests/test_fixtures.py::test_described_marks_the_senior"],
+  "fallback": null
 }
 ```
 
 `decision` is the three-way outcome (`selected` / `run_all` / `nothing`);
-`verdict` is the impact report's, unchanged.
+`verdict` is the impact report's, unchanged. `fallback` is always present and
+is `null` unless the outcome is `run_all` *and* a fallback command is
+configured; then it carries what would have been exec'd — the resolved `argv`,
+its `source` (`flag`, `env` or `config`), the `reason`, and the complete
+`payload` that would have been written to its stdin:
+
+```json
+{
+  "verdict": "run_all",
+  "reason": "non_python_changes",
+  "decision": "run_all",
+  "node_ids": [],
+  "expanded": [],
+  "dropped": [],
+  "argv": ["/home/you/proj/scripts/pick-subprojects.sh", "--from-gerenuk"],
+  "fallback": {
+    "argv": ["/home/you/proj/scripts/pick-subprojects.sh", "--from-gerenuk"],
+    "source": "config",
+    "reason": "non_python_changes",
+    "payload": {
+      "gerenuk_fallback_payload_version": 1,
+      "reason": "non_python_changes",
+      "report": { "base": "origin/main", "merge_base": "…", "non_python_changes": ["requirements.txt"], "…": "…" }
+    }
+  }
+}
+```
+
+A dry run never executes the fallback, whatever the outcome.
 
 ## From symbol to node id
 
@@ -250,6 +297,133 @@ from running `pytest` yourself in a subdirectory.
 Everything after `--` is appended to the argv verbatim — `-x`, `-k`, `-n auto`,
 whatever. gerenuk has no opinion about ordering, parallelism or `--failed-first`.
 
+## The fallback command
+
+A `run_all` outcome means gerenuk could not bound the impact of the change. By
+default that runs the whole suite under pytest. A repository that already has
+its own way of narrowing work — a script that maps changed files to
+sub-projects, say — can name it, and `run` execs that instead:
+
+```toml
+[tool.gerenuk]
+fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
+```
+
+`run_all` then means "delegate to the fallback"; `selected` and `nothing` are
+untouched, and the [default pytest resolution](#finding-pytest) is not
+consulted at all on that path.
+
+### Configuring it
+
+The value is an **argv**, never a shell string: no shell is involved, nothing is
+word-split, and nothing inside an element is substituted. The first element is
+resolved the way any exec'd program is — an absolute path as itself, a bare name
+on `PATH`, and anything with a path separator in it relative to the
+**repository root** (the directory `pyproject.toml` is in), never to the
+directory `gerenuk` was run from.
+
+Three sources, highest wins, mirroring [how pytest is found](#finding-pytest):
+
+| Source | Form |
+|---|---|
+| `--fallback-command '["scripts/pick.sh", "--from-gerenuk"]'` | a JSON array of strings |
+| `GERENUK_FALLBACK='["scripts/pick.sh", "--from-gerenuk"]'` | a JSON array of strings |
+| `fallback-command` under `[tool.gerenuk]` | a TOML array of strings |
+
+Absent everywhere is fine and means the default. An **empty array anywhere** in
+the chain is a configuration error — even in a layer a higher one overrides,
+and even when the outcome would have been `selected`. It fails at startup with
+exit `2`, not on the day the bail-out first happens.
+
+The fallback runs from the repository root, like pytest. Everything after `--`
+belongs to pytest and is **not** appended to the fallback's argv: the fallback
+is not pytest, and gerenuk does not know what its arguments mean.
+
+### What it receives
+
+The fallback inherits gerenuk's environment, plus one variable,
+`GERENUK_FALLBACK_REASON=<reason>`, so a shell script can branch without parsing
+anything. On its **stdin** it finds a JSON payload:
+
+```json
+{
+  "gerenuk_fallback_payload_version": 1,
+  "reason": "non_python_changes",
+  "report": {
+    "base": "origin/main",
+    "merge_base": "3f2c…",
+    "changed_symbols": [],
+    "ignored_symbols": [],
+    "module_level_changes": [],
+    "non_python_changes": ["requirements.txt"],
+    "test_files_changed": [],
+    "errors": []
+  }
+}
+```
+
+- `gerenuk_fallback_payload_version` is `1`. Adding a field or a reason variant
+  keeps it; renaming or removing one bumps it.
+- `report` is the [`changed-symbols` report](changed-symbols.md#example)
+  the run was computed from, in exactly the shape that command prints — the
+  changed symbols with their files, the module-level changes, the non-Python
+  changes, the changed test files and the parse errors. It is `null` when
+  [`--impact`](#replaying-a-saved-report) replayed a saved impact report, since
+  no diff was taken; a fabricated empty report would read as "nothing changed".
+- `reason` is why the outcome is `run_all` — the same value
+  [`impacted-tests`](impacted-tests.md#the-verdict) reports, as a stable
+  `snake_case` name:
+
+| `reason` | Meaning |
+|---|---|
+| `non_python_changes` | the diff touched files gerenuk cannot reason about |
+| `parse_errors` | a changed Python file did not parse |
+| `tyf_unavailable` | `tyf` is not installed, so no reference can be resolved |
+| `refs_failed` | `tyf` failed part-way through the walk |
+| `index_failed` | the working tree could not be read part-way through the walk |
+| `max_depth` | the frontier was still growing at `max-depth` levels |
+| `max_symbols` | more than `max-symbols` symbols were visited |
+| `budget` | the wall-clock budget ran out |
+| `decorator_dispatch` | a changed symbol is dispatched by a decorator whose registrar could not be resolved |
+| `unspecified` | a replayed report said `run_all` with no `reason` |
+
+New variants may be added; existing names are never renamed within a payload
+version.
+
+The payload is delivered from a file that is already unlinked, not a pipe, so a
+script that never reads its stdin neither blocks nor fails, and nothing is left
+behind either way.
+
+### Exec semantics
+
+gerenuk execs the fallback exactly as it execs pytest: its process *becomes* the
+fallback, and from then on the terminal, the signals and the **exit code are
+the fallback's own**. gerenuk does not interpret, wrap or annotate any of it.
+Before the exec it says one line for itself:
+
+```
+gerenuk: full suite — non-Python files changed
+gerenuk: delegating to fallback ["/home/you/proj/scripts/pick-subprojects.sh","--from-gerenuk"] (from fallback-command in pyproject.toml)
+```
+
+If the fallback cannot be started at all — the program is missing, or not
+executable — the error names the resolved path and where it was configured,
+and gerenuk exits `2` having run nothing else.
+
+### Delegation only
+
+This is a one-way handover, deliberately. The fallback receives context and
+ownership of the invocation; it has **no way to hand a test selection back** to
+gerenuk. A script that computes a narrower set of tests runs them itself, and
+its exit code is the answer.
+
+That keeps the contract small enough to pin: one payload, one direction, one
+exit code. A two-way protocol — the fallback returning node ids for gerenuk to
+run — would be a new, separately versioned mechanism with its own record, not a
+widening of this one. There is likewise no per-reason routing: one command for
+every `run_all` reason, and the script branches on `reason` itself if it wants
+to.
+
 ## Replaying a saved report
 
 ```sh
@@ -266,7 +440,8 @@ half-parses becomes a confident selection of the wrong tests. It conflicts with
 
 Once pytest starts, the exit code is **pytest's**, verbatim: `0` green, `1`
 failures, and `2`–`5` mean what pytest says they mean. That is the hook
-contract.
+contract, and a [fallback command](#the-fallback-command) inherits it: once it
+starts, the exit code is the fallback's.
 
 Before any spawn, gerenuk's own operational failures exit `2` as everywhere
 else, and there is no ambiguity because pytest never ran. The empty selection

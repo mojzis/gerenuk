@@ -14,16 +14,27 @@
 //! observable behaviour is the same, and the `#[cfg]` is the honest way to say
 //! so.)
 //!
+//! The same seam execs the configured fallback command when the outcome is
+//! `run_all` (see [`crate::fallback`]). It is the same shape — exec, never
+//! spawn-and-wait — with one addition: a [`Handoff`] of bytes for the child's
+//! stdin and variables for its environment. The bytes go into an unlinked
+//! temporary file that becomes the child's fd 0, not a pipe, so a child that
+//! never reads them cannot block and nothing of gerenuk's lingers to write
+//! them. See `docs/adr/0014-run-all-delegates-to-a-fallback.md`.
+//!
 //! Everything else here — resolving the runner, assembling the argv, writing
 //! the one-line summary — is pure and unit-tested with no spawn anywhere near
 //! it.
 
 use std::ffi::OsString;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
+use std::process::Stdio;
 
 use anyhow::{Context, Result};
 
 use crate::config::Config;
+use crate::fallback::Plan;
 use crate::select::{Decision, Selection};
 
 /// Binary name looked up on `PATH` when nothing else names one.
@@ -31,6 +42,17 @@ pub const DEFAULT_PYTEST_BIN: &str = "pytest";
 
 /// Environment variable that overrides which pytest is run.
 pub const PYTEST_BIN_ENV: &str = "GERENUK_PYTEST";
+
+/// What the child receives besides its argv. pytest gets neither.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Handoff {
+    /// Bytes the child finds on its stdin. Delivered from an unlinked
+    /// temporary file rather than a pipe: there is no writer left after the
+    /// exec, and a child that ignores its stdin must not hang or fail.
+    pub stdin: Option<Vec<u8>>,
+    /// Variables added to the environment the child inherits.
+    pub env: Vec<(OsString, OsString)>,
+}
 
 /// The pytest invocation gerenuk will exec, minus the node ids.
 ///
@@ -104,16 +126,26 @@ impl Runner {
         argv
     }
 
-    /// Replace this process with pytest.
+    /// Replace this process with `argv` — pytest, or the fallback command.
     ///
     /// On Unix this only ever returns an error: on success there is no caller
     /// left to return to.
-    pub fn exec(&self, argv: &[OsString]) -> Result<u8> {
+    pub fn exec(&self, argv: &[OsString], handoff: Handoff) -> Result<u8> {
         let (program, rest) =
-            argv.split_first().context("the pytest command resolved to an empty argv")?;
+            argv.split_first().context("the command resolved to an empty argv")?;
 
         let mut command = std::process::Command::new(program);
-        command.args(rest).current_dir(&self.root);
+        command.args(rest).current_dir(&self.root).envs(handoff.env);
+
+        if let Some(bytes) = handoff.stdin {
+            // A file, not a pipe: the payload is complete before the child
+            // exists, the child reads it or not at its leisure, and it is
+            // already unlinked, so nothing is left behind either way.
+            let mut file = tempfile::tempfile().context("could not create a file for stdin")?;
+            file.write_all(&bytes).context("could not write the payload for stdin")?;
+            file.seek(SeekFrom::Start(0)).context("could not rewind the payload for stdin")?;
+            command.stdin(Stdio::from(file));
+        }
 
         #[cfg(unix)]
         {
@@ -166,6 +198,9 @@ pub struct DryRun<'a> {
     pub selection: &'a Selection,
     pub argv: Vec<OsString>,
     pub elapsed_ms: u128,
+    /// The fallback that would have been exec'd: set only when the decision is
+    /// `run_all` and one is configured. Then `argv` is its argv.
+    pub fallback: Option<Plan<'a>>,
 }
 
 impl DryRun<'_> {
@@ -210,6 +245,11 @@ impl DryRun<'_> {
             }
         }
 
+        if let Some(plan) = &self.fallback {
+            let _ = writeln!(out);
+            let _ = write!(out, "{}", plan.render_human());
+        }
+
         if self.argv.is_empty() {
             // An empty argv means two different things, and the decision line
             // above says which: nothing was impacted, or pytest could not be
@@ -237,6 +277,10 @@ impl DryRun<'_> {
             let argv = serde_json::to_value(render_argv(&self.argv))
                 .context("could not serialise the pytest argv")?;
             object.insert("argv".to_string(), argv);
+            // Always present, so the shape does not depend on the config.
+            let fallback = serde_json::to_value(&self.fallback)
+                .context("could not serialise the fallback plan")?;
+            object.insert("fallback".to_string(), fallback);
         }
         serde_json::to_string_pretty(&value).context("could not render the dry run as JSON")
     }
@@ -365,7 +409,8 @@ mod tests {
     fn the_dry_run_lists_the_argv_one_element_per_line() {
         let selection = selection(Decision::Selected, &[("tests/test_a.py::test_x", "pkg.a:f")]);
         let argv = runner().argv(&selection, &[]);
-        let text = DryRun { selection: &selection, argv, elapsed_ms: 12 }.render_human();
+        let text =
+            DryRun { selection: &selection, argv, elapsed_ms: 12, fallback: None }.render_human();
 
         assert!(text.contains("decision: selected"), "got:\n{text}");
         assert!(text.contains("\n  uv\n  run\n  pytest\n"), "not interpolatable, got:\n{text}");
@@ -378,7 +423,9 @@ mod tests {
     #[test]
     fn the_dry_run_of_an_empty_selection_offers_no_argv() {
         let selection = selection(Decision::Nothing, &[]);
-        let text = DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 3 }.render_human();
+        let text =
+            DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 3, fallback: None }
+                .render_human();
         assert!(text.contains("decision: nothing"), "got:\n{text}");
         assert!(text.contains("argv: none"), "there is nothing to run, got:\n{text}");
     }
@@ -396,7 +443,9 @@ mod tests {
             why: DropReason::Superseded,
         }];
 
-        let text = DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 0 }.render_human();
+        let text =
+            DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 0, fallback: None }
+                .render_human();
         assert!(text.contains("expanded tests.conftest:shelter (fixture)"), "got:\n{text}");
         assert!(text.contains("covered by the whole file"), "got:\n{text}");
     }
@@ -405,7 +454,7 @@ mod tests {
     fn the_dry_run_json_carries_the_argv_alongside_the_selection() {
         let selection = selection(Decision::Selected, &[("tests/test_a.py::test_x", "pkg.a:f")]);
         let argv = runner().argv(&selection, &["-q".into()]);
-        let text = DryRun { selection: &selection, argv, elapsed_ms: 0 }
+        let text = DryRun { selection: &selection, argv, elapsed_ms: 0, fallback: None }
             .render_json()
             .expect("the selection serialises");
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
@@ -415,6 +464,47 @@ mod tests {
         assert_eq!(value["node_ids"][0]["node_id"], "tests/test_a.py::test_x");
         assert_eq!(value["argv"][0], "uv");
         assert_eq!(value["argv"][4], "-q", "the passthrough is part of the pinned shape");
+        assert!(value["fallback"].is_null(), "present and null when none applies: {value}");
+    }
+
+    #[test]
+    fn the_dry_run_of_a_delegated_run_all_names_the_fallback_in_both_forms() {
+        use crate::fallback::{self, Payload};
+
+        let selection = selection(Decision::RunAll, &[]);
+        let config = Config {
+            fallback_command: Some(vec!["scripts/pick.sh".into(), "--from-gerenuk".into()]),
+            ..Config::default()
+        };
+        let fallback = fallback::resolve(None, None, &config, std::path::Path::new("/repo"))
+            .expect("valid")
+            .expect("configured");
+        let plan = fallback::Plan::new(&fallback, Payload::new(selection.reason, None));
+        let report = DryRun {
+            selection: &selection,
+            argv: fallback.argv().to_vec(),
+            elapsed_ms: 0,
+            fallback: Some(plan),
+        };
+
+        let text = report.render_human();
+        assert!(text.contains("decision: run_all"), "got:\n{text}");
+        assert!(
+            text.contains(
+                "would exec fallback: [\"/repo/scripts/pick.sh\",\"--from-gerenuk\"] \
+                 (reason: non_python_changes)"
+            ),
+            "got:\n{text}"
+        );
+        assert!(text.contains("\n  /repo/scripts/pick.sh\n  --from-gerenuk\n"), "got:\n{text}");
+
+        let value: serde_json::Value =
+            serde_json::from_str(&report.render_json().expect("serialises")).expect("JSON");
+        assert_eq!(value["argv"][0], "/repo/scripts/pick.sh", "the argv is the fallback's");
+        assert_eq!(value["fallback"]["source"], "config");
+        assert_eq!(value["fallback"]["reason"], "non_python_changes");
+        assert_eq!(value["fallback"]["payload"]["gerenuk_fallback_payload_version"], 1);
+        assert!(value["fallback"]["payload"]["report"].is_null());
     }
 
     #[test]
@@ -460,7 +550,7 @@ mod tests {
     #[test]
     fn an_empty_argv_is_refused_rather_than_spawned() {
         let runner = Runner::with_command(Vec::<OsString>::new(), "/repo");
-        let err = runner.exec(&[]).expect_err("there is no program to run");
+        let err = runner.exec(&[], Handoff::default()).expect_err("there is no program to run");
         assert!(format!("{err:#}").contains("empty argv"), "got: {err:#}");
     }
 }
