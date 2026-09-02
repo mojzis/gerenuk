@@ -28,15 +28,20 @@ use crate::select::{self, Decision, Selection};
 use crate::tyf::Runner;
 use crate::workspace::detect_root;
 
-const ABOUT: &str = "Symbol-level Python code intelligence, powered by ty-find.";
+const ABOUT: &str = "Impact-based pytest selection for Python, powered by ty-find.";
 
 const LONG_ABOUT: &str = "\
-gerenuk asks `tyf` (from ty-find) about the symbols in your Python project and \
-reports what it finds: symbols nothing references, and symbols only your tests \
-reach.
+gerenuk maps the working tree's git diff to the Python symbols it changed, \
+walks `ty`'s reference graph out to the tests that reach them, and runs \
+exactly those under pytest. Anything it cannot see through becomes \
+\"run the whole suite\" rather than a confident short list.
 
-It shells out to `tyf --format json`, so `tyf` must be on PATH — install it \
-with `uv add --dev ty-find`, or point GERENUK_TYF at the binary.
+`audit` reads the same reference graph backwards, for the files you name: \
+symbols nothing references, and symbols only your tests reach.
+
+References are resolved through `tyf --format json` (from ty-find), so `tyf` \
+must be on PATH — install it with `uv add --dev ty-find`, or point \
+GERENUK_TYF at the binary.
 
 `changed-symbols` needs none of that: it uses `git` alone, taken from PATH \
 unless GERENUK_GIT names a binary.";
@@ -45,11 +50,11 @@ const AFTER_LONG_HELP: &str = "\
 Getting started:
 
   1. `gerenuk doctor`             — check that tyf and the workspace resolve.
-  2. `gerenuk audit pkg/*.py`     — report unreferenced and test-only symbols.
-  3. `gerenuk audit --format json` — same, as JSON for scripting.
-  4. `gerenuk changed-symbols`    — which symbols the working tree changed.
-  5. `gerenuk impacted-tests`     — which tests those changed symbols reach.
-  6. `gerenuk run -- -x`          — run exactly those tests under pytest.
+  2. `gerenuk changed-symbols`    — which symbols the working tree changed.
+  3. `gerenuk impacted-tests`     — which tests those changed symbols reach.
+  4. `gerenuk run -- -x`          — run exactly those tests under pytest.
+  5. `gerenuk run --dry-run`      — that decision and the exact argv, spawning nothing.
+  6. `gerenuk audit pkg/*.py`     — separately: unreferenced and test-only symbols.
 
 Exit codes:
 
