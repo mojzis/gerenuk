@@ -122,13 +122,6 @@ impl From<&BudgetFlags> for Budgets {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
-    /// Report symbols that nothing references, and symbols only tests reach.
-    Audit {
-        /// Python files to audit. Defaults to nothing — pass the files you care about.
-        #[arg(value_name = "FILE", required = true)]
-        files: Vec<PathBuf>,
-    },
-
     /// Report the Python symbols the working tree changed against a base ref.
     ///
     /// Needs only `git` — no `tyf`, no `ty`, no Python environment.
@@ -189,6 +182,13 @@ pub enum Command {
         /// Everything after `--`, appended to the pytest argv verbatim.
         #[arg(last = true, value_name = "PYTEST_ARGS", allow_hyphen_values = true)]
         pytest_args: Vec<OsString>,
+    },
+
+    /// Report symbols that nothing references, and symbols only tests reach.
+    Audit {
+        /// Python files to audit. Defaults to nothing — pass the files you care about.
+        #[arg(value_name = "FILE", required = true)]
+        files: Vec<PathBuf>,
     },
 
     /// Check that `tyf` and the workspace resolve, without running an analysis.
