@@ -82,7 +82,25 @@ When a test fails during implementation:
   `CommandExt::exec` and never returns on success — gerenuk's process *becomes*
   pytest. Nothing captures its output, nothing parses it, nothing retries it.
   Adding any of those is a different seam with a different argument, and
-  supersedes ADR 0011 rather than stretching it.
+  supersedes ADR 0011 rather than stretching it. The one thing it takes besides
+  an argv is a `pytest::Handoff` — stdin bytes and environment variables for
+  the child — and the bytes go into an unlinked temp file that becomes fd 0,
+  never a pipe, so a child that ignores its stdin cannot block (ADR 0014).
+- **The fallback command is exec'd through that seam and nowhere else, and
+  only for `Decision::RunAll`.** `fallback.rs` is pure: resolution across
+  `--fallback-command` → `GERENUK_FALLBACK` → `fallback-command` → default,
+  program lookup (repo-relative against the repo root, not the cwd), and the
+  payload. An empty argv in any layer is an error at the top of `run_pytest`,
+  before the diff — not at bail-out time. The `selected` and `nothing`
+  outcomes must never see the fallback; `tests/run.rs` asserts its marker file
+  does not exist for both.
+- **The fallback payload is an external contract.**
+  `gerenuk_fallback_payload_version` is `1`; `report` is the phase-1
+  `ChangedSymbols` serialisation reused, never a copy; `reason` is
+  `Reason::name`, which a unit test pins to serde's output for every variant.
+  Adding a field or a variant keeps the version, renaming or removing one bumps
+  it. Delegation is one-way: the fallback cannot hand a selection back (ADR
+  0014).
 - **`changed-symbols` must never construct a `tyf::Runner`.** Discovery happens
   inside the `Audit` and `Doctor` arms of `Cli::run`, not before the match. A
   test in `tests/changed_symbols.rs` runs with an empty `PATH` to enforce this.

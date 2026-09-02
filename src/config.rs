@@ -40,6 +40,16 @@ pub struct Config {
     /// multi-word runner: `["uv", "run", "pytest"]`. Empty means "work it out",
     /// which is `GERENUK_PYTEST` and then `pytest` on `PATH`.
     pub pytest_command: Vec<String>,
+
+    /// What `gerenuk run` execs instead of the full suite when the outcome is
+    /// `run_all`.
+    ///
+    /// An argv, never a shell string. `None` is "not configured" and means the
+    /// default — pytest with no selection. `Some(vec![])` is kept distinct
+    /// from that on purpose: an empty argv is a configuration error, and
+    /// [`crate::fallback::resolve`] refuses it, rather than silently meaning
+    /// the default.
+    pub fallback_command: Option<Vec<String>>,
 }
 
 /// Wrapper types mirroring `pyproject.toml`'s nesting: `[tool.gerenuk]`.
@@ -180,6 +190,43 @@ mod tests {
         let config = Config::load(tmp.path()).expect("valid config parses");
         assert_eq!(config.max_depth, Some(2), "the one that was set");
         assert_eq!(config.max_symbols, None, "and the others stay at the built-in default");
+    }
+
+    #[test]
+    fn the_fallback_command_is_absent_by_default() {
+        let tmp = with_pyproject("[tool.gerenuk]\npytest-command = [\"pytest\"]\n");
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(config.fallback_command, None, "unset means the default, not an empty argv");
+    }
+
+    #[test]
+    fn the_fallback_command_is_read_as_an_argv() {
+        let tmp = with_pyproject(
+            "[tool.gerenuk]\nfallback-command = [\"scripts/pick.sh\", \"--from-gerenuk\"]\n",
+        );
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(
+            config.fallback_command,
+            Some(vec!["scripts/pick.sh".to_string(), "--from-gerenuk".to_string()]),
+            "every element survives, in order"
+        );
+    }
+
+    #[test]
+    fn an_empty_fallback_command_is_kept_distinct_from_an_absent_one() {
+        // Loading does not reject it: the config is read by every command, and
+        // only `run` cares. Resolution is where it becomes an error.
+        let tmp = with_pyproject("[tool.gerenuk]\nfallback-command = []\n");
+        let config = Config::load(tmp.path()).expect("loading is not where it fails");
+        assert_eq!(config.fallback_command, Some(Vec::new()), "present, and empty");
+    }
+
+    #[test]
+    fn a_fallback_command_that_is_a_string_names_the_key() {
+        let tmp = with_pyproject("[tool.gerenuk]\nfallback-command = \"scripts/pick.sh\"\n");
+        let err = Config::load(tmp.path()).expect_err("a shell string is not an argv");
+        let message = format!("{err:#}");
+        assert!(message.contains("fallback-command"), "names the key, got: {message}");
     }
 
     #[test]

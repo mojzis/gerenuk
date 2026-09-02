@@ -22,3 +22,4 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0011](0011-a-third-seam-that-only-execs.md) | A third impure seam, and it only execs | accepted |
 | [0012](0012-a-decorator-is-a-reference.md) | A registering decorator is a reference to what it decorates | accepted |
 | [0013](0013-a-renaming-import-is-followed.md) | A renaming import is followed; a plain one is still dropped | accepted |
+| [0014](0014-run-all-delegates-to-a-fallback.md) | `run_all` delegates to a configured fallback, through the exec seam | accepted |

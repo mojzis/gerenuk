@@ -339,3 +339,39 @@ exec {} "$@"
     make_executable(&path);
     path
 }
+
+/// Write an executable stub that stands in for a configured fallback command.
+///
+/// It records everything gerenuk hands it, each piece in its own file next to
+/// `prefix`: the argv (`<prefix>.argv`, one element per line, argv[0]
+/// excluded), `GERENUK_FALLBACK_REASON` (`<prefix>.reason`), its working
+/// directory (`<prefix>.cwd`) and its stdin (`<prefix>.stdin`) — unless its
+/// first argument is `--skip-stdin`, in which case it never reads stdin at all,
+/// which is the case a blocking delivery would hang on. It then exits with
+/// `code`. The `.argv` file is the marker: a run that must not delegate must
+/// never create it.
+pub fn fake_fallback(dir: &Path, name: &str, prefix: &Path, code: u8) -> PathBuf {
+    let path = dir.join(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).expect("create the stub's directory");
+    }
+    std::fs::write(
+        &path,
+        format!(
+            r#"#!/usr/bin/env bash
+prefix='{prefix}'
+printf '%s\n' "$@" > "$prefix.argv"
+printf '%s' "${{GERENUK_FALLBACK_REASON-unset}}" > "$prefix.reason"
+printf '%s' "$PWD" > "$prefix.cwd"
+if [[ "${{1:-}}" != "--skip-stdin" ]]; then
+  cat > "$prefix.stdin"
+fi
+exit {code}
+"#,
+            prefix = prefix.display()
+        ),
+    )
+    .expect("write fake fallback script");
+    make_executable(&path);
+    path
+}

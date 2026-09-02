@@ -32,6 +32,7 @@ src/
   # run
   fixtures.rs   pytest fixture map + collection conventions (pure)
   select.rs     ImpactReport + working tree -> Selection, node ids (pure)
+  fallback.rs   the run_all fallback: resolution, program lookup, payload (pure)
   pytest.rs     the third seam: runner resolution, argv assembly, exec
 ```
 
@@ -54,6 +55,16 @@ It is exec-and-replace rather than run-and-parse: on Unix gerenuk's process
 *becomes* pytest, so there is nothing to capture, nothing to parse and no
 caller left to return to. Runner resolution, argv assembly and the one-line
 summary around it are ordinary pure functions.
+
+The same seam execs the configured **fallback command** when the outcome is
+`run_all` ([ADR 0014](../adr/0014-run-all-delegates-to-a-fallback.md)). It
+takes a `pytest::Handoff` — bytes for the child's stdin, variables for its
+environment — and pytest gets an empty one. The bytes go into an unlinked
+temporary file that becomes fd 0 rather than a pipe, so a child that never
+reads them cannot block. `fallback.rs` resolves the command from its three
+sources, decides where its program lives (repo-relative against the root,
+never the cwd) and builds the versioned payload; all of it is pure, and the
+exec is the one line in `cli.rs` that calls the seam.
 
 `ty-find` ships a binary and no `[lib]` target, so the integration is over
 stdout with `--format json` rather than a crate dependency. `tyf` prefixes some
@@ -144,6 +155,7 @@ import and line-attribution rules under test are the ones the binary uses.
 | Fixture map / collection rules | `src/fixtures.rs` unit tests | no | no |
 | Node-id mapping | `src/select.rs` unit tests | no | no |
 | Runner resolution, argv | `src/pytest.rs` unit tests | no | no |
+| Fallback resolution, payload | `src/fallback.rs` unit tests | no | no |
 | End-to-end (run) | `tests/run.rs` | no — stubbed | yes |
 | Real LSP output | `make test-impact` (`scripts/impact-smoke.sh`) | **yes** | yes |
 | Real LSP output *and* real pytest | `make test-run` (`scripts/run-smoke.sh`) | **yes** | yes |
@@ -153,7 +165,11 @@ with canned JSON, then points `GERENUK_TYF` at it. `fake_pytest` is the same
 trick for the third seam: a script that records the argv it was handed and exits
 with a chosen code, so `tests/run.rs` can assert both what pytest was asked to
 run and — for the empty selection — that the recording file was never created,
-which is the only way to prove nothing was spawned. The canned payloads mirror
+which is the only way to prove nothing was spawned. `fake_fallback` records
+its argv, its stdin, its working directory and `GERENUK_FALLBACK_REASON`, each
+to its own file, so the same tests can pin the payload the fallback receives
+and — for the `selected` and `nothing` outcomes — that it was never started.
+The canned payloads mirror
 what real `tyf` returns for `tests/fixtures/sample_pkg`, so the fixture package
 and the expectations stay in step.
 

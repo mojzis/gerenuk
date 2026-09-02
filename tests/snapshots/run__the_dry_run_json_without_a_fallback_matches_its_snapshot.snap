@@ -1,0 +1,16 @@
+---
+source: tests/run.rs
+expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serialises\")"
+---
+{
+  "argv": [
+    "<pytest>"
+  ],
+  "decision": "run_all",
+  "dropped": [],
+  "expanded": [],
+  "fallback": null,
+  "node_ids": [],
+  "reason": "non_python_changes",
+  "verdict": "run_all"
+}

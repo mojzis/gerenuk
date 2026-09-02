@@ -284,6 +284,40 @@ pub enum Reason {
 }
 
 impl Reason {
+    /// Every variant, for the tests that have to cover each one.
+    pub const ALL: [Self; 9] = [
+        Self::NonPythonChanges,
+        Self::ParseErrors,
+        Self::TyfUnavailable,
+        Self::RefsFailed,
+        Self::IndexFailed,
+        Self::MaxDepth,
+        Self::MaxSymbols,
+        Self::Budget,
+        Self::DecoratorDispatch,
+    ];
+
+    /// The stable `snake_case` name — the same string the JSON carries.
+    ///
+    /// Spelled out rather than derived, so it is available where there is no
+    /// serialiser to hand (an environment variable, a log line) and so a
+    /// rename shows up as a diff here, where it is a breaking change to
+    /// `impacted-tests --format json` and to the fallback payload alike.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::NonPythonChanges => "non_python_changes",
+            Self::ParseErrors => "parse_errors",
+            Self::TyfUnavailable => "tyf_unavailable",
+            Self::RefsFailed => "refs_failed",
+            Self::IndexFailed => "index_failed",
+            Self::MaxDepth => "max_depth",
+            Self::MaxSymbols => "max_symbols",
+            Self::Budget => "budget",
+            Self::DecoratorDispatch => "decorator_dispatch",
+        }
+    }
+
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -1011,6 +1045,31 @@ mod tests {
     use crate::changed::{ModuleChange, SymbolChange};
     use crate::pysource::{self, Kind};
     use crate::workspace::is_test_path;
+
+    #[test]
+    fn every_reason_name_is_the_string_the_json_carries() {
+        // `name()` is hand-written and the JSON is derived; the two must never
+        // drift, because both are published contracts.
+        for reason in Reason::ALL {
+            let json = serde_json::to_string(&reason).expect("a unit variant serialises");
+            assert_eq!(json, format!("\"{}\"", reason.name()), "{reason:?}");
+            assert!(
+                reason.name().bytes().all(|b| b.is_ascii_lowercase() || b == b'_'),
+                "{reason:?} is not snake_case: {}",
+                reason.name()
+            );
+        }
+    }
+
+    #[test]
+    fn the_reason_list_is_complete() {
+        // `name()` matches exhaustively, so a new variant fails to compile
+        // until it is named; this is what makes it also fail until listed.
+        let mut names: Vec<&str> = Reason::ALL.iter().map(|reason| reason.name()).collect();
+        names.sort_unstable();
+        names.dedup();
+        assert_eq!(names.len(), Reason::ALL.len(), "every variant is listed exactly once");
+    }
 
     /// An [`Index`] over a map of repository-relative path to source text.
     ///

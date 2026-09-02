@@ -19,6 +19,7 @@ use crate::changed::{
 use crate::closure::{Reason, Verdict};
 use crate::config::Config;
 use crate::diff;
+use crate::fallback::{self, Fallback, Payload};
 use crate::git::{Base, Git};
 use crate::impact::{self, Budgets, FsIndex, ImpactReport, TyfRefs};
 use crate::model::relative_display;
@@ -57,7 +58,9 @@ Exit codes:
   1  findings reported
   2  the run could not complete (tyf missing, bad workspace, ...)
 
-`run` is the exception: once pytest starts, the exit code is pytest's own, because gerenuk's process has become pytest.
+`run` is the exception: once pytest starts, the exit code is pytest's own, \
+because gerenuk's process has become pytest. The same goes for a configured \
+`fallback-command`, which takes over a `run_all` outcome.
 
 `changed-symbols` and `impacted-tests` never return 1: they are inventories \
 rather than verdicts. When `impacted-tests` cannot trust its own answer it \
@@ -181,6 +184,13 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
 
+        /// What to exec instead of the full suite when the outcome is
+        /// `run_all`, as a JSON array: `["scripts/pick.sh", "--from-gerenuk"]`.
+        /// Beats `GERENUK_FALLBACK`, which beats `fallback-command` in
+        /// pyproject.toml.
+        #[arg(long, value_name = "JSON_ARRAY")]
+        fallback_command: Option<String>,
+
         /// Everything after `--`, appended to the pytest argv verbatim.
         #[arg(last = true, value_name = "PYTEST_ARGS", allow_hyphen_values = true)]
         pytest_args: Vec<OsString>,
@@ -249,18 +259,21 @@ impl Cli {
                 // produce one at all is a failure, and that arrives as an Err.
                 Ok(Outcome::Clean)
             }
-            Command::Run { base, impact, budgets, dry_run, pytest_args } => run_pytest(
-                out,
-                &root,
-                &RunOptions {
-                    base: base.as_deref(),
-                    impact: impact.as_deref(),
-                    budgets: Budgets::from(&budgets),
-                    dry_run,
-                    format: self.format,
-                    pytest_args: &pytest_args,
-                },
-            ),
+            Command::Run { base, impact, budgets, dry_run, fallback_command, pytest_args } => {
+                run_pytest(
+                    out,
+                    &root,
+                    &RunOptions {
+                        base: base.as_deref(),
+                        impact: impact.as_deref(),
+                        budgets: Budgets::from(&budgets),
+                        dry_run,
+                        format: self.format,
+                        fallback_command: fallback_command.as_deref(),
+                        pytest_args: &pytest_args,
+                    },
+                )
+            }
         }
     }
 }
@@ -340,6 +353,17 @@ struct ImpactRun {
     /// Every path in the repository, or `None` when the run answered before it
     /// had to ask.
     files: Option<Vec<PathBuf>>,
+    /// The phase-1 report the impact was computed from. `run` hands it to the
+    /// fallback command; a replayed `--impact` run has none.
+    changed: Option<ChangedSymbols>,
+}
+
+impl ImpactRun {
+    /// A verdict reached without walking.
+    fn unwalked(changed: ChangedSymbols, reason: Reason, errors: Vec<String>) -> Self {
+        let report = impact::run_all(&changed, reason, errors);
+        Self { report, files: None, changed: Some(changed) }
+    }
 }
 
 fn impacted_run(
@@ -365,18 +389,19 @@ fn impacted_run(
         report
     };
 
-    let unwalked = |reason, errors| ImpactRun {
-        report: impact::run_all(&changed, reason, errors),
-        files: None,
-    };
-
     if let Some(reason) = impact::upfront_reason(&changed) {
-        return Ok(unwalked(reason, Vec::new()));
+        return Ok(ImpactRun::unwalked(changed, reason, Vec::new()));
     }
 
     let runner = match Runner::discover(root) {
         Ok(runner) => runner,
-        Err(err) => return Ok(unwalked(Reason::TyfUnavailable, vec![format!("{err:#}")])),
+        Err(err) => {
+            return Ok(ImpactRun::unwalked(
+                changed,
+                Reason::TyfUnavailable,
+                vec![format!("{err:#}")],
+            ))
+        }
     };
 
     // Past the gate every failure is a verdict, not an exit code: a repository
@@ -384,13 +409,15 @@ fn impacted_run(
     // See `docs/adr/0009-run-all-is-a-success.md`.
     let files = match workspace_files(git, untracked) {
         Ok(files) => files,
-        Err(err) => return Ok(unwalked(Reason::IndexFailed, vec![format!("{err:#}")])),
+        Err(err) => {
+            return Ok(ImpactRun::unwalked(changed, Reason::IndexFailed, vec![format!("{err:#}")]))
+        }
     };
 
     let index = FsIndex::new(root, &files);
     let refs = TyfRefs::new(&runner, root);
     let report = impact::analyze(&changed, &refs, &index, config, &limits);
-    Ok(ImpactRun { report, files: Some(files) })
+    Ok(ImpactRun { report, files: Some(files), changed: Some(changed) })
 }
 
 /// Everything `gerenuk run` was asked for.
@@ -400,6 +427,8 @@ struct RunOptions<'a> {
     budgets: Budgets,
     dry_run: bool,
     format: Format,
+    /// `--fallback-command`, still as the JSON text it was given.
+    fallback_command: Option<&'a str>,
     pytest_args: &'a [OsString],
 }
 
@@ -413,10 +442,21 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
     let started = Instant::now();
     let repo = repo_context(workspace)?;
 
-    let ImpactRun { mut report, files } = match options.impact {
+    // Resolved before the diff is taken, whatever the outcome turns out to be:
+    // an empty argv is a configuration error, and it is found now rather than
+    // on the day the bail-out first happens.
+    let fallback = fallback::resolve(
+        options.fallback_command,
+        fallback_override()?.as_deref(),
+        &repo.config,
+        &repo.root,
+    )?;
+
+    let ImpactRun { mut report, files, changed } = match options.impact {
         Some(path) => ImpactRun {
             report: load_report::<ImpactReport>(path, "impact", "an impacted-tests report")?,
             files: None,
+            changed: None,
         },
         None => impacted_run(&repo, options.base, None, options.budgets)?,
     };
@@ -444,8 +484,17 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
     let selection = select::select(&report, &index);
 
     let elapsed = started.elapsed().as_millis();
+    // The fallback applies to one outcome only; the other two never see it.
+    let delegated = match selection.decision {
+        Decision::RunAll => fallback.as_ref(),
+        Decision::Selected | Decision::Nothing => None,
+    };
+
     if options.dry_run {
-        return dry_run(out, &repo, &selection, elapsed, options);
+        let plan = delegated.map(|fallback| {
+            fallback::Plan::new(fallback, Payload::new(selection.reason, changed.as_ref()))
+        });
+        return dry_run(out, &repo, &selection, plan, elapsed, options);
     }
 
     // Said before the exec, because after it there is no gerenuk to say it.
@@ -456,11 +505,43 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
         return Ok(Outcome::Clean);
     }
 
+    if let Some(fallback) = delegated {
+        // pytest is not resolved at all: the fallback owns the run from here,
+        // and the passthrough after `--` is pytest's, so it is not handed on.
+        eprintln!("gerenuk: delegating to fallback {}", fallback.describe());
+        let handoff = Payload::new(selection.reason, changed.as_ref()).handoff()?;
+        out.flush().context("could not flush gerenuk's own output before running the fallback")?;
+        return exec_fallback(fallback, handoff, &repo.root);
+    }
+
     let runner = pytest::Runner::resolve(pytest_override(), &repo.config, &repo.root)?;
     let argv = runner.argv(&selection, options.pytest_args);
     // Nothing of ours may still be buffered: the next call replaces us.
     out.flush().context("could not flush gerenuk's own output before running pytest")?;
-    runner.exec(&argv).map(Outcome::Code)
+    runner.exec(&argv, pytest::Handoff::default()).map(Outcome::Code)
+}
+
+/// Become the fallback command, through the same seam pytest goes through.
+///
+/// A failure to exec — the program missing, not executable — names where it
+/// was configured, and the seam's own error names the resolved path: between
+/// them, that is what the user has to go and fix.
+fn exec_fallback(fallback: &Fallback, handoff: pytest::Handoff, root: &Path) -> Result<Outcome> {
+    let runner = pytest::Runner::with_command(fallback.argv().iter().cloned(), root);
+    runner.exec(fallback.argv(), handoff).map(Outcome::Code).with_context(|| {
+        format!("the fallback command from {} could not be started", fallback.source().label())
+    })
+}
+
+/// The `GERENUK_FALLBACK` override, read here for the same reason as
+/// [`pytest_override`]: so [`fallback::resolve`] stays a pure function of its
+/// arguments.
+fn fallback_override() -> Result<Option<String>> {
+    match std::env::var(fallback::FALLBACK_ENV) {
+        Ok(text) => Ok(Some(text)),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(err).with_context(|| format!("cannot read {}", fallback::FALLBACK_ENV)),
+    }
 }
 
 /// The `GERENUK_PYTEST` override, read here rather than inside
@@ -472,26 +553,35 @@ fn pytest_override() -> Option<std::ffi::OsString> {
 }
 
 /// Print the decision and the argv gerenuk would have run.
+///
+/// `plan` is the fallback that would have taken the run, when one applies; then
+/// pytest is not looked for at all, exactly as on the real path.
 fn dry_run(
     out: &mut impl Write,
     repo: &Repo,
     selection: &Selection,
+    plan: Option<fallback::Plan<'_>>,
     elapsed_ms: u128,
     options: &RunOptions,
 ) -> Result<Outcome> {
-    // A missing pytest must not fail a dry run: the interesting half of the
-    // answer is the selection, and reporting it is more use than an error.
-    let resolved = pytest::Runner::resolve(pytest_override(), &repo.config, &repo.root);
-    let argv = match (selection.decision, resolved) {
-        (Decision::Nothing, _) => Vec::new(),
-        (_, Ok(runner)) => runner.argv(selection, options.pytest_args),
-        (_, Err(err)) => {
-            eprintln!("gerenuk: {err:#}");
-            Vec::new()
+    let argv = if let Some(plan) = &plan {
+        plan.argv.iter().map(OsString::from).collect()
+    } else {
+        // A missing pytest must not fail a dry run: the interesting half of
+        // the answer is the selection, and reporting it is more use than an
+        // error.
+        let resolved = pytest::Runner::resolve(pytest_override(), &repo.config, &repo.root);
+        match (selection.decision, resolved) {
+            (Decision::Nothing, _) => Vec::new(),
+            (_, Ok(runner)) => runner.argv(selection, options.pytest_args),
+            (_, Err(err)) => {
+                eprintln!("gerenuk: {err:#}");
+                Vec::new()
+            }
         }
     };
 
-    let report = pytest::DryRun { selection, argv, elapsed_ms };
+    let report = pytest::DryRun { selection, argv, elapsed_ms, fallback: plan };
     match options.format {
         Format::Human => write!(out, "{}", report.render_human())?,
         Format::Json => write!(out, "{}", report.render_json()?)?,
