@@ -1,11 +1,14 @@
 # Commands
 
+The first three are one pipeline — impact-based pytest selection — and `run`
+computes the whole of it in-process. The other two stand alone.
+
 | Command | What it does |
 |---|---|
-| [`audit`](audit.md) | Report unreferenced and test-only symbols in one or more files |
 | [`changed-symbols`](changed-symbols.md) | Map the working tree's diff to the Python symbols it changed |
 | [`impacted-tests`](impacted-tests.md) | Walk from those changed symbols to the tests that reach them |
 | [`run`](run.md) | Run pytest on exactly those tests |
+| [`audit`](audit.md) | Report unreferenced and test-only symbols in the files you name |
 | [`doctor`](doctor.md) | Show the resolved workspace and `tyf` binary, then exit |
 
 ## Global flags
@@ -24,8 +27,9 @@
 | `1` | The run completed and findings were reported |
 | `2` | The run could not complete — `tyf` missing, bad workspace, malformed output |
 
-The split between `1` and `2` is what makes `gerenuk` usable in CI: a failing
-check and a broken setup are different problems.
+That table is [`audit`](audit.md)'s. The split between `1` and `2` is what
+makes it usable in CI: a failing check and a broken setup are different
+problems.
 
 `changed-symbols` and `impacted-tests` never return `1`: their output is an
 inventory, not a verdict on one. When `impacted-tests` cannot trust its own
@@ -40,9 +44,9 @@ without spawning anything.
 
 ## Prerequisites per command
 
-`audit` and `doctor` need `tyf` on `PATH`. `changed-symbols` needs only `git` —
-it parses Python with `tree-sitter`, so it works in a checkout that has never
-had `ty` installed. `impacted-tests` needs both, but looks for `tyf` only once
-it knows the walk will actually run. `run` needs those two plus pytest, which it
-resolves from `GERENUK_PYTEST`, then `pytest-command` in `pyproject.toml`, then
-`PATH`.
+`changed-symbols` needs only `git` — it parses Python with `tree-sitter`, so it
+works in a checkout that has never had `ty` installed. `impacted-tests` needs
+both `git` and `tyf`, but looks for `tyf` only once it knows the walk will
+actually run. `run` needs those two plus pytest, which it resolves from
+`GERENUK_PYTEST`, then `pytest-command` in `pyproject.toml`, then `PATH`.
+`audit` and `doctor` need `tyf` on `PATH`.

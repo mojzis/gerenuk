@@ -1,15 +1,18 @@
 # How it works
 
-For `audit`, `gerenuk` does no parsing of its own. It asks `tyf`, which asks
-`ty`'s language server, which does the real name resolution.
+`gerenuk` is a test-selection pipeline, plus an auditor that reads the same
+reference graph backwards.
 
-`changed-symbols` is the exception. It parses Python itself with
-`tree-sitter-python` and needs nothing but `git`, so it works in a checkout that
-has never had `ty` installed — see [changed-symbols](commands/changed-symbols.md).
+## The selection pipeline
 
-[`impacted-tests`](commands/impacted-tests.md) uses both: `git` and
-`tree-sitter` to find the changed symbols, then `tyf` to walk outwards from
-them.
+[`changed-symbols`](commands/changed-symbols.md) parses Python itself, with
+`tree-sitter-python`, and needs nothing but `git` — so the first stage works in
+a checkout that has never had `ty` installed.
+
+[`impacted-tests`](commands/impacted-tests.md) adds the second source: `tyf`,
+which asks `ty`'s language server for the references, and does the real name
+resolution. It walks that graph outwards from the changed symbols until it
+reaches test code.
 
 [`run`](commands/run.md) adds a third source that is neither: the test files
 themselves, parsed for pytest's collection conventions and for the fixture
@@ -35,6 +38,11 @@ flowchart LR
 ```
 
 
+## The audit pipeline
+
+For [`audit`](commands/audit.md), `gerenuk` does no parsing of its own at all —
+it asks `tyf` for the file's outline and then for each symbol's references.
+
 ```mermaid
 flowchart LR
     A[gerenuk audit file.py] --> B[tyf list file.py]
@@ -45,7 +53,7 @@ flowchart LR
     F --> G[human or JSON report]
 ```
 
-## The pipeline
+Step by step:
 
 1. **Outline.** `tyf --format json list <file>` returns an LSP document
    outline: every symbol in the file, its kind, and its ranges.

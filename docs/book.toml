@@ -1,6 +1,6 @@
 [book]
 title = "gerenuk"
-description = "Symbol-level Python code intelligence, powered by ty-find"
+description = "Impact-based pytest selection for Python, powered by ty-find"
 authors = ["mojzis"]
 language = "en"
 src = "src"
