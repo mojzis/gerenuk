@@ -158,11 +158,25 @@ tests/test_service.py::test_summary
 runner. See the
 [documentation](https://mojzis.github.io/gerenuk/commands/run.html).
 
+### Registered functions
+
+Nothing *references* a `@app.command()` or a `@router.get()` — the framework
+holds the only handle. So gerenuk follows the decorator to its registrar (`app`,
+`router`) and treats what reaches the registrar as reaching the function. A
+decorator that only wraps (`@property`, `@functools.wraps`) is left alone, and a
+registrar that cannot be resolved gives `run_all` with
+`reason: "decorator_dispatch"` rather than a confident empty answer.
+See [ADR 0012](docs/adr/0012-a-decorator-is-a-reference.md).
+
 ### Caveat
 
-`gerenuk` reports *static* references. Dynamic dispatch, plugin registries,
-`getattr` lookups and `__all__` re-exports are invisible to it. Findings are
-leads to confirm with `tyf refs <symbol>`, not a delete list.
+`gerenuk` reports *static* references, plus the three edges a type checker
+cannot draw and gerenuk models explicitly: `conftest.py` fixtures, registering
+decorators, and renaming imports (`from x import y as z`, which `tyf` answers
+for under `y` while the code says `z`). Everything else dynamic — registries
+populated at runtime, `getattr` dispatch, `__all__` star re-exports — stays
+invisible. Findings are leads to confirm with `tyf refs <symbol>`, not a delete
+list.
 
 ## Usage with Claude Code
 

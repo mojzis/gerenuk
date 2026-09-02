@@ -36,6 +36,7 @@ everything" rather than a short list or a crash.
 | `refs_failed` | `tyf` failed or answered unparseably part-way through |
 | `index_failed` | The working tree could not be read part-way through |
 | `max_depth` / `max_symbols` / `budget` | A limit tripped before the frontier emptied |
+| `decorator_dispatch` | A changed symbol is registered by a decorator whose registrar could not be resolved, so the framework's route to its tests is invisible. `errors` names the symbol and the decorator. |
 
 `non_python_changes` and `parse_errors` are settled *before* `tyf` is looked
 for, so a diff of `pyproject.toml` alone answers in a checkout with no `ty`
@@ -225,16 +226,24 @@ modules.
 
 These are deliberate for this phase, not bugs to rediscover:
 
-- **Re-exports.** Import lines are dropped everywhere, `__init__.py` included.
-  Most re-export consumers still appear as ordinary references because `ty`
-  resolves them back to the real definition; `__all__`-driven star imports and
-  module-object attribute access do not.
+- **Re-exports.** A plain import line is dropped: the importing module's own
+  uses of the symbol answer for themselves, and following the import too would
+  select every module that so much as mentions it. A **renaming** import
+  (`from x import y as z`) is followed, because there the uses below say `z` and
+  a query about `y` never returns them — see
+  [ADR 0013](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0013-a-renaming-import-is-followed.md).
+  `__all__`-driven star imports and module-object attribute access are still
+  invisible.
 - **Module-level execution.** A changed symbol called at import time of module
   `M` selects only the tests that import `M` directly. A non-test module that
   imports `M` and is tested elsewhere is missed.
 - **Fixtures.** `conftest.py` is not treated specially, and pytest injects
   fixtures by name rather than by reference, so a fixture is a dead end for the
   walk. Fixture-aware expansion is phase 3.
+- **Runtime registries.** Decorator registration is followed
+  ([ADR 0012](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0012-a-decorator-is-a-reference.md)),
+  but a registry populated by a plain call at runtime, `getattr` dispatch and
+  `globals()` lookups are not.
 - **Non-ASCII before a definition's name.** Positions are byte columns. Every
   prefix Python allows before a `def`/`class` name is ASCII, so this is
   theoretical — but a wrong column resolves to *no* references rather than to an

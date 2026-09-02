@@ -20,3 +20,5 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0009](0009-run-all-is-a-success.md) | `run_all` is a successful answer, not an error | accepted |
 | [0010](0010-a-replayed-report-is-parsed-strictly.md) | A `--changed` report is parsed strictly | accepted |
 | [0011](0011-a-third-seam-that-only-execs.md) | A third impure seam, and it only execs | accepted |
+| [0012](0012-a-decorator-is-a-reference.md) | A registering decorator is a reference to what it decorates | accepted |
+| [0013](0013-a-renaming-import-is-followed.md) | A renaming import is followed; a plain one is still dropped | accepted |

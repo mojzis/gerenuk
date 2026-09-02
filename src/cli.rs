@@ -536,12 +536,23 @@ pub fn run_audit(runner: &Runner, root: &Path, files: &[PathBuf]) -> Result<Repo
             runner.list(file).with_context(|| format!("could not outline {}", file.display()))?;
         symbols_checked += outline_size(&outline);
 
+        // Parsed for decorators only. A file `tyf` outlined but we cannot parse
+        // is not fatal here: the audit simply loses the decorator rule for it.
+        let parsed = std::fs::read_to_string(file)
+            .ok()
+            .and_then(|source| crate::pysource::parse(&source).ok());
+
         let mut usages = Vec::new();
         for (name, kind, line) in auditable_symbols(&outline) {
             let refs = runner
                 .refs(&name)
                 .with_context(|| format!("could not resolve references for `{name}`"))?;
-            usages.push(SymbolUsage { name, kind, line, refs });
+            let decorators = parsed
+                .as_ref()
+                .and_then(|module| module.symbol_at(line))
+                .map(|span| span.decorator_names().map(ToString::to_string).collect())
+                .unwrap_or_default();
+            usages.push(SymbolUsage { name, kind, line, refs, decorators });
         }
 
         findings.extend(audit(file, root, &usages));
