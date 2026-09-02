@@ -6,6 +6,58 @@ Report symbols that nothing references, and symbols only tests reach.
 gerenuk audit [OPTIONS] <FILE>...
 ```
 
+`audit` is the companion to the selection pipeline, not the product: the walk
+that [`impacted-tests`](impacted-tests.md) does already holds a resolved
+reference graph, and asking it *what does nothing reach?* is one more query
+against the same graph.
+
+## A verifier, not a repo-wide sweep
+
+[vulture](https://github.com/jendrikseipp/vulture) is the cheap sweep for dead
+code: one pass over a whole project, no type checker involved, nothing to
+install beyond vulture itself. It works on **names**, though, which sets its
+limits — it cannot tell two same-named symbols apart, it flags dynamic and
+framework code that is very much alive, and it cannot tell you *who* references
+a symbol.
+
+`gerenuk audit` asks `ty`'s type checker instead, through `tyf`. References
+resolve the way Python resolves them, and each one comes back as a file and a
+line. That costs one `tyf refs` call per symbol and needs `tyf` installed, which
+is why `audit` takes the files you name rather than a repository — it is shaped
+for confirming a specific suspicion, not for finding one.
+
+So run them in that order:
+
+```sh
+vulture src/                    # sweep: what might be dead
+gerenuk audit src/suspect.py    # confirm the file against resolved references
+tyf refs one_symbol             # or confirm a single name
+# then delete
+```
+
+### Referenced only from tests
+
+The `note` severity is the finding a name-based sweep cannot produce at all:
+every reference to the symbol exists, and every one of them is in a test file.
+Production stopped calling it and its own tests are what keep it alive —
+usually the residue of an unfinished refactor, and exactly the code that
+survives a dead-code scan forever. That finding is why `audit` earns a place
+next to a repo-wide scanner rather than deferring to one entirely.
+
+### What it cannot see
+
+`gerenuk` reports **static** references, plus the three edges a type checker
+cannot draw and gerenuk models explicitly: `conftest.py` fixtures, registering
+decorators, and renaming imports (`from x import y as z`, which `tyf` answers
+for under `y` while the code says `z`). Everything else dynamic — registries
+populated at runtime, `getattr` dispatch, `__all__` star re-exports — stays
+invisible.
+
+So findings are leads, not a delete list. Confirm with `tyf refs <symbol>`
+before deleting anything, and see
+[Troubleshooting](../troubleshooting.md#a-symbol-is-flagged-but-is-definitely-used)
+for the shapes that are flagged but alive.
+
 ## Example
 
 ```

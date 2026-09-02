@@ -24,7 +24,10 @@ echo "Copied .md source files to $BOOK_DIR/"
 cat > "$BOOK_DIR/llms.txt" << EOF
 # gerenuk
 
-> Symbol-level Python code intelligence, powered by ty-find.
+> Impact-based pytest selection for Python, powered by ty-find. Maps a git
+> diff to the symbols it changed, walks the type checker's reference graph out
+> to the tests that reach them, and runs exactly those under pytest. The audit
+> command reads the same graph backwards to confirm dead code.
 
 ## Documentation
 

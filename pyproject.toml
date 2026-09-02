@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gerenuk"
-description = "Symbol-level Python code intelligence, powered by ty-find"
+description = "Impact-based pytest selection for Python: run only the tests your diff impacts, resolved with ty-find"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
@@ -21,9 +21,11 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Quality Assurance",
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
-keywords = ["python", "lsp", "symbols", "static-analysis", "rust"]
+keywords = ["pytest", "test-selection", "python", "static-analysis", "dead-code", "lsp", "rust"]
 dynamic = ["version"]
 # `tyf` is not optional — every command except `changed-symbols` shells out to
 # it — so installing gerenuk installs it. `ty` itself is deliberately *not* a

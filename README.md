@@ -1,21 +1,22 @@
 # gerenuk
 
-**Symbol-level Python code intelligence, powered by [ty-find](https://github.com/mojzis/ty-find).**
+**Impact-based pytest selection for Python, powered by
+[ty-find](https://github.com/mojzis/ty-find).**
 
-`tyf` answers questions about one symbol at a time. `gerenuk` asks those
-questions for every symbol in a file and reports what stands out:
+A diff comes in; `gerenuk run` runs exactly the tests that diff impacts, and
+nothing else:
 
 ```
-$ gerenuk audit sample_pkg/service.py
-warn  sample_pkg/service.py:43  func `legacy_export` has no references
-note  sample_pkg/service.py:34  method `ShelterService.seniors` is referenced only from tests (1)
-
-1 file(s), 7 symbol(s) checked — 1 warn, 1 note
+$ gerenuk run -- -q
+gerenuk: 5 node id(s) from 1 origin(s) in 152 ms — details: gerenuk impacted-tests
+.........                                                                [100%]
+9 passed in 0.02s
 ```
 
-Grep tells you whether a name *appears*. `gerenuk` asks `ty`'s type checker
-whether it is actually *referenced* — so docstrings, comments and same-named
-symbols in other modules do not count.
+It gets there by asking `ty`'s type checker, through `tyf`, which symbols the
+working tree changed and which tests can reach them — so the selection follows
+Python's actual name resolution, not a name match. Anything gerenuk cannot see
+through becomes "run the whole suite" rather than a confident short list.
 
 📖 **[Documentation](https://mojzis.github.io/gerenuk)** ·
 🤖 [llms.txt](https://mojzis.github.io/gerenuk/llms.txt)
@@ -40,29 +41,15 @@ gerenuk doctor
 ## Usage
 
 ```sh
-gerenuk audit pkg/module.py            # human output
-gerenuk audit --format json pkg/*.py   # machine-readable
-gerenuk audit --workspace ../other pkg/module.py
 gerenuk changed-symbols                # what the working tree changed
 gerenuk impacted-tests                 # and which tests that reaches
 gerenuk run -- -q                      # and run exactly those, under pytest
+gerenuk run --dry-run                  # the decision and the argv, no pytest
+gerenuk audit pkg/module.py            # separately: what nothing references
 ```
 
-| Severity | Rule |
-|---|---|
-| `warn` | The symbol has no references anywhere |
-| `note` | Every reference lives in a test file |
-
-Only callable symbols are audited; `_private` and dunder names are skipped.
-
-| Exit code | Meaning |
-|---|---|
-| `0` | Nothing flagged |
-| `1` | Findings reported |
-| `2` | The run could not complete (`tyf` missing, bad workspace, …) |
-
-The split between `1` and `2` is what makes it usable in CI: a failing check and
-a broken setup are different problems.
+The three selection stages are one pipeline, and `run` computes the whole thing
+in-process — the first two are there to be read when a selection surprises you.
 
 ### `changed-symbols`
 
@@ -92,8 +79,8 @@ decorators can be filtered out via `[tool.gerenuk] ignore-decorators` in
 ### `impacted-tests`
 
 Walks the reference graph from those changed symbols out to the tests that
-reach them — impact-based test selection, minus the `pytest` invocation, which
-is [`run`](#run)'s job.
+reach them — the selection, minus the `pytest` invocation, which is
+[`run`](#run)'s job.
 
 ```
 $ gerenuk impacted-tests
@@ -158,7 +145,77 @@ tests/test_service.py::test_summary
 runner. See the
 [documentation](https://mojzis.github.io/gerenuk/commands/run.html).
 
-### Registered functions
+## Dead code: `audit`
+
+The same reference graph answers the opposite question — *what does nothing
+reach?* — so `gerenuk audit` asks it for every symbol in a file:
+
+```
+$ gerenuk audit sample_pkg/service.py
+warn  sample_pkg/service.py:43  func `legacy_export` has no references
+note  sample_pkg/service.py:34  method `ShelterService.seniors` is referenced only from tests (1)
+
+1 file(s), 7 symbol(s) checked — 1 warn, 1 note
+```
+
+| Severity | Rule |
+|---|---|
+| `warn` | The symbol has no references anywhere |
+| `note` | Every reference lives in a test file |
+
+Only callable symbols are audited; `_private` and dunder names are skipped.
+`--format json` emits the findings for scripting.
+
+### It is a verifier, not a sweep
+
+[vulture](https://github.com/jendrikseipp/vulture) is the cheap repo-wide sweep
+for dead code: one pass over a whole project, no type checker involved. It works
+on *names*, so it cannot tell two same-named symbols apart, it flags dynamic and
+framework code that is very much alive, and it cannot tell you *who* references
+a symbol.
+
+`gerenuk audit` asks `ty`'s type checker instead, through `tyf`. References
+resolve the way Python resolves them — docstrings, comments and same-named
+symbols in other modules do not count — and each one comes back as a file and a
+line you can open. That costs one `tyf refs` call per symbol and needs `tyf`
+installed, which is why it takes the files you name rather than a whole
+repository. It is shaped for confirming a specific suspicion.
+
+The two fit together in that order:
+
+```sh
+vulture src/                    # sweep: what might be dead
+gerenuk audit src/suspect.py    # confirm the file against resolved references
+tyf refs one_symbol             # or confirm a single name
+# then delete
+```
+
+Exit codes carry the verdict: `0` nothing flagged, `1` findings reported, `2`
+the run could not complete. The split between `1` and `2` is what makes it
+usable in CI — a failing check and a broken setup are different problems.
+
+### Referenced only from tests
+
+The `note` is the finding a name-based scanner cannot produce at all: every
+reference to the symbol exists, and every one of them is in a test file.
+Production stopped calling it and its own tests are what keep it alive —
+usually the residue of an unfinished refactor, and exactly the code that
+survives a dead-code sweep forever. That finding is why `audit` earns a place
+next to a repo-wide scanner rather than deferring to one entirely.
+
+### What it cannot see
+
+`gerenuk` reports *static* references, plus the three edges a type checker
+cannot draw and gerenuk models explicitly: `conftest.py` fixtures, registering
+decorators, and renaming imports (`from x import y as z`, which `tyf` answers
+for under `y` while the code says `z`). Everything else dynamic — registries
+populated at runtime, `getattr` dispatch, `__all__` star re-exports — stays
+invisible.
+
+So findings are leads, not a delete list. Confirm with `tyf refs <symbol>`
+before deleting anything.
+
+## Registered functions
 
 Nothing *references* a `@app.command()` or a `@router.get()` — the framework
 holds the only handle. So gerenuk follows the decorator to its registrar (`app`,
@@ -168,47 +225,21 @@ registrar that cannot be resolved gives `run_all` with
 `reason: "decorator_dispatch"` rather than a confident empty answer.
 See [ADR 0012](docs/adr/0012-a-decorator-is-a-reference.md).
 
-### Caveat
-
-`gerenuk` reports *static* references, plus the three edges a type checker
-cannot draw and gerenuk models explicitly: `conftest.py` fixtures, registering
-decorators, and renaming imports (`from x import y as z`, which `tyf` answers
-for under `y` while the code says `z`). Everything else dynamic — registries
-populated at runtime, `getattr` dispatch, `__all__` star re-exports — stays
-invisible. Findings are leads to confirm with `tyf refs <symbol>`, not a delete
-list.
-
 ## Usage with Claude Code
 
-Add this to your project's `CLAUDE.md`:
+Add this to your project's `CLAUDE.md`. Two lines is the whole of it — the exit
+codes, the `run_all` verdict and the caveat above are in `gerenuk --help` and on
+the [documentation site](https://mojzis.github.io/gerenuk), which is where an
+agent that needs them should go:
 
 <!-- BEGIN SHARED:claude-snippet -->
 ```markdown
-### Dead-symbol checks — `gerenuk`
+### `gerenuk` — test selection and dead code
 
-This project has `gerenuk` — a symbol-level auditor built on `tyf` (ty-find).
-Run it before deleting Python code, and after a refactor.
-
-- `gerenuk audit pkg/module.py` — flag symbols nothing references, and symbols
-  only tests reach
-- `gerenuk audit --format json pkg/*.py` — same, machine-readable
-- `gerenuk changed-symbols` — which Python symbols the working tree changed
-- `gerenuk impacted-tests` — which tests those changed symbols can reach
-- `gerenuk run -- -q` — run pytest on exactly those tests
-- `gerenuk doctor` — check that `tyf` and the workspace resolve
-
-Exit codes: `0` clean, `1` findings reported, `2` the run could not complete.
-`changed-symbols` and `impacted-tests` never return `1`. When `impacted-tests`
-cannot trust its answer it reports `"verdict": "run_all"` with a `reason` and
-still exits `0` — read the verdict, not the exit code.
-
-`run` is the exception: once pytest starts, the exit code is pytest's own. Use
-`gerenuk run --dry-run` to see the decision and the exact argv without running
-anything.
-
-Findings are signals, not verdicts: dynamic dispatch, plugin registries, and
-`__all__` re-exports can hide a real usage. Confirm with `tyf refs <symbol>`
-before deleting anything.
+- `gerenuk run -- -q` runs only the tests the working tree's diff impacts
+  (`--dry-run` to inspect; `gerenuk impacted-tests` explains why).
+- `gerenuk audit <file>` confirms a symbol vulture flagged is really unused;
+  its `only tests reach it` findings are ones vulture cannot produce.
 ```
 <!-- END SHARED:claude-snippet -->
 

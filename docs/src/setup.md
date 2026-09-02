@@ -4,7 +4,7 @@
 
 ```sh
 uv add --dev "gerenuk[ty]"        # from PyPI (a maturin-built wheel)
-uvx --from "gerenuk[ty]" gerenuk audit pkg/x.py   # one-off, no install
+uvx --from "gerenuk[ty]" gerenuk impacted-tests   # one-off, no install
 ```
 
 From a `pip` world, `pip install "gerenuk[ty]"`.
@@ -57,38 +57,23 @@ GERENUK_TYF=/opt/bin/tyf gerenuk doctor
 
 By default `gerenuk` walks up from the current directory until it finds a
 `pyproject.toml`, `setup.py`, `setup.cfg`, or `.git`. Override it with
-`--workspace PATH` when you want to audit a project you are not standing in.
+`--workspace PATH` when you want to run against a project you are not standing
+in.
 
 ## Telling coding agents about it
 
-Paste this into your project's `CLAUDE.md`:
+Paste this into your project's `CLAUDE.md`. It is deliberately two lines — the
+exit codes, the `run_all` verdict and the static-reference caveat are all in
+`gerenuk --help` and on this site, and an agent that needs them can read them
+there:
 
 <!-- BEGIN SHARED:claude-snippet -->
 ```markdown
-### Dead-symbol checks — `gerenuk`
+### `gerenuk` — test selection and dead code
 
-This project has `gerenuk` — a symbol-level auditor built on `tyf` (ty-find).
-Run it before deleting Python code, and after a refactor.
-
-- `gerenuk audit pkg/module.py` — flag symbols nothing references, and symbols
-  only tests reach
-- `gerenuk audit --format json pkg/*.py` — same, machine-readable
-- `gerenuk changed-symbols` — which Python symbols the working tree changed
-- `gerenuk impacted-tests` — which tests those changed symbols can reach
-- `gerenuk run -- -q` — run pytest on exactly those tests
-- `gerenuk doctor` — check that `tyf` and the workspace resolve
-
-Exit codes: `0` clean, `1` findings reported, `2` the run could not complete.
-`changed-symbols` and `impacted-tests` never return `1`. When `impacted-tests`
-cannot trust its answer it reports `"verdict": "run_all"` with a `reason` and
-still exits `0` — read the verdict, not the exit code.
-
-`run` is the exception: once pytest starts, the exit code is pytest's own. Use
-`gerenuk run --dry-run` to see the decision and the exact argv without running
-anything.
-
-Findings are signals, not verdicts: dynamic dispatch, plugin registries, and
-`__all__` re-exports can hide a real usage. Confirm with `tyf refs <symbol>`
-before deleting anything.
+- `gerenuk run -- -q` runs only the tests the working tree's diff impacts
+  (`--dry-run` to inspect; `gerenuk impacted-tests` explains why).
+- `gerenuk audit <file>` confirms a symbol vulture flagged is really unused;
+  its `only tests reach it` findings are ones vulture cannot produce.
 ```
 <!-- END SHARED:claude-snippet -->
