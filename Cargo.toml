@@ -2,12 +2,16 @@
 name = "gerenuk"
 version = "0.1.0"
 edition = "2021"
-description = "Symbol-level Python code intelligence on top of ty-find"
+description = "Impact-based pytest selection for Python: run only the tests your diff impacts, resolved with ty-find"
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/mojzis/gerenuk"
-keywords = ["python", "lsp", "static-analysis", "symbols", "cli"]
-categories = ["development-tools", "command-line-utilities"]
+keywords = ["pytest", "test-selection", "python", "static-analysis", "cli"]
+categories = [
+    "development-tools",
+    "development-tools::testing",
+    "command-line-utilities",
+]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
