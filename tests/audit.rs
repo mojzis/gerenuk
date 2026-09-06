@@ -14,6 +14,9 @@ use common::{fake_tyf, gerenuk, sample_pkg, SERVICE_OUTLINE};
 
 /// Reference payloads shaped like real `tyf` output for `sample_pkg/service.py`.
 ///
+/// Keyed by the `file:line:col` position `audit` queries — the name's own
+/// position from [`SERVICE_OUTLINE`], one-based — not by name (ADR 0002).
+///
 /// Two quirks are reproduced on purpose, because gerenuk has to survive both:
 ///
 /// * `tyf` files **every** reference under `test_references` here — its test
@@ -29,8 +32,8 @@ use common::{fake_tyf, gerenuk, sample_pkg, SERVICE_OUTLINE};
 fn refs_fixtures() -> Vec<(&'static str, &'static str)> {
     vec![
         (
-            "describe",
-            r#"{"symbol": "describe", "reference_count": 0, "references": [],
+            "sample_pkg/service.py:16:5",
+            r#"{"symbol": "sample_pkg/service.py:16:5", "reference_count": 0, "references": [],
                 "test_reference_count": 8, "test_references": [
                   {"file": "sample_pkg/service.py", "line": 16, "column": 5, "context": "describe"},
                   {"file": "sample_pkg/cli.py", "line": 6, "column": 48, "context": "module scope"},
@@ -43,8 +46,8 @@ fn refs_fixtures() -> Vec<(&'static str, &'static str)> {
                 ]}"#,
         ),
         (
-            "ShelterService.summary",
-            r#"{"symbol": "ShelterService.summary", "reference_count": 0, "references": [],
+            "sample_pkg/service.py:28:9",
+            r#"{"symbol": "sample_pkg/service.py:28:9", "reference_count": 0, "references": [],
                 "test_reference_count": 3, "test_references": [
                   {"file": "sample_pkg/service.py", "line": 28, "column": 9, "context": "summary"},
                   {"file": "sample_pkg/cli.py", "line": 23, "column": 19, "context": "main"},
@@ -52,16 +55,16 @@ fn refs_fixtures() -> Vec<(&'static str, &'static str)> {
                 ]}"#,
         ),
         (
-            "ShelterService.seniors",
-            r#"{"symbol": "ShelterService.seniors", "reference_count": 0, "references": [],
+            "sample_pkg/service.py:34:9",
+            r#"{"symbol": "sample_pkg/service.py:34:9", "reference_count": 0, "references": [],
                 "test_reference_count": 2, "test_references": [
                   {"file": "sample_pkg/service.py", "line": 34, "column": 9, "context": "seniors"},
                   {"file": "tests/test_service.py", "line": 30, "column": 25, "context": "test_seniors_returns_only_old_animals"}
                 ]}"#,
         ),
         (
-            "legacy_export",
-            r#"{"symbol": "legacy_export", "reference_count": 0, "references": [],
+            "sample_pkg/service.py:43:5",
+            r#"{"symbol": "sample_pkg/service.py:43:5", "reference_count": 0, "references": [],
                 "test_reference_count": 1, "test_references": [
                   {"file": "sample_pkg/service.py", "line": 43, "column": 5, "context": "legacy_export"}
                 ]}"#,
@@ -71,7 +74,7 @@ fn refs_fixtures() -> Vec<(&'static str, &'static str)> {
 
 /// A truncated answer: counts are reported but the lists are withheld, the
 /// shape `tyf` returns without `--tests` or under `--references-limit`.
-const TRUNCATED_REFS: &str = r#"{"symbol": "describe", "reference_count": 0, "references": [],
+const TRUNCATED_REFS: &str = r#"{"symbol": "sample_pkg/service.py:16:5", "reference_count": 0, "references": [],
     "test_reference_count": 7, "test_references": []}"#;
 
 #[test]
@@ -165,6 +168,58 @@ fn a_file_where_everything_is_used_exits_clean() {
         .stdout(contains("0 warn, 0 note"));
 }
 
+/// A function nested in a function has no `tyf refs` name form: `outer.helper`
+/// answers "no results", which used to surface as a `no references` warning
+/// for every closure called only inside its enclosing function. The query has
+/// to be the definition's position, as `impacted-tests` already does.
+#[test]
+fn a_closure_called_inside_its_enclosing_function_is_not_dead() {
+    let tmp = TempDir::new().expect("temp dir");
+    let outline = r#"[
+      {"name": "describe", "kind": 12,
+       "range": {"start": {"line": 15, "character": 0}, "end": {"line": 18, "character": 48}},
+       "selectionRange": {"start": {"line": 15, "character": 4}, "end": {"line": 15, "character": 12}},
+       "children": [
+         {"name": "helper", "kind": 12,
+          "range": {"start": {"line": 16, "character": 4}, "end": {"line": 17, "character": 20}},
+          "selectionRange": {"start": {"line": 16, "character": 8}, "end": {"line": 16, "character": 14}},
+          "children": []}
+       ]}
+    ]"#;
+    let refs = vec![
+        (
+            "sample_pkg/service.py:16:5",
+            r#"{"symbol": "sample_pkg/service.py:16:5", "reference_count": 0, "references": [],
+                "test_reference_count": 2, "test_references": [
+                  {"file": "sample_pkg/service.py", "line": 16, "column": 5, "context": "describe"},
+                  {"file": "sample_pkg/cli.py", "line": 24, "column": 15, "context": "main"}
+                ]}"#,
+        ),
+        (
+            "sample_pkg/service.py:17:9",
+            r#"{"symbol": "sample_pkg/service.py:17:9", "reference_count": 0, "references": [],
+                "test_reference_count": 2, "test_references": [
+                  {"file": "sample_pkg/service.py", "line": 17, "column": 9, "context": "describe.helper"},
+                  {"file": "sample_pkg/service.py", "line": 18, "column": 13, "context": "describe"}
+                ]}"#,
+        ),
+        // The name form is what real `tyf` says to `outer.helper`; a stub that
+        // still answers it proves the query no longer goes by name.
+        (
+            "describe.helper",
+            r#"{"symbol": "describe.helper", "reference_count": 0, "references": [],
+                "test_reference_count": 0, "test_references": []}"#,
+        ),
+    ];
+    let tyf = fake_tyf(&tmp, outline, &refs);
+
+    gerenuk(&sample_pkg(), &tyf)
+        .args(["audit", "sample_pkg/service.py"])
+        .assert()
+        .success()
+        .stdout(contains("No findings."));
+}
+
 #[test]
 fn an_empty_file_is_audited_without_complaint() {
     let tmp = TempDir::new().expect("temp dir");
@@ -200,7 +255,7 @@ fn withheld_reference_lists_fall_back_to_tyf_counts() {
        "selectionRange": {"start": {"line": 15, "character": 4}, "end": {"line": 15, "character": 12}},
        "children": []}
     ]"#;
-    let tyf = fake_tyf(&tmp, outline, &[("describe", TRUNCATED_REFS)]);
+    let tyf = fake_tyf(&tmp, outline, &[("sample_pkg/service.py:16:5", TRUNCATED_REFS)]);
 
     gerenuk(&sample_pkg(), &tyf)
         .args(["audit", "sample_pkg/service.py"])

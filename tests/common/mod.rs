@@ -148,8 +148,8 @@ impl Default for TestRepo {
 ///
 /// The script ignores `--format json` (gerenuk always passes it) and dispatches
 /// on the sub-command. `outline` answers `list`; `refs_for` maps a query — a
-/// bare name for `audit`, a `file:line:col` position for `impacted-tests` — to
-/// a `tyf refs` payload, and unknown queries get an empty result.
+/// `file:line:col` position, which is what both `audit` and `impacted-tests`
+/// send — to a `tyf refs` payload, and unknown queries get an empty result.
 ///
 /// Real `tyf` answers one query with a bare object and several with an array,
 /// in query order. The stub reproduces both shapes, because that asymmetry is

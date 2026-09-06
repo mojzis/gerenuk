@@ -94,22 +94,16 @@ impl Runner {
         parse_find(&raw)
     }
 
-    /// Usages of `symbol` (`tyf refs`).
-    pub fn refs(&self, symbol: &str) -> Result<ReferencesResult> {
-        let mut args = vec!["refs", symbol];
-        args.extend(REFS_FLAGS);
-        parse_refs(&self.run(args)?)
-    }
-
     /// Usages of several symbols or positions in one invocation.
     ///
     /// Each query is either a bare name or a `file:line:col` position; `tyf`
     /// auto-detects which. Answers come back in query order — one JSON object
     /// for a single query, an array for several — so the caller zips by index.
     ///
-    /// Positions are what phase 2 sends: `tyf refs` rejects a name with more
-    /// than one dot (`Outer.Inner.method`), and two same-named symbols in
-    /// different modules answer as one.
+    /// Positions are what every caller sends: `tyf refs` rejects a name with
+    /// more than one dot (`Outer.Inner.method`), answers "no results" for a
+    /// function nested in a function, and two same-named symbols in different
+    /// modules answer as one.
     pub fn refs_batch(&self, queries: &[String]) -> Result<Vec<ReferencesResult>> {
         if queries.is_empty() {
             return Ok(Vec::new());

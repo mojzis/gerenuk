@@ -22,7 +22,7 @@ a symbol.
 
 `gerenuk audit` asks `ty`'s type checker instead, through `tyf`. References
 resolve the way Python resolves them, and each one comes back as a file and a
-line. That costs one `tyf refs` call per symbol and needs `tyf` installed, which
+line. That costs one `tyf refs` call per file and needs `tyf` installed, which
 is why `audit` takes the files you name rather than a repository — it is shaped
 for confirming a specific suspicion, not for finding one.
 
@@ -139,6 +139,7 @@ would call every file a test.
 
 ## Cost
 
-`audit` runs one `tyf list` per file plus one `tyf refs` per auditable symbol.
-On a large module that is a lot of LSP round-trips — pass the files you care
-about rather than the whole package.
+`audit` runs one `tyf list` per file plus one `tyf refs` per file, batching
+every auditable symbol's position into it. The batch still resolves each
+symbol inside `ty`, so a large module is still a lot of work — pass the files
+you care about rather than the whole package.

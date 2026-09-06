@@ -679,17 +679,29 @@ pub fn run_audit(runner: &Runner, root: &Path, files: &[PathBuf]) -> Result<Repo
             .ok()
             .and_then(|source| crate::pysource::parse(&source).ok());
 
+        // Queried by position, one `tyf refs` call per file: a nested function
+        // has no name form, and `Outer.Inner.method` is a usage error (ADR 0002).
+        let targets = auditable_symbols(&outline);
+        let positions: Vec<String> =
+            targets.iter().map(|t| format!("{}:{}:{}", file.display(), t.line, t.column)).collect();
+        let answers = runner.refs_batch(&positions).with_context(|| {
+            format!("could not resolve references for {}", positions.join(", "))
+        })?;
+
         let mut usages = Vec::new();
-        for (name, kind, line) in auditable_symbols(&outline) {
-            let refs = runner
-                .refs(&name)
-                .with_context(|| format!("could not resolve references for `{name}`"))?;
+        for (target, refs) in targets.into_iter().zip(answers) {
             let decorators = parsed
                 .as_ref()
-                .and_then(|module| module.symbol_at(line))
+                .and_then(|module| module.symbol_at(target.line))
                 .map(|span| span.decorator_names().map(ToString::to_string).collect())
                 .unwrap_or_default();
-            usages.push(SymbolUsage { name, kind, line, refs, decorators });
+            usages.push(SymbolUsage {
+                name: target.name,
+                kind: target.kind,
+                line: target.line,
+                refs,
+                decorators,
+            });
         }
 
         findings.extend(audit(file, root, &usages));

@@ -57,27 +57,49 @@ pub struct SymbolUsage {
     pub decorators: Vec<String>,
 }
 
+/// One symbol an audit will ask `tyf refs` about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditTarget {
+    /// Dotted name through every nesting level, e.g. `Outer.Inner.method`.
+    /// For display: a nested function has no `tyf refs` name form.
+    pub name: String,
+    pub kind: SymbolKind,
+    /// One-based line of the symbol's name.
+    pub line: u32,
+    /// One-based column of the symbol's name — with [`Self::line`], what
+    /// `tyf refs file:line:col` resolves (ADR 0002).
+    pub column: u32,
+}
+
 /// Flatten a `tyf list` outline into the callable symbols worth auditing.
 ///
 /// Dunder methods and private helpers (`_name`) are skipped: they are usually
 /// referenced implicitly or deliberately internal, so flagging them is noise.
 #[must_use]
-pub fn auditable_symbols(outline: &[DocumentSymbol]) -> Vec<(String, SymbolKind, u32)> {
+pub fn auditable_symbols(outline: &[DocumentSymbol]) -> Vec<AuditTarget> {
     let mut out = Vec::new();
     for top in outline {
-        for symbol in top.walk() {
-            if !symbol.kind.is_callable() || !is_auditable_name(&symbol.name) {
-                continue;
-            }
-            let name = if std::ptr::eq(symbol, top) {
-                symbol.name.clone()
-            } else {
-                top.qualified_child(symbol)
-            };
-            out.push((name, symbol.kind, symbol.selection_range.start.line + 1));
-        }
+        collect_targets(top, None, &mut out);
     }
     out
+}
+
+fn collect_targets(symbol: &DocumentSymbol, parent: Option<&str>, out: &mut Vec<AuditTarget>) {
+    let name = match parent {
+        Some(parent) => format!("{parent}.{}", symbol.name),
+        None => symbol.name.clone(),
+    };
+    if symbol.kind.is_callable() && is_auditable_name(&symbol.name) {
+        out.push(AuditTarget {
+            name: name.clone(),
+            kind: symbol.kind,
+            line: symbol.selection_range.start.line + 1,
+            column: symbol.selection_range.start.character + 1,
+        });
+    }
+    for child in &symbol.children {
+        collect_targets(child, Some(&name), out);
+    }
 }
 
 /// Count every symbol in an outline, nested ones included.
@@ -362,13 +384,46 @@ mod tests {
         ];
 
         let found: Vec<(String, u32)> =
-            auditable_symbols(&outline).into_iter().map(|(name, _, line)| (name, line)).collect();
+            auditable_symbols(&outline).into_iter().map(|t| (t.name, t.line)).collect();
 
         assert_eq!(
             found,
             vec![("Calculator.add".to_string(), 3), ("main".to_string(), 21)],
             "methods are qualified, private/dunder names and non-callables are skipped"
         );
+    }
+
+    #[test]
+    fn auditable_symbols_qualify_through_every_nesting_level() {
+        // `Outer.Inner.method` used to come out as `Outer.method`: only the
+        // top-level name was prepended, so two levels down lost a segment.
+        let outline = vec![
+            symbol("outer", 12, 0, vec![symbol("helper", 12, 1, vec![])]),
+            symbol(
+                "Outer",
+                5,
+                5,
+                vec![symbol("Inner", 5, 6, vec![symbol("method", 6, 7, vec![])])],
+            ),
+        ];
+
+        let names: Vec<String> = auditable_symbols(&outline).into_iter().map(|t| t.name).collect();
+
+        assert_eq!(names, vec!["outer", "outer.helper", "Outer.Inner.method"]);
+    }
+
+    #[test]
+    fn auditable_symbols_carry_the_one_based_column_of_the_name() {
+        // The column is what `tyf refs file:line:col` needs: a nested function
+        // has no name form, so the position is the only query that reaches it.
+        let mut nested = symbol("helper", 12, 1, vec![]);
+        nested.selection_range.start.character = 8;
+        let outline = vec![symbol("outer", 12, 0, vec![nested])];
+
+        let positions: Vec<(u32, u32)> =
+            auditable_symbols(&outline).into_iter().map(|t| (t.line, t.column)).collect();
+
+        assert_eq!(positions, vec![(1, 1), (2, 9)], "LSP is zero-based, tyf positions are not");
     }
 
     #[test]
