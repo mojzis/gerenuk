@@ -10,6 +10,7 @@ computes the whole of it in-process. The other two stand alone.
 | [`run`](run.md) | Run pytest on exactly those tests |
 | [`audit`](audit.md) | Report unreferenced and test-only symbols in the files you name |
 | [`doctor`](doctor.md) | Show the resolved workspace and `tyf` binary, then exit |
+| [`guide`](guide.md) | Print agent-facing instructions: `setup`, `triage` or `tune` |
 
 ## Global flags
 
@@ -49,4 +50,5 @@ works in a checkout that has never had `ty` installed. `impacted-tests` needs
 both `git` and `tyf`, but looks for `tyf` only once it knows the walk will
 actually run. `run` needs those two plus pytest, which it resolves from
 `GERENUK_PYTEST`, then `pytest-command` in `pyproject.toml`, then `PATH`.
-`audit` and `doctor` need `tyf` on `PATH`.
+`audit` and `doctor` need `tyf` on `PATH`. `guide` needs nothing at all, not
+even a repository.

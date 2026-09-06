@@ -23,3 +23,4 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0012](0012-a-decorator-is-a-reference.md) | A registering decorator is a reference to what it decorates | accepted |
 | [0013](0013-a-renaming-import-is-followed.md) | A renaming import is followed; a plain one is still dropped | accepted |
 | [0014](0014-run-all-delegates-to-a-fallback.md) | `run_all` delegates to a configured fallback, through the exec seam | accepted |
+| [0015](0015-the-guide-is-the-docs.md) | `gerenuk guide` ships the docs pages and reads one file to pick one | accepted |
