@@ -31,7 +31,7 @@ dynamic = ["version"]
 # it — so installing gerenuk installs it. `ty` itself is deliberately *not* a
 # hard dependency; see the `ty` extra below.
 dependencies = [
-    "ty-find>=0.4",
+    "ty-find>=0.4.5",
 ]
 
 [project.urls]
