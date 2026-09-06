@@ -55,6 +55,11 @@ pub struct SymbolUsage {
     /// Dotted names of the decorators applied to it, when the file could be
     /// parsed. A registering decorator is what makes "no references" a lie.
     pub decorators: Vec<String>,
+    /// Bases of the class a method sits in, when the file could be parsed.
+    /// Empty for a function and for a class with no bases. A framework calling
+    /// an override through the base is the other thing that makes "no
+    /// references" a lie.
+    pub bases: Vec<String>,
 }
 
 /// One symbol an audit will ask `tyf refs` about.
@@ -183,11 +188,24 @@ fn classify(usage: &SymbolUsage, file: &Path, root: &Path) -> Option<(Severity, 
         return None;
     }
 
+    // `logging.Filter.filter`, `Thread.run`, `TestCase.setUp`: the base class
+    // is the reference. Only with a base — on a plain class `filter` is just a
+    // name — and only for names a framework is known to call (ADR 0016).
+    if overrides_framework_hook(usage) {
+        return None;
+    }
+
     if tests == 0 {
         Some((Severity::Warn, format!("`{}` has no references", usage.name)))
     } else {
         Some((Severity::Note, format!("`{}` is referenced only from tests ({tests})", usage.name)))
     }
+}
+
+fn overrides_framework_hook(usage: &SymbolUsage) -> bool {
+    let has_base = usage.bases.iter().any(|b| b.rsplit('.').next() != Some("object"));
+    let own_name = usage.name.rsplit('.').next().unwrap_or(&usage.name);
+    has_base && crate::hooks::is_framework_hook(own_name)
 }
 
 #[cfg(test)]
@@ -226,7 +244,67 @@ mod tests {
             line: 10,
             refs,
             decorators: Vec::new(),
+            bases: Vec::new(),
         }
+    }
+
+    fn method(name: &str, bases: &[&str]) -> SymbolUsage {
+        SymbolUsage {
+            kind: SymbolKind::Method,
+            bases: bases.iter().map(ToString::to_string).collect(),
+            ..usage(name, refs(name, &[], &[]))
+        }
+    }
+
+    #[test]
+    fn a_framework_hook_overridden_on_a_subclass_is_not_dead() {
+        // `logging.Filter.filter` is called by the logging module, which holds
+        // the only reference — the same shape as a registering decorator.
+        let findings = audit(
+            Path::new("pkg/logs.py"),
+            Path::new(ROOT),
+            &[method("Quiet.filter", &["logging.Filter"])],
+        );
+        assert!(findings.is_empty(), "an override the framework calls is alive, got {findings:?}");
+    }
+
+    #[test]
+    fn a_hook_name_on_a_class_without_bases_is_still_audited() {
+        // Nothing but a base class makes `filter` mean the logging protocol.
+        let findings =
+            audit(Path::new("pkg/logs.py"), Path::new(ROOT), &[method("Plain.filter", &[])]);
+        assert_eq!(findings.len(), 1, "no base, no framework, got {findings:?}");
+    }
+
+    #[test]
+    fn object_is_not_a_base_worth_the_name() {
+        let findings = audit(
+            Path::new("pkg/logs.py"),
+            Path::new(ROOT),
+            &[method("Legacy.filter", &["object"])],
+        );
+        assert_eq!(findings.len(), 1, "`class X(object)` is `class X`, got {findings:?}");
+    }
+
+    #[test]
+    fn an_ordinary_method_on_a_subclass_is_still_audited() {
+        let findings = audit(
+            Path::new("pkg/logs.py"),
+            Path::new(ROOT),
+            &[method("Quiet.helper", &["logging.Filter"])],
+        );
+        assert_eq!(findings.len(), 1, "only known hook names are exempt, got {findings:?}");
+    }
+
+    #[test]
+    fn the_hook_rule_reads_the_method_s_own_name() {
+        // `Outer.Inner.on_message`: the last segment is what the framework calls.
+        let findings = audit(
+            Path::new("pkg/bot.py"),
+            Path::new(ROOT),
+            &[method("Outer.Inner.on_message", &["Client"])],
+        );
+        assert!(findings.is_empty(), "prefix hooks match the last segment, got {findings:?}");
     }
 
     fn span(line: u32) -> Range {

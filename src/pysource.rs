@@ -64,6 +64,10 @@ pub struct SymbolSpan {
     /// Empty for a class. This is how a pytest fixture request is recognised:
     /// pytest injects by parameter *name*, so the list is the whole edge.
     pub params: Vec<String>,
+    /// Dotted names of a class's bases, in source order: `logging.Filter`,
+    /// `Generic` for `Generic[T]`. Keyword arguments (`metaclass=`) are not
+    /// bases. Empty for a `def`, and for a class with no parentheses.
+    pub bases: Vec<String>,
 }
 
 impl SymbolSpan {
@@ -206,6 +210,14 @@ impl Module {
     #[must_use]
     pub fn symbol_at(&self, line: u32) -> Option<&SymbolSpan> {
         self.spans.iter().filter(|span| span.contains(line)).max_by_key(|span| span.start_line)
+    }
+
+    /// The class a definition sits directly in: `Outer.Inner` for
+    /// `Outer.Inner.method`, `None` at module level.
+    #[must_use]
+    pub fn enclosing_class(&self, span: &SymbolSpan) -> Option<&SymbolSpan> {
+        let (parent, _) = span.qualname.rsplit_once('.')?;
+        self.spans.iter().find(|s| s.kind == Kind::Class && s.qualname == parent)
     }
 
     /// Whether `line` is part of an import statement.
@@ -358,6 +370,7 @@ fn emit(
         name_column,
         decorators,
         params: parameters(def, src),
+        bases: superclasses(def, src),
     });
 
     if defines_class {
@@ -459,6 +472,22 @@ fn parameters(def: Node, src: &[u8]) -> Vec<String> {
                 param.named_child(0).and_then(|n| n.utf8_text(src).ok()).map(ToString::to_string)
             }
             _ => None,
+        })
+        .collect()
+}
+
+/// The bases of a `class` statement, as dotted names.
+///
+/// tree-sitter files them under `superclasses` as an argument list, keyword
+/// arguments included; those are skipped. `Generic[T]` reduces to `Generic`.
+fn superclasses(def: Node, src: &[u8]) -> Vec<String> {
+    let Some(list) = def.child_by_field_name("superclasses") else { return Vec::new() };
+    let mut cursor = list.walk();
+    list.named_children(&mut cursor)
+        .filter(|base| base.kind() != "keyword_argument")
+        .filter_map(|base| match base.kind() {
+            "subscript" => dotted_name(base.child_by_field_name("value")?, src),
+            _ => dotted_name(base, src),
         })
         .collect()
 }
@@ -787,6 +816,71 @@ def a():
             spans[0].decorators
         );
         assert_eq!(spans[0].qualname, "a", "the definition itself is still found");
+    }
+
+    #[test]
+    fn a_class_records_its_bases_as_dotted_names() {
+        let source = "import logging
+from typing import Generic, TypeVar
+
+T = TypeVar(\"T\")
+
+
+class Quiet(logging.Filter, Generic[T], metaclass=type):
+    def filter(self, record):
+        return True
+
+
+class Plain:
+    def filter(self, record):
+        return True
+
+
+def free():
+    pass
+";
+        let module = module(source);
+        assert_eq!(
+            span_of(&module, "Quiet").bases,
+            vec!["logging.Filter", "Generic"],
+            "a subscripted base keeps its name, a keyword is not a base"
+        );
+        assert!(span_of(&module, "Plain").bases.is_empty(), "no parentheses, no bases");
+        assert!(span_of(&module, "free").bases.is_empty(), "a def has no bases");
+        assert!(span_of(&module, "Quiet.filter").bases.is_empty(), "a method has no bases");
+    }
+
+    #[test]
+    fn a_method_resolves_to_its_enclosing_class() {
+        let source = "class Outer:
+    class Inner(Base):
+        def method(self):
+            pass
+
+    def own(self):
+        pass
+
+
+def free():
+    pass
+";
+        let module = module(source);
+        let class_of = |name: &str| {
+            module.enclosing_class(span_of(&module, name)).map(|c| c.qualname.as_str())
+        };
+        assert_eq!(class_of("Outer.Inner.method"), Some("Outer.Inner"), "the nearest class");
+        assert_eq!(class_of("Outer.own"), Some("Outer"));
+        assert_eq!(class_of("Outer.Inner"), Some("Outer"), "a nested class has one too");
+        assert_eq!(class_of("free"), None, "a function has none");
+        assert_eq!(class_of("Outer"), None, "a top-level class has none");
+    }
+
+    fn span_of<'a>(module: &'a Module, qualname: &str) -> &'a SymbolSpan {
+        module
+            .spans
+            .iter()
+            .find(|s| s.qualname == qualname)
+            .unwrap_or_else(|| panic!("`{qualname}` should be in the source"))
     }
 
     /// The span for `qualname`, which every fixture-rule test starts from.

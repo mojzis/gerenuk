@@ -182,6 +182,12 @@ When a test fails during implementation:
   dispatched at the top of `Cli::run`, needs no repository, no `tyf` and no
   `git`, and returns `0` or `2`, never `1`. Detection reads `./pyproject.toml`
   only and treats unreadable or malformed as "not configured".
+- **`hooks.rs` is a table and a predicate, no I/O, and the rule needs a
+  base.** `analyze` skips a method only when its class declares a base other
+  than `object` *and* the name is a known framework hook (ADR 0016). Dropping
+  either half turns every `run` and `filter` in a project into a silent skip.
+  New names go into `hooks::EXACT` under their framework's comment; a name
+  reached by a convention goes into `PREFIXES` or `SUFFIXES`.
 - **Do not trust `tyf`'s production/test split.** Its heuristic reads the whole
   absolute path, so a project under a `tests/` directory has every reference
   filed as a test. `analyze::split_refs` re-derives the buckets from paths

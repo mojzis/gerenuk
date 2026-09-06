@@ -220,6 +220,71 @@ fn a_closure_called_inside_its_enclosing_function_is_not_dead() {
         .stdout(contains("No findings."));
 }
 
+/// `logging.Filter.filter` is called by the logging module and by nothing in
+/// the project, so `tyf refs` answers with the definition alone. A method a
+/// framework calls on a subclass is skipped the way a registering decorator is.
+#[test]
+fn a_framework_hook_on_a_subclass_is_not_reported_dead() {
+    let tmp = TempDir::new().expect("temp dir");
+    std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"logs\"\n")
+        .expect("write pyproject");
+    std::fs::write(
+        tmp.path().join("logs.py"),
+        "import logging
+
+
+class Quiet(logging.Filter):
+    def filter(self, record):
+        return True
+
+    def helper(self):
+        return False
+",
+    )
+    .expect("write module");
+    let outline = r#"[
+      {"name": "Quiet", "kind": 5,
+       "range": {"start": {"line": 3, "character": 0}, "end": {"line": 8, "character": 20}},
+       "selectionRange": {"start": {"line": 3, "character": 6}, "end": {"line": 3, "character": 11}},
+       "children": [
+         {"name": "filter", "kind": 6,
+          "range": {"start": {"line": 4, "character": 4}, "end": {"line": 5, "character": 19}},
+          "selectionRange": {"start": {"line": 4, "character": 8}, "end": {"line": 4, "character": 14}},
+          "children": []},
+         {"name": "helper", "kind": 6,
+          "range": {"start": {"line": 7, "character": 4}, "end": {"line": 8, "character": 20}},
+          "selectionRange": {"start": {"line": 7, "character": 8}, "end": {"line": 7, "character": 14}},
+          "children": []}
+       ]}
+    ]"#;
+    // Both answer with the definition only, which is exactly what real `tyf`
+    // says about an override nothing in the workspace calls.
+    let refs = vec![
+        (
+            "logs.py:5:9",
+            r#"{"symbol": "logs.py:5:9", "reference_count": 1, "references": [
+                  {"file": "logs.py", "line": 5, "column": 9, "context": "Quiet.filter"}
+                ], "test_reference_count": 0, "test_references": []}"#,
+        ),
+        (
+            "logs.py:8:9",
+            r#"{"symbol": "logs.py:8:9", "reference_count": 1, "references": [
+                  {"file": "logs.py", "line": 8, "column": 9, "context": "Quiet.helper"}
+                ], "test_reference_count": 0, "test_references": []}"#,
+        ),
+    ];
+    let tyf = fake_tyf(&tmp, outline, &refs);
+
+    let assert = gerenuk(tmp.path(), &tyf).args(["audit", "logs.py"]).assert().code(1);
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+
+    assert!(!stdout.contains("Quiet.filter"), "the logging hook is alive, got:\n{stdout}");
+    assert!(
+        stdout.contains("Quiet.helper"),
+        "the plain method on the same class is not:\n{stdout}"
+    );
+}
+
 #[test]
 fn an_empty_file_is_audited_without_complaint() {
     let tmp = TempDir::new().expect("temp dir");

@@ -673,8 +673,9 @@ pub fn run_audit(runner: &Runner, root: &Path, files: &[PathBuf]) -> Result<Repo
             runner.list(file).with_context(|| format!("could not outline {}", file.display()))?;
         symbols_checked += outline_size(&outline);
 
-        // Parsed for decorators only. A file `tyf` outlined but we cannot parse
-        // is not fatal here: the audit simply loses the decorator rule for it.
+        // Parsed for decorators and class bases only. A file `tyf` outlined but
+        // we cannot parse is not fatal here: the audit simply loses those two
+        // rules for it.
         let parsed = std::fs::read_to_string(file)
             .ok()
             .and_then(|source| crate::pysource::parse(&source).ok());
@@ -690,10 +691,15 @@ pub fn run_audit(runner: &Runner, root: &Path, files: &[PathBuf]) -> Result<Repo
 
         let mut usages = Vec::new();
         for (target, refs) in targets.into_iter().zip(answers) {
-            let decorators = parsed
-                .as_ref()
-                .and_then(|module| module.symbol_at(target.line))
+            let span = parsed.as_ref().and_then(|module| module.symbol_at(target.line));
+            let decorators = span
                 .map(|span| span.decorator_names().map(ToString::to_string).collect())
+                .unwrap_or_default();
+            let bases = parsed
+                .as_ref()
+                .zip(span)
+                .and_then(|(module, span)| module.enclosing_class(span))
+                .map(|class| class.bases.clone())
                 .unwrap_or_default();
             usages.push(SymbolUsage {
                 name: target.name,
@@ -701,6 +707,7 @@ pub fn run_audit(runner: &Runner, root: &Path, files: &[PathBuf]) -> Result<Repo
                 line: target.line,
                 refs,
                 decorators,
+                bases,
             });
         }
 
