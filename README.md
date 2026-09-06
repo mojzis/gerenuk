@@ -46,7 +46,12 @@ gerenuk impacted-tests                 # and which tests that reaches
 gerenuk run -- -q                      # and run exactly those, under pytest
 gerenuk run --dry-run                  # the decision and the argv, no pytest
 gerenuk audit pkg/module.py            # separately: what nothing references
+gerenuk guide                          # agent-facing instructions for where you stand
 ```
+
+Not sure where to start? `uvx gerenuk guide` prints the setup instructions
+without installing anything; once a madoqua step names gerenuk, the same
+command prints how to read a report. Every page is under 60 lines.
 
 The three selection stages are one pipeline, and `run` computes the whole thing
 in-process — the first two are there to be read when a selection surprises you.

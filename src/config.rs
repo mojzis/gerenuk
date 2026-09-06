@@ -98,6 +98,101 @@ impl Config {
     }
 }
 
+/// The field names `Config` accepts, asked of the deserializer rather than
+/// written down twice. The guide tests check every key a page shows against
+/// this list, and every key in this list against the pages. Test-only: a
+/// shipped binary has no question to ask it.
+#[cfg(test)]
+pub(crate) mod keys {
+    use std::collections::BTreeSet;
+    use std::fmt;
+
+    use serde::de::{self, Deserializer, Visitor};
+    use serde::forward_to_deserialize_any;
+
+    use super::Config;
+
+    /// Carries the captured field list out through serde's error channel,
+    /// the only way out of a `Deserializer` that refuses to produce a value.
+    #[derive(Debug)]
+    struct Captured(Vec<&'static str>);
+
+    impl fmt::Display for Captured {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            write!(f, "captured fields: {:?}", self.0)
+        }
+    }
+
+    impl std::error::Error for Captured {}
+
+    impl de::Error for Captured {
+        fn custom<T: fmt::Display>(_msg: T) -> Self {
+            Self(Vec::new())
+        }
+    }
+
+    /// A `Deserializer` that answers "what fields does this struct have?" and
+    /// nothing else.
+    struct FieldCapture;
+
+    impl<'de> Deserializer<'de> for FieldCapture {
+        type Error = Captured;
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, Captured> {
+            Err(Captured(fields.to_vec()))
+        }
+
+        fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Captured> {
+            Err(Captured(Vec::new()))
+        }
+
+        forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string
+            bytes byte_buf option unit unit_struct newtype_struct seq tuple
+            tuple_struct map enum identifier ignored_any
+        }
+    }
+
+    /// Every key `[tool.gerenuk]` may set, in the kebab-case a file writes.
+    #[must_use]
+    pub fn accepted_keys() -> BTreeSet<&'static str> {
+        match <Config as serde::Deserialize>::deserialize(FieldCapture) {
+            Err(Captured(fields)) => fields.into_iter().collect(),
+            // Unreachable for a derived struct, which always reaches
+            // `deserialize_struct`. An empty set fails the test below loudly
+            // rather than letting the guide checks pass vacuously.
+            Ok(_) => BTreeSet::new(),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::accepted_keys;
+
+        #[test]
+        fn the_keys_are_the_kebab_case_field_names() {
+            let keys = accepted_keys();
+            for expected in [
+                "ignore-decorators",
+                "max-depth",
+                "max-symbols",
+                "budget-ms",
+                "pytest-command",
+                "fallback-command",
+            ] {
+                assert!(keys.contains(expected), "`{expected}` should be accepted: {keys:?}");
+            }
+            assert!(!keys.contains("max_depth"), "serde renames, so the snake form is not a key");
+            assert!(!keys.contains("timeout-s"), "an invented key must be absent");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use tempfile::TempDir;

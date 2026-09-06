@@ -21,6 +21,7 @@ use crate::config::Config;
 use crate::diff;
 use crate::fallback::{self, Fallback, Payload};
 use crate::git::{Base, Git};
+use crate::guide;
 use crate::impact::{self, Budgets, FsIndex, ImpactReport, TyfRefs};
 use crate::model::relative_display;
 use crate::pytest;
@@ -56,6 +57,10 @@ Getting started:
   4. `gerenuk run -- -x`          — run exactly those tests under pytest.
   5. `gerenuk run --dry-run`      — that decision and the exact argv, spawning nothing.
   6. `gerenuk audit pkg/*.py`     — separately: unreferenced and test-only symbols.
+
+`gerenuk guide` prints agent-facing instructions for where you are standing: \
+`setup` until a madoqua step names gerenuk in ./pyproject.toml, `triage` after; \
+`tune` is the reference and is only ever asked for by name.
 
 Exit codes:
 
@@ -203,6 +208,19 @@ pub enum Command {
 
     /// Check that `tyf` and the workspace resolve, without running an analysis.
     Doctor,
+
+    /// Print short instructions for using gerenuk here.
+    ///
+    /// With no topic, picks `setup` or `triage` by reading one file:
+    /// `./pyproject.toml`, looking for a `[tool.madoqua]` step that names
+    /// gerenuk. `tune` is a reference and is never auto-selected. Needs no
+    /// repository, no `tyf` and no `git`; exits `0`, or `2` if it could not
+    /// write its output.
+    Guide {
+        /// Which instructions to print. Omit to have gerenuk choose.
+        #[arg(value_enum)]
+        topic: Option<guide::Topic>,
+    },
 }
 
 /// Process exit code. `main` maps this to [`std::process::ExitCode`].
@@ -221,6 +239,14 @@ pub enum Outcome {
 impl Cli {
     /// Execute the parsed command, writing output to `out`.
     pub fn run(self, out: &mut impl Write) -> Result<Outcome> {
+        // `guide` is what an agent runs before anything is set up, so it
+        // goes first: before the workspace is looked for, let alone `tyf` or
+        // `git`. Nothing below this point may run for it.
+        if let Command::Guide { topic } = self.command {
+            write!(out, "{}", guide_output(topic))?;
+            return Ok(Outcome::Clean);
+        }
+
         let root = match self.workspace {
             Some(explicit) => explicit
                 .canonicalize()
@@ -264,6 +290,7 @@ impl Cli {
                 // produce one at all is a failure, and that arrives as an Err.
                 Ok(Outcome::Clean)
             }
+            Command::Guide { .. } => unreachable!("handled before the workspace is resolved"),
             Command::Run { base, impact, budgets, dry_run, fallback_command, pytest_args } => {
                 run_pytest(
                     out,
@@ -281,6 +308,21 @@ impl Cli {
             }
         }
     }
+}
+
+/// Resolve the guide topic and render it.
+///
+/// Detection reads the current directory only: the question `gerenuk guide`
+/// answers is "is gerenuk wired into the repository I am standing in", and the
+/// guide tells its reader to stand at the root. A current directory that
+/// cannot be read is "not configured": the point of `guide` is to print
+/// instructions, never to fail.
+fn guide_output(topic: Option<guide::Topic>) -> String {
+    if let Some(topic) = topic {
+        return guide::render(topic, guide::Selection::Explicit);
+    }
+    let source = std::env::current_dir().ok().and_then(|cwd| guide::detect(&cwd));
+    guide::render(guide::auto_topic(source), guide::Selection::Auto(source))
 }
 
 /// Diff the working tree against a base ref and map the result to symbols.
@@ -811,6 +853,81 @@ mod tests {
         ])
         .expect_err("the two flags contradict each other");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn guide_takes_an_optional_topic() {
+        let cli = Cli::try_parse_from(["gerenuk", "guide"]).expect("bare guide parses");
+        assert!(matches!(cli.command, Command::Guide { topic: None }), "no topic means detect");
+        let cli = Cli::try_parse_from(["gerenuk", "guide", "tune"]).expect("a topic parses");
+        assert!(matches!(cli.command, Command::Guide { topic: Some(guide::Topic::Tune) }));
+        assert!(Cli::try_parse_from(["gerenuk", "guide", "how"]).is_err(), "unknown topic");
+    }
+
+    /// Every gerenuk command a guide page shows must parse. A guide that
+    /// shows a command the CLI rejects is worse than no guide.
+    #[test]
+    fn every_command_in_the_guides_parses() {
+        let mut checked = 0_usize;
+        for topic in guide::Topic::all() {
+            for argv in guide::embedded_invocations(topic) {
+                checked += 1;
+                let parsed = Cli::command().try_get_matches_from(&argv);
+                assert!(
+                    parsed.is_ok(),
+                    "guide `{}` shows `{}`, which the CLI rejects: {}",
+                    topic.name(),
+                    argv.join(" "),
+                    parsed.err().map_or_else(String::new, |e| e.to_string()),
+                );
+            }
+        }
+        assert!(checked >= 8, "expected several commands across the guides, found {checked}");
+    }
+
+    /// Guard the guard: an invocation the CLI would reject must fail the
+    /// check above.
+    #[test]
+    fn an_unknown_flag_would_be_caught() {
+        assert!(
+            Cli::command().try_get_matches_from(["gerenuk", "doctor", "--not-a-flag"]).is_err(),
+            "the command check would pass anything if clap accepted unknown flags",
+        );
+    }
+
+    /// Every `--flag` a guide mentions on its own, outside a full command,
+    /// must exist on some subcommand or globally. `tune` is a table of them.
+    #[test]
+    fn every_flag_named_in_the_guides_exists() {
+        fn long_names(cmd: &clap::Command, into: &mut std::collections::BTreeSet<String>) {
+            for arg in cmd.get_arguments() {
+                if let Some(long) = arg.get_long() {
+                    into.insert(format!("--{long}"));
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                long_names(sub, into);
+            }
+        }
+        let mut known = std::collections::BTreeSet::new();
+        long_names(&Cli::command(), &mut known);
+        // Only the flag itself; `--max-depth <N>` names a value the reader fills in.
+        let mut checked = 0_usize;
+        for topic in guide::Topic::all() {
+            for span in guide::inline_code_spans(topic.text()) {
+                let Some(flag) = span.split_whitespace().next() else { continue };
+                if !flag.starts_with("--") || flag == "--" {
+                    continue;
+                }
+                checked += 1;
+                assert!(
+                    known.contains(flag),
+                    "guide `{}` names `{flag}`, which no gerenuk command accepts",
+                    topic.name(),
+                );
+            }
+        }
+        assert!(checked >= 6, "expected the guides to name several flags, found {checked}");
     }
 
     #[test]

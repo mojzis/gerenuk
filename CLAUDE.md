@@ -170,6 +170,18 @@ When a test fails during implementation:
   never orphaned. Renames are deliberately *not* paired — a moved module is a
   new module, so the old path's symbols are `deleted` and the new path's
   `added`.
+- **Guide prose lives in `docs/src/guide/`, never in `guide.rs`.** The CLI
+  `include_str!`s the same bytes the site publishes; a second copy is a copy
+  that drifts. The tests are the contract: every gerenuk command a guide shows
+  is fed through the real `clap::Command`, every `--flag` it names exists,
+  every `[tool.gerenuk]` key it shows is one serde accepts (`config::keys`)
+  and every accepted key is named, the triage ladder names every
+  `Reason::label`, each page is capped at 60 lines and ends with exactly one
+  `next: run` line. Cut a guide rather than raise the cap (ADR 0015).
+- **`guide` runs before the workspace is resolved and reads one file.** It is
+  dispatched at the top of `Cli::run`, needs no repository, no `tyf` and no
+  `git`, and returns `0` or `2`, never `1`. Detection reads `./pyproject.toml`
+  only and treats unreadable or malformed as "not configured".
 - **Do not trust `tyf`'s production/test split.** Its heuristic reads the whole
   absolute path, so a project under a `tests/` directory has every reference
   filed as a test. `analyze::split_refs` re-derives the buckets from paths

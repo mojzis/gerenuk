@@ -17,7 +17,71 @@ fn help_lists_the_available_commands() {
         .assert()
         .success()
         .stdout(contains("audit"))
-        .stdout(contains("doctor"));
+        .stdout(contains("doctor"))
+        .stdout(contains("guide"));
+}
+
+/// `guide` is what an agent runs before anything is installed: no `tyf` on
+/// PATH, no git repository, no pyproject. It must still print.
+#[test]
+fn guide_prints_setup_with_nothing_installed_and_no_repository() {
+    let tmp = TempDir::new().expect("temp dir");
+    let output = common::gerenuk_no_tyf(tmp.path()).arg("guide").output().expect("runs");
+    assert_eq!(output.status.code(), Some(0), "an inventory never fails");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.starts_with("# gerenuk guide: not configured here -> setup\n\n# Setup gerenuk"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("uv add --dev gerenuk"), "setup says how to install");
+    assert!(output.stderr.is_empty(), "the guide is output, not logging");
+}
+
+#[test]
+fn guide_picks_triage_once_a_madoqua_step_names_gerenuk() {
+    let tmp = TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        "[tool.madoqua]\nextend_check = [{ name = \"gerenuk\", cmd = \"gerenuk run -- -q\", pass_files = false }]\n",
+    )
+    .expect("write pyproject");
+    common::gerenuk_no_tyf(tmp.path())
+        .arg("guide")
+        .assert()
+        .success()
+        .stdout(contains("# gerenuk guide: configured via pyproject.toml [tool.madoqua] -> triage"))
+        .stdout(contains("`run_all` ladder"));
+}
+
+#[test]
+fn guide_prints_the_named_topic_whatever_the_directory_holds() {
+    let tmp = TempDir::new().expect("temp dir");
+    std::fs::write(
+        tmp.path().join("pyproject.toml"),
+        "[tool.madoqua]\ncheck = [\"gerenuk run\"]\n",
+    )
+    .expect("write pyproject");
+    common::gerenuk_no_tyf(tmp.path())
+        .args(["guide", "setup"])
+        .assert()
+        .success()
+        .stdout(contains("# gerenuk guide: setup\n"));
+    common::gerenuk_no_tyf(tmp.path())
+        .args(["guide", "tune"])
+        .assert()
+        .success()
+        .stdout(contains("# gerenuk guide: tune\n"))
+        .stdout(contains("GERENUK_TYF"));
+}
+
+#[test]
+fn an_unknown_guide_topic_is_a_usage_error() {
+    let tmp = TempDir::new().expect("temp dir");
+    common::gerenuk_no_tyf(tmp.path())
+        .args(["guide", "how"])
+        .assert()
+        .code(2)
+        .stderr(contains("invalid value"));
 }
 
 #[test]
