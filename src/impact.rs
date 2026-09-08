@@ -17,10 +17,11 @@ use serde::{Deserialize, Serialize};
 use crate::changed::ChangedSymbols;
 use crate::closure::{
     classify_in, indexed, seeds_from, walk, IgnoredSymbol, ImpactedTest, Index, IndexedSymbol,
-    Limits, Reason, RefAnswer, RefSite, Refs, Site, Stats, SymbolQuery, Verdict, DEFAULT_BUDGET_MS,
-    DEFAULT_MAX_DEPTH, DEFAULT_MAX_SYMBOLS,
+    Limits, Reason, RefAnswer, RefSite, Refs, Site, Stats, SymbolQuery, TestKind, Verdict,
+    DEFAULT_BUDGET_MS, DEFAULT_MAX_DEPTH, DEFAULT_MAX_SYMBOLS,
 };
 use crate::config::Config;
+use crate::fixtures::is_conftest;
 use crate::modpath::module_path;
 use crate::pysource::{self, imports_module, word_lines};
 use crate::report::{list_section, Format};
@@ -71,6 +72,27 @@ pub(crate) fn resolve_limits(flags: Budgets, config: &Config, started: Instant) 
         max_symbols: flags.max_symbols.or(config.max_symbols).unwrap_or(DEFAULT_MAX_SYMBOLS),
         deadline: (budget_ms > 0).then(|| started + Duration::from_millis(budget_ms)),
     }
+}
+
+/// What a selection costs before pytest starts, in milliseconds.
+///
+/// The `tyf` round-trips of a typical walk, measured across a rollout at three
+/// to eight calls and 1.5–2 s warm. A suite declared faster than this is
+/// cheaper to run whole.
+pub const SELECTION_COST_MS: u64 = 2000;
+
+/// The short-circuit `run` applies once the diff is known: a suite the
+/// repository declares faster than [`SELECTION_COST_MS`] is not worth walking.
+///
+/// Only when there is a walk to skip. A diff that changed test files alone
+/// seeds nothing, and the empty walk costs no `tyf` — it answers `selected`
+/// with the changed files, or `nothing`, and both beat the full suite.
+#[must_use]
+pub(crate) fn fast_suite(config: &Config, changed: &ChangedSymbols) -> Option<Reason> {
+    let declared = config.suite_ms?;
+    let needs_walk =
+        !changed.changed_symbols.is_empty() || !changed.module_level_changes.is_empty();
+    (needs_walk && declared <= SELECTION_COST_MS).then_some(Reason::FastSuite)
 }
 
 /// The verdict that can be reached without asking `tyf` anything.
@@ -187,32 +209,75 @@ impl ImpactReport {
     }
 
     /// Each impacted test, with the chain that reached it underneath.
+    ///
+    /// A fixture or a `conftest.py` the walk reached is listed apart from the
+    /// tests: neither is one, and what each stands for — the fixture's
+    /// consumers, every test file in the conftest's subtree — is phase 3's to
+    /// expand. Counting them among the tests would inflate the number and
+    /// read oddly next to node ids.
     fn write_tests(&self, out: &mut String) {
         use std::fmt::Write as _;
+
+        let mut tests = Vec::new();
+        let mut fixtures = Vec::new();
+        let mut conftests = Vec::new();
+        for test in &self.impacted_tests {
+            if test.kind == TestKind::Fixture {
+                fixtures.push(test);
+            } else if test.symbol.is_none() && is_conftest(Path::new(&test.file)) {
+                conftests.push(test);
+            } else {
+                tests.push(test);
+            }
+        }
 
         if self.impacted_tests.is_empty() {
             let _ = writeln!(out, "\nNo impacted tests.");
             return;
         }
 
-        let _ = writeln!(out, "\nimpacted tests ({})", self.impacted_tests.len());
-        for test in &self.impacted_tests {
-            match &test.symbol {
-                Some(symbol) => {
-                    let name = symbol.rsplit(':').next().unwrap_or(symbol);
-                    let _ = writeln!(out, "  {}::{name}", test.file);
+        if !tests.is_empty() {
+            let _ = writeln!(out, "\nimpacted tests ({})", tests.len());
+            for test in tests {
+                match &test.symbol {
+                    Some(symbol) => {
+                        let name = symbol.rsplit(':').next().unwrap_or(symbol);
+                        let _ = writeln!(out, "  {}::{name}", test.file);
+                    }
+                    None => {
+                        let _ = writeln!(out, "  {}  (whole file)", test.file);
+                    }
                 }
-                None => {
-                    let _ = writeln!(out, "  {}  (whole file)", test.file);
-                }
+                write_chain(out, test);
             }
-            // The chain the JSON splits across `via` and `origin`, joined back
-            // up for reading: nearest the test first.
-            let chain: Vec<&str> =
-                test.via.iter().map(String::as_str).chain([test.origin.as_str()]).collect();
-            let _ = writeln!(out, "    ← {}", chain.join(" ← "));
+        }
+
+        if !fixtures.is_empty() {
+            let _ = writeln!(out, "\nimpacted fixtures ({})", fixtures.len());
+            for fixture in fixtures {
+                let symbol = fixture.symbol.as_deref().unwrap_or(&fixture.file);
+                let _ = writeln!(out, "  {symbol}  (the tests that consume it)");
+                write_chain(out, fixture);
+            }
+        }
+
+        if !conftests.is_empty() {
+            let _ = writeln!(out, "\nimpacted conftests ({})", conftests.len());
+            for conftest in conftests {
+                let _ = writeln!(out, "  {}  (every test file in its subtree)", conftest.file);
+                write_chain(out, conftest);
+            }
         }
     }
+}
+
+/// The chain the JSON splits across `via` and `origin`, joined back up for
+/// reading: nearest the test first.
+fn write_chain(out: &mut String, test: &ImpactedTest) {
+    use std::fmt::Write as _;
+    let chain: Vec<&str> =
+        test.via.iter().map(String::as_str).chain([test.origin.as_str()]).collect();
+    let _ = writeln!(out, "    ← {}", chain.join(" ← "));
 }
 
 /// [`Refs`] over the `tyf` binary: one `tyf refs` call per BFS frontier.
@@ -404,6 +469,12 @@ impl Index for FsIndex<'_> {
         }
         Ok(importers)
     }
+
+    fn binding(&self, file: &Path, name: &str) -> Result<Option<(u32, u32)>> {
+        let Some(cached) = self.load(file)? else { return Ok(None) };
+        let Some(module) = cached.module() else { return Ok(None) };
+        Ok(module.binding(name).map(|binding| (binding.line, binding.column)))
+    }
 }
 
 /// The same cache, read the way [`crate::select`] needs it: whole modules
@@ -528,6 +599,7 @@ mod tests {
             symbol: Some("tests.test_enrich:test_run".to_string()),
             via: vec!["mypkg.api:endpoint".to_string()],
             origin: "mypkg.enrich:Enricher.run".to_string(),
+            kind: TestKind::Test,
         }]);
 
         let text = report.render(Format::Human).expect("human rendering cannot fail");
@@ -549,11 +621,122 @@ mod tests {
             symbol: None,
             via: vec![],
             origin: "mypkg.settings".to_string(),
+            kind: TestKind::Test,
         }]);
         let text = report.render(Format::Human).expect("human rendering cannot fail");
         assert!(
             text.contains("tests/test_settings.py  (whole file)"),
             "a null symbol must not render as an empty node id, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_conftest_the_walk_reached_is_listed_apart_from_the_tests() {
+        let report = report_with(vec![
+            ImpactedTest {
+                file: "backoffice/tests/conftest.py".to_string(),
+                symbol: None,
+                via: vec!["backoffice.api.main".to_string()],
+                origin: "backoffice.sql:validate".to_string(),
+                kind: TestKind::Test,
+            },
+            ImpactedTest {
+                file: "backoffice/tests/test_sql.py".to_string(),
+                symbol: Some("backoffice.tests.test_sql:test_strip".to_string()),
+                via: vec![],
+                origin: "backoffice.sql:validate".to_string(),
+                kind: TestKind::Test,
+            },
+        ]);
+
+        let text = report.render(Format::Human).expect("human rendering cannot fail");
+        assert!(text.contains("impacted tests (1)"), "the conftest is not a test, got:\n{text}");
+        assert!(
+            text.contains(
+                "impacted conftests (1)\n  backoffice/tests/conftest.py  (every test file in its subtree)\n    ← backoffice.api.main ← backoffice.sql:validate"
+            ),
+            "it says what selecting it means, with its chain, got:\n{text}"
+        );
+        assert!(!text.contains("conftest.py  (whole file)"), "got:\n{text}");
+    }
+
+    #[test]
+    fn a_fixture_the_walk_reached_is_listed_apart_from_the_tests() {
+        let report = report_with(vec![
+            ImpactedTest {
+                file: "tests/test_mcp.py".to_string(),
+                symbol: Some("tests.test_mcp:TestQueryLogging.logged_run_sql".to_string()),
+                via: vec!["mcp.tools:make_tools".to_string()],
+                origin: "sql:validate".to_string(),
+                kind: TestKind::Fixture,
+            },
+            ImpactedTest {
+                file: "tests/test_mcp.py".to_string(),
+                symbol: Some("tests.test_mcp:TestValidate.test_empty".to_string()),
+                via: vec![],
+                origin: "sql:validate".to_string(),
+                kind: TestKind::Test,
+            },
+        ]);
+
+        let text = report.render(Format::Human).expect("human rendering cannot fail");
+        assert!(text.contains("impacted tests (1)"), "the fixture is not a test, got:\n{text}");
+        assert!(
+            text.contains(
+                "impacted fixtures (1)\n  tests.test_mcp:TestQueryLogging.logged_run_sql  (the tests that consume it)\n    ← mcp.tools:make_tools ← sql:validate"
+            ),
+            "listed as the symbol id `tyf refs` and `run` both use, got:\n{text}"
+        );
+        assert!(!text.contains("::logged_run_sql"), "never node-id shaped, got:\n{text}");
+    }
+
+    #[test]
+    fn a_conftest_alone_is_still_not_no_impacted_tests() {
+        let report = report_with(vec![ImpactedTest {
+            file: "tests/conftest.py".to_string(),
+            symbol: None,
+            via: vec![],
+            origin: "mypkg.settings".to_string(),
+            kind: TestKind::Test,
+        }]);
+        let text = report.render(Format::Human).expect("human rendering cannot fail");
+        assert!(!text.contains("No impacted tests."), "got:\n{text}");
+        assert!(text.contains("impacted conftests (1)"), "got:\n{text}");
+        assert!(
+            !text.contains("impacted tests ("),
+            "an empty section is not printed, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn a_fast_suite_short_circuits_only_a_diff_that_needs_a_walk() {
+        use crate::changed::{Change, SymbolChange};
+
+        let mut config = Config::default();
+        assert_eq!(fast_suite(&config, &changed()), None, "unset: never");
+
+        config.suite_ms = Some(SELECTION_COST_MS + 1);
+        let mut report = changed();
+        report.changed_symbols.push(SymbolChange {
+            symbol: "mypkg.core:target".to_string(),
+            file: "src/mypkg/core.py".to_string(),
+            line: 4,
+            column: 5,
+            kind: crate::pysource::Kind::Function,
+            change: Change::Modified,
+            ignored_by: None,
+        });
+        assert_eq!(fast_suite(&config, &report), None, "slower than a selection: walk");
+
+        config.suite_ms = Some(SELECTION_COST_MS);
+        assert_eq!(fast_suite(&config, &report), Some(Reason::FastSuite), "at the cost: skip");
+
+        let mut tests_only = changed();
+        tests_only.test_files_changed.push("tests/test_core.py".to_string());
+        assert_eq!(
+            fast_suite(&config, &tests_only),
+            None,
+            "nothing to walk: the changed tests select themselves for free"
         );
     }
 
@@ -579,6 +762,7 @@ mod tests {
             symbol: None,
             via: vec![],
             origin: "mypkg.a".to_string(),
+            kind: TestKind::Test,
         }]);
         let text = report.render(Format::Json).expect("JSON rendering cannot fail");
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
@@ -705,6 +889,22 @@ def read():
             "src-layout resolves through the __init__ chain"
         );
         assert!(index.is_test(Path::new("tests/test_a.py")), "and the test heuristic is shared");
+    }
+
+    #[test]
+    fn the_index_finds_module_scope_bindings() {
+        let (tmp, files) = tree(&[("src/pkg/cli.py", "import typer\n\napp = typer.Typer()\n")]);
+        let index = FsIndex::new(tmp.path(), &files);
+
+        assert_eq!(
+            index.binding(Path::new("src/pkg/cli.py"), "app").expect("readable"),
+            Some((3, 1))
+        );
+        assert_eq!(index.binding(Path::new("src/pkg/cli.py"), "router").expect("readable"), None);
+        assert_eq!(
+            index.binding(Path::new("src/pkg/missing.py"), "app").expect("a missing file is None"),
+            None
+        );
     }
 
     #[test]

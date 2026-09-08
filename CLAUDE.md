@@ -125,6 +125,24 @@ When a test fails during implementation:
 - **`closure.rs` reaches the world only through `Refs` and `Index`.** New inputs
   go behind one of those traits, not into `walk` directly, or the unit tests
   stop being able to run without `tyf`. `impact.rs` is glue and holds no rules.
+- **A helper in a test file is a step; what pytest reaches by name is an
+  answer.** `closure::is_test_helper` decides: `test*`/`Test*`, a
+  `@pytest.fixture` and every name in `hooks` are recorded and never expanded;
+  anything else is expanded, and recorded only if the expansion finds nothing
+  (ADR 0017). Dropping the dead-end record turns a `getattr`-dispatched helper
+  into a silent miss. `ImpactedTest.kind` says `fixture` or `test`, and the
+  human report lists fixtures and conftests apart from the tests.
+- **A registrar is queried at its binding before it is scanned by name.**
+  `chase_registrar` asks `Index::binding` for where the decorated symbol's
+  module binds `app`, queries `Refs` there, and falls back to `word_hits` only
+  when there is no binding or the answer is empty (ADR 0018). Trusting an
+  empty answer would turn a `ty` resolution failure into `decorator_dispatch`;
+  skipping the query would bring back the cross-module `app` collision.
+- **`suite-ms` is `run`'s gate and never `impacted-tests`'s.** `impact::fast_suite`
+  runs after `upfront_reason` and before `Runner::discover`, only for
+  `Economics::Honour`, and only when the diff seeds a walk (ADR 0019). A test
+  in `tests/run.rs` runs it with an empty `PATH`; one in
+  `tests/impacted_tests.rs` pins that the inventory ignores the key.
 - **`impacted-tests` never fails a run it could answer.** Anything that goes
   wrong past the first gate — `tyf` missing, `tyf` garbling its output, an
   unreadable file — degrades to `verdict: run_all` and exit `0`. The one

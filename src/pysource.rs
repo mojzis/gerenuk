@@ -171,6 +171,9 @@ pub struct Module {
     pub imports: Vec<(u32, u32)>,
     /// Every `… import X as Y` binding in the file.
     pub aliases: Vec<ImportAlias>,
+    /// Every name bound at module scope by an assignment or an import, in
+    /// source order.
+    pub bindings: Vec<Binding>,
     /// The source did not parse cleanly. Callers treat the whole file as
     /// module-level rather than trusting a partial tree.
     pub has_error: bool,
@@ -193,7 +196,33 @@ pub struct ImportAlias {
     pub column: u32,
 }
 
+/// One name bound at module scope: `app = typer.Typer()`, `import typer`,
+/// `from .app import app`.
+///
+/// This is what a decorator's registrar resolves to. `@app.command` names
+/// `app`, and the position of the binding is what a reference query can be
+/// asked about — a real edge where a word scan would match every `app` in the
+/// repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Binding {
+    /// The local name.
+    pub name: String,
+    /// Line of the name, 1-based.
+    pub line: u32,
+    /// 1-based column of the name, as `tyf refs file:line:col` wants.
+    pub column: u32,
+}
+
 impl Module {
+    /// Where `name` is first bound at module scope, if it is.
+    ///
+    /// First rather than last: a name rebound later in the file is rare, and
+    /// the first binding is the one the definitions between them see.
+    #[must_use]
+    pub fn binding(&self, name: &str) -> Option<&Binding> {
+        self.bindings.iter().find(|binding| binding.name == name)
+    }
+
     /// The alias `name` was bound to on `line`, when that import renames it.
     ///
     /// `None` for a plain `from x import name`: there the callers spell the
@@ -257,7 +286,10 @@ pub fn parse(source: &str) -> Result<Module> {
     let mut aliases = Vec::new();
     collect_aliases(root, source.as_bytes(), &mut aliases);
 
-    Ok(Module { spans, imports, aliases, has_error: root.has_error() })
+    let mut bindings = Vec::new();
+    collect_bindings(root, source.as_bytes(), &mut bindings);
+
+    Ok(Module { spans, imports, aliases, bindings, has_error: root.has_error() })
 }
 
 /// Line ranges of every import statement in the tree, at any nesting depth.
@@ -306,6 +338,77 @@ fn collect_aliases(node: Node, src: &[u8], out: &mut Vec<ImportAlias>) {
             collect_aliases(child, src, out);
         }
     }
+}
+
+/// Every name an assignment or an import binds at module scope.
+///
+/// Descends into `if`/`try`/`with` blocks, which are still module scope, and
+/// never into a function or class body, whose bindings are somebody else's.
+/// Only plain identifier targets count: `a, b = …` and `obj.attr = …` bind
+/// nothing a decorator would name.
+fn collect_bindings(node: Node, src: &[u8], out: &mut Vec<Binding>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "function_definition" | "class_definition" | "decorated_definition" => {}
+            "expression_statement" => {
+                let mut inner = child.walk();
+                for expr in child.named_children(&mut inner) {
+                    if expr.kind() != "assignment" {
+                        continue;
+                    }
+                    let Some(left) = expr.child_by_field_name("left") else { continue };
+                    if left.kind() == "identifier" {
+                        push_binding(left, src, out);
+                    }
+                }
+            }
+            "import_statement" => {
+                let mut inner = child.walk();
+                for name in child.named_children(&mut inner) {
+                    match name.kind() {
+                        // `import a.b` binds `a`.
+                        "dotted_name" => {
+                            if let Some(first) = name.named_child(0) {
+                                push_binding(first, src, out);
+                            }
+                        }
+                        "aliased_import" => {
+                            if let Some(alias) = name.child_by_field_name("alias") {
+                                push_binding(alias, src, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "import_from_statement" => {
+                let mut inner = child.walk();
+                // The first named child is the module; the rest are the names.
+                for name in child.named_children(&mut inner).skip(1) {
+                    match name.kind() {
+                        "dotted_name" => push_binding(name, src, out),
+                        "aliased_import" => {
+                            if let Some(alias) = name.child_by_field_name("alias") {
+                                push_binding(alias, src, out);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => collect_bindings(child, src, out),
+        }
+    }
+}
+
+fn push_binding(node: Node, src: &[u8], out: &mut Vec<Binding>) {
+    let Ok(name) = node.utf8_text(src) else { return };
+    out.push(Binding {
+        name: name.to_string(),
+        line: one_based(node.start_position().row),
+        column: one_based(node.start_position().column),
+    });
 }
 
 /// Walk `node`'s children, emitting definitions and recursing everywhere except
@@ -639,6 +742,68 @@ class Enricher:
 async def fetch():
     return None
 ";
+
+    const BOUND: &str = "\
+import typer
+import os.path
+import json as j
+from fastapi import FastAPI, APIRouter as R
+from .routes import router
+
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
+
+app = typer.Typer()
+counter: int = 0
+a, b = 1, 2
+obj.attr = 3
+
+
+def make():
+    local = 1
+    return local
+
+
+class Holder:
+    inner = 2
+";
+
+    fn binding_at(name: &str) -> Option<(u32, u32)> {
+        module(BOUND).binding(name).map(|b| (b.line, b.column))
+    }
+
+    #[test]
+    fn an_assignment_binds_its_target_at_the_target() {
+        assert_eq!(binding_at("app"), Some((12, 1)), "`app = typer.Typer()`");
+        assert_eq!(binding_at("counter"), Some((13, 1)), "an annotated assignment counts too");
+    }
+
+    #[test]
+    fn imports_bind_the_local_name() {
+        assert_eq!(binding_at("typer"), Some((1, 8)));
+        assert_eq!(binding_at("os"), Some((2, 8)), "`import os.path` binds `os`");
+        assert_eq!(binding_at("j"), Some((3, 16)), "`import json as j` binds `j`");
+        assert_eq!(binding_at("json"), None, "and not `json`");
+        assert_eq!(binding_at("FastAPI"), Some((4, 21)));
+        assert_eq!(binding_at("R"), Some((4, 43)), "`APIRouter as R` binds `R`");
+        assert_eq!(binding_at("APIRouter"), None);
+        assert_eq!(binding_at("router"), Some((5, 21)), "a relative import is an import");
+    }
+
+    #[test]
+    fn a_try_block_is_still_module_scope() {
+        assert_eq!(binding_at("tomllib"), Some((8, 12)), "the first binding wins");
+    }
+
+    #[test]
+    fn destructuring_attributes_and_nested_scopes_bind_nothing() {
+        assert_eq!(binding_at("a"), None, "`a, b = …` is not a name a decorator uses");
+        assert_eq!(binding_at("obj"), None, "`obj.attr = …` binds an attribute");
+        assert_eq!(binding_at("local"), None, "a function body is not module scope");
+        assert_eq!(binding_at("inner"), None, "nor is a class body");
+    }
 
     #[test]
     fn a_body_line_maps_to_its_function() {

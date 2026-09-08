@@ -21,6 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::changed::{Change, ChangedSymbols};
 use crate::config::Config;
+use crate::fixtures::is_fixture_decorator;
+use crate::hooks::is_framework_hook;
 use crate::modpath::{split_symbol_id, symbol_id};
 
 /// BFS levels walked before the search gives up.
@@ -255,6 +257,25 @@ pub trait Index {
     fn word_hits(&self, name: &str) -> Result<Vec<(PathBuf, u32)>>;
     /// Test files whose text imports `module`.
     fn test_importers(&self, module: &str) -> Result<Vec<PathBuf>>;
+    /// Where `name` is bound at module scope in `file` — by an assignment or
+    /// an import — as a `(line, column)` position a reference query accepts.
+    fn binding(&self, file: &Path, name: &str) -> Result<Option<(u32, u32)>>;
+}
+
+/// A definition in a test file that is a step towards the tests rather than
+/// one of them: pytest neither collects it, injects it, nor calls it by name.
+///
+/// `TestQueryLogging.logged_run_sql` is the shape — a helper the tests around
+/// it call, which `tyf` resolves like any other call. Everything pytest
+/// reaches by name stays an answer: `test_*` and `Test*` (collected),
+/// `@pytest.fixture` (injected), `setup_method` and the rest of the hook table
+/// (called by the framework).
+#[must_use]
+pub(crate) fn is_test_helper(found: &IndexedSymbol) -> bool {
+    let last = found.qualname.rsplit('.').next().unwrap_or(&found.qualname);
+    !last.starts_with("Test")
+        && !is_framework_hook(last)
+        && !found.decorators.iter().any(|decorator| is_fixture_decorator(decorator))
 }
 
 /// What stops a walk short of a complete answer.
@@ -281,11 +302,14 @@ pub enum Reason {
     /// be resolved, so the tests that reach it through the framework cannot be
     /// seen. Selecting nothing here would be a silent miss, so we run all.
     DecoratorDispatch,
+    /// The repository declared a full suite (`suite-ms`) faster than a
+    /// selection costs, so `run` skipped the walk. Only `run` emits this.
+    FastSuite,
 }
 
 impl Reason {
     /// Every variant, for the tests that have to cover each one.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::NonPythonChanges,
         Self::ParseErrors,
         Self::TyfUnavailable,
@@ -295,6 +319,7 @@ impl Reason {
         Self::MaxSymbols,
         Self::Budget,
         Self::DecoratorDispatch,
+        Self::FastSuite,
     ];
 
     /// The stable `snake_case` name — the same string the JSON carries.
@@ -315,6 +340,7 @@ impl Reason {
             Self::MaxSymbols => "max_symbols",
             Self::Budget => "budget",
             Self::DecoratorDispatch => "decorator_dispatch",
+            Self::FastSuite => "fast_suite",
         }
     }
 
@@ -332,6 +358,7 @@ impl Reason {
             Self::DecoratorDispatch => {
                 "a changed symbol is dispatched by an unresolvable decorator"
             }
+            Self::FastSuite => "the full suite is faster than a selection",
         }
     }
 }
@@ -346,8 +373,26 @@ pub enum Verdict {
     RunAll,
 }
 
+/// What an [`ImpactedTest`] entry with a symbol stands for.
+///
+/// Both are answers the walk stops at; they differ in what phase 3 does with
+/// them. A test becomes its own node id. A fixture is injected by name and
+/// never collected, so `run` expands it to the tests that consume it — and
+/// the human report lists it apart, since it is not a test and counting it as
+/// one misstates the answer.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestKind {
+    /// A definition pytest reaches by name: a test, or a hook such as
+    /// `setup_method`. Also the whole-file case, where `symbol` is `null`.
+    #[default]
+    Test,
+    /// A `@pytest.fixture` definition.
+    Fixture,
+}
+
 /// One test the change can reach.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImpactedTest {
     /// Repository-relative path of the test file.
@@ -360,6 +405,10 @@ pub struct ImpactedTest {
     pub via: Vec<String>,
     /// The changed symbol this test was reached from.
     pub origin: String,
+    /// What the symbol is. Defaults to `test` so a report saved before the
+    /// field existed still replays.
+    #[serde(default)]
+    pub kind: TestKind,
 }
 
 /// A symbol the walk refused to expand because of `ignore-decorators`.
@@ -502,6 +551,7 @@ pub fn walk(
         tyf_calls: 0,
         max_depth_reached: 0,
         unresolved_dispatch: false,
+        registrars: BTreeMap::new(),
     }
     .run(seeds)
 }
@@ -563,6 +613,9 @@ struct Walk<'a, R, I> {
     /// Set when a dead-ended symbol is decorated by something whose registrar
     /// could not be resolved. The selection is then known to be incomplete.
     unresolved_dispatch: bool,
+    /// Registrar sites already resolved, by `(file, name)`: every command on
+    /// one `app` dead-ends on the same registrar, and one query answers all.
+    registrars: BTreeMap<(PathBuf, String), Vec<RefSite>>,
 }
 
 impl<R: Refs, I: Index> Walk<'_, R, I> {
@@ -689,10 +742,10 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
             };
             let before = self.progress(&next);
             self.absorb(query, Some(&query.declaration()), &answer.sites, &mut next)?;
-            // Only a dead end is worth a registrar scan: a symbol with real
+            // Only a dead end is worth a second look: a symbol with real
             // callers is already on a path to its tests.
             if self.progress(&next) == before {
-                self.chase_registrar(query, &mut next)?;
+                self.dead_end(query, &mut next)?;
             }
         }
         next.sort_by(|a, b| a.id.cmp(&b.id));
@@ -707,19 +760,42 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
         (self.impacted.len(), next.len())
     }
 
+    /// A symbol whose references led nowhere new.
+    ///
+    /// A test-file helper that dead-ends is recorded as the answer it would
+    /// have been before it was made a step: nothing visible calls it, and
+    /// "nothing" is exactly the case where a by-name route (`getattr`, a hook
+    /// the table does not know) would otherwise become a silent miss. The
+    /// selection degrades to the helper's class or file, as it always did.
+    fn dead_end(&mut self, query: &SymbolQuery, next: &mut Vec<SymbolQuery>) -> Result<(), Stop> {
+        if self.index.is_test(&query.file) {
+            let from = self
+                .visited
+                .get(&query.id)
+                .and_then(|visit| visit.predecessor.clone())
+                .unwrap_or_else(|| query.id.clone());
+            self.record(&query.file, Some(query.id.clone()), TestKind::Test, &from);
+        }
+        self.chase_registrar(query, next)
+    }
+
     /// Follow a decorated dead end out through the object it is registered on.
     ///
     /// `@app.command()` on `show` means the CLI runner calls `show`, but the
     /// only *reference* to `show` is its own definition, so the walk stops with
     /// an empty answer it presents as `selected`. The registrar (`app`) is an
-    /// ordinary name that the tests do mention, so its occurrences are absorbed
+    /// ordinary name that the tests do mention, so its references are absorbed
     /// as if they were references to the decorated symbol — which, through the
     /// framework, is what they are.
     ///
-    /// Word-boundary matching, like the deleted-symbol path: no type checker
-    /// can resolve this edge, and over-selection is the safe direction. When no
-    /// registrar can be resolved, the miss is recorded so the verdict degrades
-    /// to `run_all` instead of quietly claiming nothing is impacted.
+    /// The registrar is a binding in the decorated symbol's own module, and a
+    /// reference query at that binding is a real edge: the `app` the tests
+    /// drive, not every `app` in the repository. Only when the name is not
+    /// bound there — or `ty` cannot resolve it — does the walk fall back to the
+    /// word-boundary scan the deleted-symbol path uses, where over-selection is
+    /// the safe direction. When no registrar can be resolved either way, the
+    /// miss is recorded so the verdict degrades to `run_all` instead of quietly
+    /// claiming nothing is impacted.
     fn chase_registrar(
         &mut self,
         query: &SymbolQuery,
@@ -746,15 +822,9 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
             let Some(registrar) = registrar_of(decorator) else { continue };
             candidates.push(decorator.as_str());
 
-            let hits = self
-                .index
-                .word_hits(registrar)
-                .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
-            if hits.len() > REGISTRAR_SITE_CAP {
-                continue;
-            }
+            let sites = self.registrar_sites(query, registrar)?;
 
-            // Every `@app.command` line mentions `app`, so a scan is never
+            // Every `@app.command` line mentions `app`, so the sites are never
             // empty and "non-empty" cannot mean resolved. What counts is a
             // mention that is *not* one of the definitions this registrar
             // registers: `app.add_typer(journal_app)`, a module-level
@@ -762,12 +832,12 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
             // that wires or exercises the registry, and the route to its
             // tests. A registrar mentioned nowhere but its own decorator lines
             // has no visible driver, and guessing is what this exists to stop.
-            for (file, line) in &hits {
-                let site = self
+            for site in &sites {
+                let class = self
                     .index
-                    .classify(file, *line)
+                    .classify(&site.file, site.line)
                     .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
-                let is_own_registration = matches!(&site, Site::Symbol(symbol)
+                let is_own_registration = matches!(&class, Site::Symbol(symbol)
                     if symbol.decorators.iter().any(|d| registrar_of(d) == Some(registrar)));
                 if !is_own_registration {
                     resolved = true;
@@ -775,8 +845,6 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
                 }
             }
 
-            let sites: Vec<RefSite> =
-                hits.into_iter().map(|(file, line)| RefSite { file, line }).collect();
             self.absorb(query, None, &sites, next)?;
         }
 
@@ -792,6 +860,80 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
             self.unresolved_dispatch = true;
         }
         Ok(())
+    }
+
+    /// Where `registrar` is used, as seen from the decorated symbol's file.
+    ///
+    /// Memoised per `(file, name)`: every command registered on one `app`
+    /// dead-ends on the same registrar, and one answer serves them all.
+    fn registrar_sites(
+        &mut self,
+        query: &SymbolQuery,
+        registrar: &str,
+    ) -> Result<Vec<RefSite>, Stop> {
+        let key = (query.file.clone(), registrar.to_string());
+        if let Some(sites) = self.registrars.get(&key) {
+            return Ok(sites.clone());
+        }
+        let sites = self.resolve_registrar(query, registrar)?;
+        self.registrars.insert(key, sites.clone());
+        Ok(sites)
+    }
+
+    /// The registrar's references by position when it is bound in the file,
+    /// the word scan otherwise.
+    ///
+    /// An empty answer for a name that is demonstrably bound here is `ty`
+    /// failing to resolve it, not evidence that nothing uses it — every
+    /// `@app.command` line does — so it falls through to the scan rather than
+    /// being trusted. A scan with more than [`REGISTRAR_SITE_CAP`] hits is
+    /// abandoned: a name that common says nothing about who drives the symbol.
+    fn resolve_registrar(
+        &mut self,
+        query: &SymbolQuery,
+        registrar: &str,
+    ) -> Result<Vec<RefSite>, Stop> {
+        let bound = self
+            .index
+            .binding(&query.file, registrar)
+            .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
+        if let Some((line, column)) = bound {
+            let id = self
+                .index
+                .module_path(&query.file)
+                .map_or_else(|| registrar.to_string(), |module| symbol_id(&module, registrar));
+            let probe = SymbolQuery {
+                id,
+                name: registrar.to_string(),
+                file: query.file.clone(),
+                line,
+                column,
+            };
+            self.tyf_calls += 1;
+            let answers = self
+                .refs
+                .refs(std::slice::from_ref(&probe))
+                .map_err(|err| Stop::failed(Reason::RefsFailed, &err))?;
+            let declaration = probe.declaration();
+            let sites: Vec<RefSite> = answers
+                .into_iter()
+                .filter(|answer| answer.id == probe.id)
+                .flat_map(|answer| answer.sites)
+                .filter(|site| *site != declaration)
+                .collect();
+            if !sites.is_empty() {
+                return Ok(sites);
+            }
+        }
+
+        let hits = self
+            .index
+            .word_hits(registrar)
+            .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
+        if hits.len() > REGISTRAR_SITE_CAP {
+            return Ok(Vec::new());
+        }
+        Ok(hits.into_iter().map(|(file, line)| RefSite { file, line }).collect())
     }
 
     /// A deleted symbol has no definition left for `tyf` to resolve, so its
@@ -832,7 +974,7 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
                 .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
 
             if self.index.is_test(&site.file) {
-                self.test_site(&query.id, site, &class);
+                self.test_site(&query.id, site, &class, next);
             } else {
                 self.code_site(&query.id, query.bare_name(), site, &class, next)?;
             }
@@ -872,23 +1014,63 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
     }
 
     /// A reference inside test code: record it and stop. Tests are the answer,
-    /// not a step towards it.
-    fn test_site(&mut self, from: &str, site: &RefSite, class: &Site) {
+    /// not a step towards it — unless the definition is a helper pytest never
+    /// reaches by name, which is a step like any other.
+    fn test_site(&mut self, from: &str, site: &RefSite, class: &Site, next: &mut Vec<SymbolQuery>) {
         if matches!(class, Site::Import) {
             // The test's actual use of the symbol is its own reference; the
             // import line would otherwise select every test that imports the
             // module for any reason.
             return;
         }
-        let symbol = match class {
+        let (symbol, kind) = match class {
             Site::Symbol(found) => {
-                self.index.module_path(&site.file).map(|module| symbol_id(&module, &found.qualname))
+                let Some(module) = self.index.module_path(&site.file) else {
+                    self.record(&site.file, None, TestKind::Test, from);
+                    return;
+                };
+                if is_test_helper(found) {
+                    self.helper_site(from, site, found, &module, next);
+                    return;
+                }
+                let kind = if found.decorators.iter().any(|d| is_fixture_decorator(d)) {
+                    TestKind::Fixture
+                } else {
+                    TestKind::Test
+                };
+                (Some(symbol_id(&module, &found.qualname)), kind)
             }
             // Module scope in a test file, or a file we could not parse: the
             // whole file is selected rather than one function.
-            _ => None,
+            _ => (None, TestKind::Test),
         };
-        self.record(&site.file, symbol, from);
+        self.record(&site.file, symbol, kind, from);
+    }
+
+    /// A helper in a test file: the next node of the graph, like a definition
+    /// in production code. Its callers are the tests, and `tyf` sees them.
+    ///
+    /// No `ignore-decorators` check, unlike [`Self::symbol_site`]: a helper
+    /// marked as registry-dispatched would otherwise vanish from the answer,
+    /// and the dead-end rule needs it visited to record it.
+    fn helper_site(
+        &mut self,
+        from: &str,
+        site: &RefSite,
+        found: &IndexedSymbol,
+        module: &str,
+        next: &mut Vec<SymbolQuery>,
+    ) {
+        let id = symbol_id(module, &found.qualname);
+        if self.record_visit(&id, from) {
+            next.push(SymbolQuery {
+                id,
+                name: found.qualname.clone(),
+                file: site.file.clone(),
+                line: found.line,
+                column: found.column,
+            });
+        }
     }
 
     /// A reference in non-test code: expand it, unless it is noise.
@@ -985,7 +1167,7 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
             .test_importers(module)
             .map_err(|err| Stop::failed(Reason::IndexFailed, &err))?;
         for file in importers {
-            self.record(&file, None, module);
+            self.record(&file, None, TestKind::Test, module);
         }
         Ok(())
     }
@@ -1006,7 +1188,7 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
     }
 
     /// Record an impacted test, keeping the first (shortest) route to it.
-    fn record(&mut self, file: &Path, symbol: Option<String>, from: &str) {
+    fn record(&mut self, file: &Path, symbol: Option<String>, kind: TestKind, from: &str) {
         let (via, origin) = self.chain(from);
         let file = file.display().to_string();
         self.impacted.entry((file.clone(), symbol.clone())).or_insert(ImpactedTest {
@@ -1014,6 +1196,7 @@ impl<R: Refs, I: Index> Walk<'_, R, I> {
             symbol,
             via,
             origin,
+            kind,
         });
     }
 
@@ -1160,6 +1343,12 @@ mod tests {
                 .filter(|(_, source)| pysource::imports_module(source, module))
                 .map(|(path, _)| path.clone())
                 .collect())
+        }
+
+        fn binding(&self, file: &Path, name: &str) -> Result<Option<(u32, u32)>> {
+            self.check()?;
+            let Some(module) = self.parse(file) else { return Ok(None) };
+            Ok(module.binding(name).map(|b| (b.line, b.column)))
         }
     }
 
@@ -1330,6 +1519,108 @@ def test_middle():
             "the test that invokes `app` must be selected, got {:?}",
             closure.impacted
         );
+    }
+
+    /// A second, unrelated `app` — a `FastAPI` one — with a module-level call
+    /// on it and a test that imports the module. A word scan for `app` lands
+    /// here; a reference query for the Typer `app` does not.
+    const WEB: &str = "from fastapi import FastAPI\n\napp = FastAPI()\napp.include_router(None)\n";
+
+    const WEB_TEST: &str =
+        "from pkg.web import app\n\n\ndef test_web():\n    assert app is not None\n";
+
+    #[test]
+    fn a_registrar_is_resolved_at_its_binding_rather_than_by_name() {
+        let index = MapIndex::default()
+            .with("src/pkg/cli.py", CLI)
+            .with("tests/test_cli.py", CLI_TEST)
+            .with("src/pkg/web.py", WEB)
+            .with("tests/test_web.py", WEB_TEST);
+        // `app` is bound on line 3 of `cli.py`; a query there answers with its
+        // own decorator line and the test that drives it, and nothing in `web`.
+        let refs = MapRefs::default()
+            .with("pkg.cli:show", &[])
+            .with("pkg.cli:app", &[("src/pkg/cli.py", 6), ("tests/test_cli.py", 8)]);
+
+        let closure = run(&[seed("pkg.cli:show", "src/pkg/cli.py", 7)], &refs, &index);
+
+        assert_eq!(closure.verdict, Verdict::Selected);
+        assert_eq!(
+            selected(&closure).into_iter().map(|(file, ..)| file).collect::<Vec<_>>(),
+            vec!["tests/test_cli.py".to_string()],
+            "the other `app` is a different object and its tests stay out: {:?}",
+            closure.impacted
+        );
+        assert_eq!(closure.stats.tyf_calls, 2, "one frontier, one registrar query");
+    }
+
+    #[test]
+    fn every_command_on_one_registrar_shares_a_single_query() {
+        let index = MapIndex::default()
+            .with(
+                "src/pkg/cli.py",
+                "import typer\n\napp = typer.Typer()\n\n\n@app.command()\ndef show():\n    return 1\n\n\n@app.command()\ndef hide():\n    return 2\n",
+            )
+            .with("tests/test_cli.py", CLI_TEST);
+        let refs = MapRefs::default().with(
+            "pkg.cli:app",
+            &[("src/pkg/cli.py", 6), ("src/pkg/cli.py", 11), ("tests/test_cli.py", 8)],
+        );
+
+        let closure = run(
+            &[
+                seed("pkg.cli:show", "src/pkg/cli.py", 7),
+                seed("pkg.cli:hide", "src/pkg/cli.py", 12),
+            ],
+            &refs,
+            &index,
+        );
+
+        assert_eq!(closure.verdict, Verdict::Selected);
+        assert_eq!(closure.stats.tyf_calls, 2, "the second dead end reuses the answer");
+    }
+
+    #[test]
+    fn a_registrar_whose_only_references_are_its_own_decorators_is_unresolved() {
+        // `ty` answers precisely: `app` is used by its `@app.command` lines and
+        // nothing else. The unrelated `app` a word scan would find must not
+        // turn that into a confident selection.
+        let index = MapIndex::default()
+            .with("src/pkg/cli.py", CLI)
+            .with("src/pkg/web.py", WEB)
+            .with("tests/test_web.py", WEB_TEST);
+        let refs = MapRefs::default()
+            .with("pkg.cli:show", &[])
+            .with("pkg.cli:app", &[("src/pkg/cli.py", 6)]);
+
+        let closure = run(&[seed("pkg.cli:show", "src/pkg/cli.py", 7)], &refs, &index);
+
+        assert_eq!(closure.verdict, Verdict::RunAll, "nobody visible drives `app`");
+        assert_eq!(closure.reason, Some(Reason::DecoratorDispatch));
+        assert!(closure.impacted.is_empty(), "and the FastAPI tests are not guessed at");
+    }
+
+    #[test]
+    fn a_registrar_the_file_does_not_bind_falls_back_to_the_word_scan() {
+        // `from pkg.wiring import *` leaves `app` unbound as far as the parse
+        // can tell: there is no position to ask about, so the scan it is.
+        let index = MapIndex::default()
+            .with(
+                "src/pkg/cli.py",
+                "from pkg.wiring import *\n\n\n@app.command()\ndef show():\n    return 1\n",
+            )
+            .with("tests/test_cli.py", CLI_TEST);
+        let refs = MapRefs::default().with("pkg.cli:show", &[]);
+
+        let closure = run(&[seed("pkg.cli:show", "src/pkg/cli.py", 5)], &refs, &index);
+
+        assert_eq!(closure.verdict, Verdict::Selected);
+        assert!(
+            closure.impacted.iter().any(|test| test.file == "tests/test_cli.py"),
+            "the scan still finds the driver, got {:?}",
+            closure.impacted
+        );
+        assert_eq!(closure.stats.tyf_calls, 1, "no registrar query without a binding");
     }
 
     #[test]
@@ -1574,6 +1865,102 @@ def test_middle():
             }],
             "but it is reported, with the entry that matched"
         );
+    }
+
+    const HELPER_TEST: &str = "\
+from pkg.core import target
+
+
+class TestTarget:
+    def check(self, value):
+        return target(value) == value + 1
+
+    def test_one(self):
+        assert self.check(1)
+
+    def test_two(self):
+        assert self.check(2)
+";
+
+    #[test]
+    fn a_helper_in_a_test_file_is_a_step_towards_the_tests_that_call_it() {
+        let index = MapIndex::default()
+            .with("src/pkg/core.py", "def target(value):\n    return value + 1\n")
+            .with("tests/test_target.py", HELPER_TEST);
+        let refs = MapRefs::default().with("pkg.core:target", &[("tests/test_target.py", 6)]).with(
+            "tests.test_target:TestTarget.check",
+            &[("tests/test_target.py", 9), ("tests/test_target.py", 12)],
+        );
+
+        let closure = run(&[seed("pkg.core:target", "src/pkg/core.py", 1)], &refs, &index);
+
+        assert_eq!(
+            selected(&closure),
+            vec![
+                (
+                    "tests/test_target.py".to_string(),
+                    Some("tests.test_target:TestTarget.test_one".to_string()),
+                    vec!["tests.test_target:TestTarget.check".to_string()],
+                    "pkg.core:target".to_string(),
+                ),
+                (
+                    "tests/test_target.py".to_string(),
+                    Some("tests.test_target:TestTarget.test_two".to_string()),
+                    vec!["tests.test_target:TestTarget.check".to_string()],
+                    "pkg.core:target".to_string(),
+                ),
+            ],
+            "the tests, reached through the helper, and not the helper itself"
+        );
+    }
+
+    #[test]
+    fn a_helper_nothing_visible_calls_is_still_an_answer() {
+        // `getattr(self, name)()`, a hook the table does not know — whatever
+        // the reason, a helper with no callers must not become a silent miss.
+        let index = MapIndex::default()
+            .with("src/pkg/core.py", "def target(value):\n    return value + 1\n")
+            .with("tests/test_target.py", HELPER_TEST);
+        let refs = MapRefs::default().with("pkg.core:target", &[("tests/test_target.py", 6)]);
+
+        let closure = run(&[seed("pkg.core:target", "src/pkg/core.py", 1)], &refs, &index);
+
+        assert_eq!(
+            selected(&closure),
+            vec![(
+                "tests/test_target.py".to_string(),
+                Some("tests.test_target:TestTarget.check".to_string()),
+                vec![],
+                "pkg.core:target".to_string(),
+            )],
+            "recorded as it was before helpers became steps"
+        );
+    }
+
+    #[test]
+    fn a_fixture_and_a_hook_in_a_test_file_are_answers_not_steps() {
+        // pytest injects the fixture and calls the hook by name; `tyf` would
+        // find no callers for either, and asking costs a round-trip.
+        let index = MapIndex::default()
+            .with("src/pkg/core.py", "def target(value):\n    return value + 1\n")
+            .with(
+                "tests/test_target.py",
+                "import pytest\n\nfrom pkg.core import target\n\n\n@pytest.fixture\ndef shelter():\n    return target(1)\n\n\nclass TestTarget:\n    def setup_method(self):\n        self.value = target(2)\n",
+            );
+        let refs = MapRefs::default()
+            .with("pkg.core:target", &[("tests/test_target.py", 8), ("tests/test_target.py", 13)]);
+
+        let closure = run(&[seed("pkg.core:target", "src/pkg/core.py", 1)], &refs, &index);
+
+        assert_eq!(
+            closure.impacted.iter().map(|t| (t.symbol.clone(), t.kind)).collect::<Vec<_>>(),
+            vec![
+                (Some("tests.test_target:TestTarget.setup_method".to_string()), TestKind::Test),
+                (Some("tests.test_target:shelter".to_string()), TestKind::Fixture),
+            ],
+            "and the fixture is marked as one"
+        );
+        assert_eq!(closure.stats.tyf_calls, 1, "neither was expanded");
     }
 
     #[test]

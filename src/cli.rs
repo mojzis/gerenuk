@@ -388,7 +388,21 @@ pub fn run_impacted_tests(
     changed_file: Option<&Path>,
     budgets: Budgets,
 ) -> Result<ImpactReport> {
-    Ok(impacted_run(&repo_context(workspace)?, base, changed_file, budgets)?.report)
+    Ok(impacted_run(&repo_context(workspace)?, base, changed_file, budgets, Economics::Ignore)?
+        .report)
+}
+
+/// Whether the walk is worth its cost, which only `run` has a view on.
+///
+/// `impacted-tests` is an inventory: what could break is the same question
+/// however fast the suite is. `run` is the one that pays for the answer and
+/// then runs it, so it is the one that honours `suite-ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Economics {
+    /// Walk whenever the diff needs it.
+    Ignore,
+    /// Skip the walk for a suite declared faster than a selection.
+    Honour,
 }
 
 /// One impact run, plus the working-tree file list it happened to need.
@@ -418,6 +432,7 @@ fn impacted_run(
     base: Option<&str>,
     changed_file: Option<&Path>,
     budgets: Budgets,
+    economics: Economics,
 ) -> Result<ImpactRun> {
     let started = Instant::now();
     let Repo { git, root, config } = repo;
@@ -438,6 +453,12 @@ fn impacted_run(
 
     if let Some(reason) = impact::upfront_reason(&changed) {
         return Ok(ImpactRun::unwalked(changed, reason, Vec::new()));
+    }
+    // Still before `tyf` is looked for: the whole point is to not pay for it.
+    if economics == Economics::Honour {
+        if let Some(reason) = impact::fast_suite(config, &changed) {
+            return Ok(ImpactRun::unwalked(changed, reason, Vec::new()));
+        }
     }
 
     let runner = match Runner::discover(root) {
@@ -505,7 +526,7 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
             files: None,
             changed: None,
         },
-        None => impacted_run(&repo, options.base, None, options.budgets)?,
+        None => impacted_run(&repo, options.base, None, options.budgets, Economics::Honour)?,
     };
 
     // A `run_all` verdict needs no tree: the whole suite runs either way, and

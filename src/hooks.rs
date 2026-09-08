@@ -87,6 +87,16 @@ const EXACT: &[&str] = &[
     "stopTestRun",
     "tearDown",
     "tearDownClass",
+    // pytest xunit-style setup and teardown
+    "setup_class",
+    "setup_function",
+    "setup_method",
+    "setup_module",
+    "teardown",
+    "teardown_class",
+    "teardown_function",
+    "teardown_method",
+    "teardown_module",
     // ast.NodeVisitor, docutils
     "generic_visit",
     "visit",
@@ -307,6 +317,13 @@ pub fn is_framework_hook(method: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pytest_xunit_hooks_are_hooks() {
+        for name in ["setup_method", "teardown_class", "setup_module", "teardown"] {
+            assert!(is_framework_hook(name), "pytest calls `{name}` by name");
+        }
+    }
 
     #[test]
     fn stdlib_protocol_methods_are_hooks() {

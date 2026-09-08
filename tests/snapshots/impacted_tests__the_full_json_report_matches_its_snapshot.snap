@@ -15,12 +15,14 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
   "impacted_tests": [
     {
       "file": "tests/test_core.py",
+      "kind": "test",
       "origin": "mypkg.core:target",
       "symbol": "tests.test_core:test_target",
       "via": []
     },
     {
       "file": "tests/test_service.py",
+      "kind": "test",
       "origin": "mypkg.core:target",
       "symbol": "tests.test_service:test_middle",
       "via": [
@@ -29,6 +31,7 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
     },
     {
       "file": "tests/test_settings.py",
+      "kind": "test",
       "origin": "mypkg.core:target",
       "symbol": null,
       "via": [

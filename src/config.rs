@@ -34,6 +34,15 @@ pub struct Config {
     /// Wall-clock budget for the whole walk, in milliseconds.
     pub budget_ms: Option<u64>,
 
+    /// How long the whole suite takes, in milliseconds, as declared by the
+    /// repository.
+    ///
+    /// A selection costs a few `tyf` round-trips before pytest starts. When
+    /// the full suite is faster than that, `gerenuk run` skips the walk and
+    /// runs everything (`fast_suite`). `impacted-tests` ignores it: an
+    /// inventory has no economics.
+    pub suite_ms: Option<u64>,
+
     /// How `gerenuk run` invokes pytest.
     ///
     /// An argv rather than a string, because the common real-world value is a
@@ -285,6 +294,14 @@ mod tests {
         let config = Config::load(tmp.path()).expect("valid config parses");
         assert_eq!(config.max_depth, Some(2), "the one that was set");
         assert_eq!(config.max_symbols, None, "and the others stay at the built-in default");
+    }
+
+    #[test]
+    fn the_suite_duration_is_absent_by_default_and_read_in_kebab_case() {
+        assert_eq!(Config::default().suite_ms, None, "unset means never short-circuit");
+        let tmp = with_pyproject("[tool.gerenuk]\nsuite-ms = 800\n");
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(config.suite_ms, Some(800));
     }
 
     #[test]

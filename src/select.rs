@@ -427,7 +427,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::closure::{ImpactedTest, Stats};
+    use crate::closure::{ImpactedTest, Stats, TestKind};
     use crate::modpath::module_path;
     use crate::pysource;
     use crate::workspace::is_test_path;
@@ -534,6 +534,7 @@ mod tests {
             symbol: symbol.map(ToString::to_string),
             via: Vec::new(),
             origin: "pkg.core:target".to_string(),
+            kind: TestKind::Test,
         }
     }
 

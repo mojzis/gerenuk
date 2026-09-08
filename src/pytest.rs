@@ -35,7 +35,7 @@ use anyhow::{Context, Result};
 
 use crate::config::Config;
 use crate::fallback::Plan;
-use crate::select::{Decision, Selection};
+use crate::select::{Decision, DropReason, Selection};
 
 /// Binary name looked up on `PATH` when nothing else names one.
 pub const DEFAULT_PYTEST_BIN: &str = "pytest";
@@ -235,6 +235,22 @@ impl DryRun<'_> {
                 expansion.from,
                 expansion.kind.label(),
                 expansion.into.len()
+            );
+        }
+
+        // Said explicitly: a reader who counted node ids in `impacted-tests`
+        // and sees whole files here would otherwise take the collapse for a
+        // bug. It is the rule — a whole-file entry supersedes the per-test ids
+        // inside it, so pytest is handed each file once.
+        let superseded =
+            self.selection.dropped.iter().filter(|d| d.why == DropReason::Superseded).count();
+        if superseded > 0 {
+            let whole =
+                self.selection.node_ids.iter().filter(|s| !s.node_id.contains("::")).count();
+            let _ = writeln!(
+                out,
+                "\n{superseded} per-test node id(s) folded into {whole} whole file(s): a file \
+                 selected wholesale supersedes the node ids inside it"
             );
         }
 
@@ -448,6 +464,19 @@ mod tests {
                 .render_human();
         assert!(text.contains("expanded tests.conftest:shelter (fixture)"), "got:\n{text}");
         assert!(text.contains("covered by the whole file"), "got:\n{text}");
+        assert!(
+            text.contains("1 per-test node id(s) folded into 1 whole file(s)"),
+            "the collapse to file granularity is announced, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn the_dry_run_says_nothing_about_folding_when_nothing_folded() {
+        let selection = selection(Decision::Selected, &[("tests/test_a.py::test_x", "pkg.a:f")]);
+        let text =
+            DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 0, fallback: None }
+                .render_human();
+        assert!(!text.contains("folded"), "got:\n{text}");
     }
 
     #[test]
