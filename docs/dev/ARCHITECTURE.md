@@ -213,6 +213,14 @@ binary (`common::TestRepo`), pointing `GIT_CONFIG_GLOBAL` and
 `GERENUK_TYF`, and one runs with an empty `PATH` to prove `tyf` discovery is
 never attempted.
 
+## What `run` decides before the walk
+
+`impacted_run` settles two things from the diff alone, before `tyf` is looked
+for: the up-front `run_all` reasons (`non_python_changes`, `parse_errors`),
+and — for `run` only, via `Economics::Honour` — the `fast_suite` short-circuit
+from `[tool.gerenuk] suite-ms` ([ADR 0019](../adr/0019-a-declared-suite-time-skips-the-walk.md)).
+`impacted-tests` passes `Economics::Ignore`: it is an inventory.
+
 ## Adding a closure rule
 
 1. Add the case to `closure::Walk`, with a unit test against `MapIndex`.

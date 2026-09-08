@@ -388,7 +388,21 @@ pub fn run_impacted_tests(
     changed_file: Option<&Path>,
     budgets: Budgets,
 ) -> Result<ImpactReport> {
-    Ok(impacted_run(&repo_context(workspace)?, base, changed_file, budgets)?.report)
+    Ok(impacted_run(&repo_context(workspace)?, base, changed_file, budgets, Economics::Ignore)?
+        .report)
+}
+
+/// Whether the walk is worth its cost, which only `run` has a view on.
+///
+/// `impacted-tests` is an inventory: what could break is the same question
+/// however fast the suite is. `run` is the one that pays for the answer and
+/// then runs it, so it is the one that honours `suite-ms`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Economics {
+    /// Walk whenever the diff needs it.
+    Ignore,
+    /// Skip the walk for a suite declared faster than a selection.
+    Honour,
 }
 
 /// One impact run, plus the working-tree file list it happened to need.
@@ -418,6 +432,7 @@ fn impacted_run(
     base: Option<&str>,
     changed_file: Option<&Path>,
     budgets: Budgets,
+    economics: Economics,
 ) -> Result<ImpactRun> {
     let started = Instant::now();
     let Repo { git, root, config } = repo;
@@ -438,6 +453,12 @@ fn impacted_run(
 
     if let Some(reason) = impact::upfront_reason(&changed) {
         return Ok(ImpactRun::unwalked(changed, reason, Vec::new()));
+    }
+    // Still before `tyf` is looked for: the whole point is to not pay for it.
+    if economics == Economics::Honour {
+        if let Some(reason) = impact::fast_suite(config, &changed) {
+            return Ok(ImpactRun::unwalked(changed, reason, Vec::new()));
+        }
     }
 
     let runner = match Runner::discover(root) {
@@ -505,7 +526,7 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
             files: None,
             changed: None,
         },
-        None => impacted_run(&repo, options.base, None, options.budgets)?,
+        None => impacted_run(&repo, options.base, None, options.budgets, Economics::Honour)?,
     };
 
     // A `run_all` verdict needs no tree: the whole suite runs either way, and
@@ -673,23 +694,42 @@ pub fn run_audit(runner: &Runner, root: &Path, files: &[PathBuf]) -> Result<Repo
             runner.list(file).with_context(|| format!("could not outline {}", file.display()))?;
         symbols_checked += outline_size(&outline);
 
-        // Parsed for decorators only. A file `tyf` outlined but we cannot parse
-        // is not fatal here: the audit simply loses the decorator rule for it.
+        // Parsed for decorators and class bases only. A file `tyf` outlined but
+        // we cannot parse is not fatal here: the audit simply loses those two
+        // rules for it.
         let parsed = std::fs::read_to_string(file)
             .ok()
             .and_then(|source| crate::pysource::parse(&source).ok());
 
+        // Queried by position, one `tyf refs` call per file: a nested function
+        // has no name form, and `Outer.Inner.method` is a usage error (ADR 0002).
+        let targets = auditable_symbols(&outline);
+        let positions: Vec<String> =
+            targets.iter().map(|t| format!("{}:{}:{}", file.display(), t.line, t.column)).collect();
+        let answers = runner.refs_batch(&positions).with_context(|| {
+            format!("could not resolve references for {}", positions.join(", "))
+        })?;
+
         let mut usages = Vec::new();
-        for (name, kind, line) in auditable_symbols(&outline) {
-            let refs = runner
-                .refs(&name)
-                .with_context(|| format!("could not resolve references for `{name}`"))?;
-            let decorators = parsed
-                .as_ref()
-                .and_then(|module| module.symbol_at(line))
+        for (target, refs) in targets.into_iter().zip(answers) {
+            let span = parsed.as_ref().and_then(|module| module.symbol_at(target.line));
+            let decorators = span
                 .map(|span| span.decorator_names().map(ToString::to_string).collect())
                 .unwrap_or_default();
-            usages.push(SymbolUsage { name, kind, line, refs, decorators });
+            let bases = parsed
+                .as_ref()
+                .zip(span)
+                .and_then(|(module, span)| module.enclosing_class(span))
+                .map(|class| class.bases.clone())
+                .unwrap_or_default();
+            usages.push(SymbolUsage {
+                name: target.name,
+                kind: target.kind,
+                line: target.line,
+                refs,
+                decorators,
+                bases,
+            });
         }
 
         findings.extend(audit(file, root, &usages));

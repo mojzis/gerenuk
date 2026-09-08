@@ -55,6 +55,25 @@ pub struct SymbolUsage {
     /// Dotted names of the decorators applied to it, when the file could be
     /// parsed. A registering decorator is what makes "no references" a lie.
     pub decorators: Vec<String>,
+    /// Bases of the class a method sits in, when the file could be parsed.
+    /// Empty for a function and for a class with no bases. A framework calling
+    /// an override through the base is the other thing that makes "no
+    /// references" a lie.
+    pub bases: Vec<String>,
+}
+
+/// One symbol an audit will ask `tyf refs` about.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditTarget {
+    /// Dotted name through every nesting level, e.g. `Outer.Inner.method`.
+    /// For display: a nested function has no `tyf refs` name form.
+    pub name: String,
+    pub kind: SymbolKind,
+    /// One-based line of the symbol's name.
+    pub line: u32,
+    /// One-based column of the symbol's name — with [`Self::line`], what
+    /// `tyf refs file:line:col` resolves (ADR 0002).
+    pub column: u32,
 }
 
 /// Flatten a `tyf list` outline into the callable symbols worth auditing.
@@ -62,22 +81,30 @@ pub struct SymbolUsage {
 /// Dunder methods and private helpers (`_name`) are skipped: they are usually
 /// referenced implicitly or deliberately internal, so flagging them is noise.
 #[must_use]
-pub fn auditable_symbols(outline: &[DocumentSymbol]) -> Vec<(String, SymbolKind, u32)> {
+pub fn auditable_symbols(outline: &[DocumentSymbol]) -> Vec<AuditTarget> {
     let mut out = Vec::new();
     for top in outline {
-        for symbol in top.walk() {
-            if !symbol.kind.is_callable() || !is_auditable_name(&symbol.name) {
-                continue;
-            }
-            let name = if std::ptr::eq(symbol, top) {
-                symbol.name.clone()
-            } else {
-                top.qualified_child(symbol)
-            };
-            out.push((name, symbol.kind, symbol.selection_range.start.line + 1));
-        }
+        collect_targets(top, None, &mut out);
     }
     out
+}
+
+fn collect_targets(symbol: &DocumentSymbol, parent: Option<&str>, out: &mut Vec<AuditTarget>) {
+    let name = match parent {
+        Some(parent) => format!("{parent}.{}", symbol.name),
+        None => symbol.name.clone(),
+    };
+    if symbol.kind.is_callable() && is_auditable_name(&symbol.name) {
+        out.push(AuditTarget {
+            name: name.clone(),
+            kind: symbol.kind,
+            line: symbol.selection_range.start.line + 1,
+            column: symbol.selection_range.start.character + 1,
+        });
+    }
+    for child in &symbol.children {
+        collect_targets(child, Some(&name), out);
+    }
 }
 
 /// Count every symbol in an outline, nested ones included.
@@ -161,11 +188,24 @@ fn classify(usage: &SymbolUsage, file: &Path, root: &Path) -> Option<(Severity, 
         return None;
     }
 
+    // `logging.Filter.filter`, `Thread.run`, `TestCase.setUp`: the base class
+    // is the reference. Only with a base — on a plain class `filter` is just a
+    // name — and only for names a framework is known to call (ADR 0016).
+    if overrides_framework_hook(usage) {
+        return None;
+    }
+
     if tests == 0 {
         Some((Severity::Warn, format!("`{}` has no references", usage.name)))
     } else {
         Some((Severity::Note, format!("`{}` is referenced only from tests ({tests})", usage.name)))
     }
+}
+
+fn overrides_framework_hook(usage: &SymbolUsage) -> bool {
+    let has_base = usage.bases.iter().any(|b| b.rsplit('.').next() != Some("object"));
+    let own_name = usage.name.rsplit('.').next().unwrap_or(&usage.name);
+    has_base && crate::hooks::is_framework_hook(own_name)
 }
 
 #[cfg(test)]
@@ -204,7 +244,67 @@ mod tests {
             line: 10,
             refs,
             decorators: Vec::new(),
+            bases: Vec::new(),
         }
+    }
+
+    fn method(name: &str, bases: &[&str]) -> SymbolUsage {
+        SymbolUsage {
+            kind: SymbolKind::Method,
+            bases: bases.iter().map(ToString::to_string).collect(),
+            ..usage(name, refs(name, &[], &[]))
+        }
+    }
+
+    #[test]
+    fn a_framework_hook_overridden_on_a_subclass_is_not_dead() {
+        // `logging.Filter.filter` is called by the logging module, which holds
+        // the only reference — the same shape as a registering decorator.
+        let findings = audit(
+            Path::new("pkg/logs.py"),
+            Path::new(ROOT),
+            &[method("Quiet.filter", &["logging.Filter"])],
+        );
+        assert!(findings.is_empty(), "an override the framework calls is alive, got {findings:?}");
+    }
+
+    #[test]
+    fn a_hook_name_on_a_class_without_bases_is_still_audited() {
+        // Nothing but a base class makes `filter` mean the logging protocol.
+        let findings =
+            audit(Path::new("pkg/logs.py"), Path::new(ROOT), &[method("Plain.filter", &[])]);
+        assert_eq!(findings.len(), 1, "no base, no framework, got {findings:?}");
+    }
+
+    #[test]
+    fn object_is_not_a_base_worth_the_name() {
+        let findings = audit(
+            Path::new("pkg/logs.py"),
+            Path::new(ROOT),
+            &[method("Legacy.filter", &["object"])],
+        );
+        assert_eq!(findings.len(), 1, "`class X(object)` is `class X`, got {findings:?}");
+    }
+
+    #[test]
+    fn an_ordinary_method_on_a_subclass_is_still_audited() {
+        let findings = audit(
+            Path::new("pkg/logs.py"),
+            Path::new(ROOT),
+            &[method("Quiet.helper", &["logging.Filter"])],
+        );
+        assert_eq!(findings.len(), 1, "only known hook names are exempt, got {findings:?}");
+    }
+
+    #[test]
+    fn the_hook_rule_reads_the_method_s_own_name() {
+        // `Outer.Inner.on_message`: the last segment is what the framework calls.
+        let findings = audit(
+            Path::new("pkg/bot.py"),
+            Path::new(ROOT),
+            &[method("Outer.Inner.on_message", &["Client"])],
+        );
+        assert!(findings.is_empty(), "prefix hooks match the last segment, got {findings:?}");
     }
 
     fn span(line: u32) -> Range {
@@ -362,13 +462,46 @@ mod tests {
         ];
 
         let found: Vec<(String, u32)> =
-            auditable_symbols(&outline).into_iter().map(|(name, _, line)| (name, line)).collect();
+            auditable_symbols(&outline).into_iter().map(|t| (t.name, t.line)).collect();
 
         assert_eq!(
             found,
             vec![("Calculator.add".to_string(), 3), ("main".to_string(), 21)],
             "methods are qualified, private/dunder names and non-callables are skipped"
         );
+    }
+
+    #[test]
+    fn auditable_symbols_qualify_through_every_nesting_level() {
+        // `Outer.Inner.method` used to come out as `Outer.method`: only the
+        // top-level name was prepended, so two levels down lost a segment.
+        let outline = vec![
+            symbol("outer", 12, 0, vec![symbol("helper", 12, 1, vec![])]),
+            symbol(
+                "Outer",
+                5,
+                5,
+                vec![symbol("Inner", 5, 6, vec![symbol("method", 6, 7, vec![])])],
+            ),
+        ];
+
+        let names: Vec<String> = auditable_symbols(&outline).into_iter().map(|t| t.name).collect();
+
+        assert_eq!(names, vec!["outer", "outer.helper", "Outer.Inner.method"]);
+    }
+
+    #[test]
+    fn auditable_symbols_carry_the_one_based_column_of_the_name() {
+        // The column is what `tyf refs file:line:col` needs: a nested function
+        // has no name form, so the position is the only query that reaches it.
+        let mut nested = symbol("helper", 12, 1, vec![]);
+        nested.selection_range.start.character = 8;
+        let outline = vec![symbol("outer", 12, 0, vec![nested])];
+
+        let positions: Vec<(u32, u32)> =
+            auditable_symbols(&outline).into_iter().map(|t| (t.line, t.column)).collect();
+
+        assert_eq!(positions, vec![(1, 1), (2, 9)], "LSP is zero-based, tyf positions are not");
     }
 
     #[test]

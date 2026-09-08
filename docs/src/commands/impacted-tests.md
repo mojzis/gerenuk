@@ -37,6 +37,7 @@ everything" rather than a short list or a crash.
 | `index_failed` | The working tree could not be read part-way through |
 | `max_depth` / `max_symbols` / `budget` | A limit tripped before the frontier emptied |
 | `decorator_dispatch` | A changed symbol is registered by a decorator whose registrar could not be resolved, so the framework's route to its tests is invisible. `errors` names the symbol and the decorator. |
+| `fast_suite` | Only from `run`: the repository declared a suite (`suite-ms`) faster than a selection costs, so the walk was skipped. Never emitted by this command. |
 
 `non_python_changes` and `parse_errors` are settled *before* `tyf` is looked
 for, so a diff of `pyproject.toml` alone answers in a checkout with no `ty`
@@ -86,25 +87,29 @@ the chain makes it legible.
       "file": "tests/test_api.py",
       "symbol": null,
       "via": ["sample_pkg.cli", "sample_pkg.cli:main"],
-      "origin": "sample_pkg.service:describe"
+      "origin": "sample_pkg.service:describe",
+      "kind": "test"
     },
     {
       "file": "tests/test_pipelines.py",
       "symbol": "tests.test_pipelines:test_run_describes_animals_in_order",
       "via": ["sample_pkg.pipelines:Enricher.run"],
-      "origin": "sample_pkg.service:describe"
+      "origin": "sample_pkg.service:describe",
+      "kind": "test"
     },
     {
       "file": "tests/test_pipelines.py",
       "symbol": "tests.test_pipelines:test_run_on_an_empty_shelter_returns_nothing",
       "via": ["sample_pkg.pipelines:Enricher.run"],
-      "origin": "sample_pkg.service:describe"
+      "origin": "sample_pkg.service:describe",
+      "kind": "test"
     },
     {
       "file": "tests/test_service.py",
       "symbol": null,
       "via": ["sample_pkg.cli", "sample_pkg.cli:main"],
-      "origin": "sample_pkg.service:describe"
+      "origin": "sample_pkg.service:describe",
+      "kind": "test"
     }
   ],
   "test_files_changed": [],
@@ -137,6 +142,27 @@ When a whole file is selected, its individually-reached tests are dropped from
 the list: the file entry already covers them, and emitting both would hand the
 same file to pytest twice.
 
+`kind` says what a non-null `symbol` is: `test` for anything pytest reaches by
+name — a test function, a `Test*` class, a `setup_method` — and `fixture` for
+a `@pytest.fixture` definition. A fixture is an answer the walk stops at, but
+not a test: pytest injects it by name and never collects it, so
+[`run`](run.md#fixture-awareness) expands it to its consumers. The human report
+lists fixtures under their own heading for the same reason, and does the same
+for a `conftest.py` reached wholesale:
+
+```
+impacted fixtures (1)
+  tests.test_mcp_tools:TestQueryLogging.logged_run_sql  (the tests that consume it)
+    ← backoffice.mcp.tools:make_tools ← backoffice.sql:validate_read_only_sql
+
+impacted conftests (1)
+  backoffice/tests/conftest.py  (every test file in its subtree)
+    ← backoffice.api.main ← backoffice.api.main:lifespan ← backoffice.sql:validate_read_only_sql
+```
+
+Neither counts towards `impacted tests (N)`. A report saved before `kind`
+existed replays with every entry read as `test`.
+
 `test_files_changed` passes straight through from
 [`changed-symbols`](changed-symbols.md): a changed test selects itself, and
 needs no walking.
@@ -154,7 +180,8 @@ seeds both the module's own top-level definitions and the module itself.
 
 | The reference is | What happens |
 |---|---|
-| In a test file, inside a test function | Recorded as an impacted test. The walk stops there. |
+| In a test file, inside a test, a fixture or a hook pytest calls by name | Recorded as an impacted test. The walk stops there. |
+| In a test file, inside a helper pytest never reaches by name | Expanded next round, like a definition in production code: its callers are the tests, and `tyf` sees them. A helper nothing visible calls is recorded as it was, so an unseen by-name route degrades to its class or file rather than to a miss. |
 | In a test file, at module scope | The whole file is recorded (`symbol: null`). |
 | A plain `import` / `from … import` line | **Dropped.** |
 | Inside a definition | Mapped to that definition and expanded next round. |
@@ -176,6 +203,21 @@ commit, over-selection is safe, and the `via` chain shows what happened.
 Because [renames are not paired](changed-symbols.md#added-modified-deleted), a
 moved module walks precisely on the `added` half and coarsely on the `deleted`
 half.
+
+**Registered symbols** — `@app.command()`, `@router.get(...)` — have no
+callers a type checker can see: the framework holds the only handle. When such
+a symbol dead-ends, the walk follows the decorator to its *registrar*, the
+first dotted segment (`app`), and treats what references the registrar as
+reaching the symbol
+([ADR 0012](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0012-a-decorator-is-a-reference.md)).
+The registrar is looked up where the decorated symbol's own module binds it —
+an assignment or an import — and its references are queried at that position,
+so the `app` the tests drive is the one that answers and an unrelated `app` in
+another module does not
+([ADR 0018](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0018-a-registrar-is-resolved-by-position.md)).
+Only a name the module does not bind falls back to a word-boundary scan of the
+workspace. A registrar with no reference beyond its own decorator lines has no
+visible driver, and the verdict is `run_all` with `decorator_dispatch`.
 
 ## Budgets
 

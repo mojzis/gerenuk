@@ -182,7 +182,7 @@ a symbol.
 `gerenuk audit` asks `ty`'s type checker instead, through `tyf`. References
 resolve the way Python resolves them — docstrings, comments and same-named
 symbols in other modules do not count — and each one comes back as a file and a
-line you can open. That costs one `tyf refs` call per symbol and needs `tyf`
+line you can open. That costs one `tyf refs` call per file and needs `tyf`
 installed, which is why it takes the files you name rather than a whole
 repository. It is shaped for confirming a specific suspicion.
 

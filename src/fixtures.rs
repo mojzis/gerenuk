@@ -18,7 +18,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use crate::pysource::{Kind, Literal, Module, SymbolSpan};
+use crate::pysource::{suffix_matches, Kind, Literal, Module, SymbolSpan};
 
 /// The file name pytest gives directory-scoped fixtures.
 pub const CONFTEST: &str = "conftest.py";
@@ -26,6 +26,17 @@ pub const CONFTEST: &str = "conftest.py";
 /// Decorator suffix that marks a fixture: matches `fixture` and
 /// `pytest.fixture` alike, and deliberately not `pytest.mark.usefixtures`.
 const FIXTURE_DECORATOR: &str = "fixture";
+
+/// Whether a decorator's dotted name marks a fixture: `pytest.fixture`,
+/// `fixture`, `pytest_asyncio.fixture`.
+///
+/// The one fixture test the closure applies: a fixture in a test file is
+/// injected by name, so it is an answer rather than a step, and the walk must
+/// never try to expand it.
+#[must_use]
+pub fn is_fixture_decorator(name: &str) -> bool {
+    suffix_matches(name, FIXTURE_DECORATOR)
+}
 
 /// Decorator suffix that names fixtures a test needs without taking them as
 /// parameters.

@@ -1,6 +1,7 @@
 # 0012 — A registering decorator is a reference to what it decorates
 
-**Status:** accepted
+**Status:** accepted, amended by [0018](0018-a-registrar-is-resolved-by-position.md):
+the registrar is resolved by position first, and the word scan is the fallback.
 
 ## Decision
 

@@ -407,6 +407,90 @@ fn a_non_python_change_answers_before_tyf_or_pytest_is_looked_for() {
 }
 
 #[test]
+fn a_suite_declared_faster_than_a_selection_skips_the_walk_before_tyf_is_looked_for() {
+    let fixture = Fixture::new(0);
+    fixture
+        .repo
+        .write("pyproject.toml", "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 800\n");
+    fixture.repo.commit("declare the suite");
+    touch_target(&fixture.repo);
+
+    let output = fixture
+        .without_tools()
+        .args(["--format", "json", "run", "--dry-run"])
+        .output()
+        .expect("gerenuk should run");
+
+    assert!(output.status.success(), "run_all is an answer: {output:?}");
+    let report: Value =
+        serde_json::from_slice(&output.stdout).expect("the dry run should print JSON");
+    assert_eq!(report["decision"], "run_all");
+    assert_eq!(
+        report["reason"], "fast_suite",
+        "settled from the diff alone, with no ty installed: {report}"
+    );
+    assert_eq!(report["argv"], serde_json::json!([]), "no pytest either, so no argv: {report}");
+}
+
+#[test]
+fn a_fast_suite_still_runs_only_the_changed_test_files_when_nothing_needs_walking() {
+    // The declared duration is not a switch: a diff that seeds no walk answers
+    // for free, and that answer beats the full suite.
+    let fixture = Fixture::new(0);
+    fixture
+        .repo
+        .write("pyproject.toml", "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 800\n");
+    fixture.repo.commit("declare the suite");
+    fixture
+        .repo
+        .write("tests/test_core.py", &format!("{TEST_CORE}\n\ndef test_more():\n    pass\n"));
+
+    let output = fixture.run(&["--dry-run", "--format", "json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+
+    assert_eq!(report["decision"], "selected", "{report}");
+    assert_eq!(report["node_ids"][0]["node_id"], "tests/test_core.py", "{report}");
+    assert_eq!(report["node_ids"].as_array().map(Vec::len), Some(1), "{report}");
+}
+
+#[test]
+fn a_fast_suite_slower_than_a_selection_is_walked_as_usual() {
+    let fixture = Fixture::new(0);
+    fixture.repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 30000\n",
+    );
+    fixture.repo.commit("declare the suite");
+    touch_target(&fixture.repo);
+
+    let output = fixture.run(&["--dry-run", "--format", "json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+
+    assert_eq!(report["decision"], "selected", "a slow suite is worth selecting for: {report}");
+}
+
+#[test]
+fn a_fast_suite_delegates_to_the_fallback_like_any_run_all() {
+    let fixture = Fixture::new(0);
+    fixture.repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 1\nfallback-command = [\"scripts/pick.sh\"]\n",
+    );
+    fixture.repo.commit("declare the suite");
+    touch_target(&fixture.repo);
+
+    let output = fixture.run(&["--dry-run", "--format", "json"]);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+
+    assert_eq!(report["fallback"]["reason"], "fast_suite", "{report}");
+    assert_eq!(
+        report["fallback"]["payload"]["report"]["changed_symbols"][0]["symbol"],
+        "mypkg.core:target",
+        "the fallback still gets the diff it can narrow on: {report}"
+    );
+}
+
+#[test]
 fn the_configured_pytest_command_is_used_when_no_override_is_set() {
     let fixture = Fixture::new(0);
     touch_target(&fixture.repo);

@@ -24,3 +24,7 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0013](0013-a-renaming-import-is-followed.md) | A renaming import is followed; a plain one is still dropped | accepted |
 | [0014](0014-run-all-delegates-to-a-fallback.md) | `run_all` delegates to a configured fallback, through the exec seam | accepted |
 | [0015](0015-the-guide-is-the-docs.md) | `gerenuk guide` ships the docs pages and reads one file to pick one | accepted |
+| [0016](0016-a-framework-hook-on-a-subclass-is-a-reference.md) | A framework hook overridden on a subclass is a reference | accepted |
+| [0017](0017-a-test-helper-is-a-step.md) | A helper in a test file is a step, not an answer | accepted |
+| [0018](0018-a-registrar-is-resolved-by-position.md) | A registrar is resolved by position before it is scanned by name | accepted, amends 0012 |
+| [0019](0019-a-declared-suite-time-skips-the-walk.md) | A declared suite time skips the walk | accepted |

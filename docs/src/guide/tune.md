@@ -25,17 +25,23 @@ built-in default.
 ```toml
 [tool.gerenuk]
 max-depth = 20
+suite-ms = 800
 ignore-decorators = ["transformation", "celery.task"]
-pytest-command = ["uv", "run", "pytest"]
+pytest-command = ["uv", "run", "pytest", "-o", "addopts="]
 fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
 ```
 
+- `suite-ms`: how long the whole suite takes, from pytest's summary line. A
+  selection costs 1.5-2 s of `tyf` round-trips, so a suite declared at
+  2000 ms or under makes `run` skip the walk and say `run_all` (`fast_suite`)
+  whenever the diff would have needed one. `impacted-tests` ignores it.
 - `ignore-decorators`: dotted names, suffix-matched syntactically, of
   decorators that register a function with a runner. A changed symbol
   carrying one is reported as ignored instead of walked; import aliases are
   not resolved.
 - `pytest-command`: an argv, never a string, because the common value has
   arguments. Empty means `pytest` on `PATH`; `GERENUK_PYTEST` beats both.
+  `-o addopts=` drops a coverage-carrying `addopts` for the hook run only.
 - `fallback-command`: what `run` execs instead of the whole suite on
   `run_all`. It receives the reason in `GERENUK_FALLBACK_REASON` and the
   `changed-symbols` report as JSON on stdin, and its exit code becomes the
@@ -47,14 +53,8 @@ executable and skip the `PATH` lookup. `tyf` is looked for only once a walk
 is actually needed, so `changed-symbols` and a `run_all` settled by the diff
 alone work in a checkout with no `ty` at all.
 
-**Reading a walk.** `gerenuk changed-symbols` is the first stage on its own:
-the symbols the diff changed, from `git` alone. `gerenuk impacted-tests`
-adds the walk, with `--changed <FILE>` to replay a saved first stage.
-`--format json` on either is the schema the next stage reads.
-
-**Audit.** `gerenuk audit src/app.py` reads the same reference graph
-backwards for the files you name: symbols nothing references, and symbols
-only tests reach. Exit `1` on findings. It is a verifier for a candidate
-something else flagged, not a sweep.
+**Audit.** `gerenuk audit src/app.py` reads the same graph backwards for the
+files you name: symbols nothing references, and symbols only tests reach.
+Exit `1` on findings. A verifier for a candidate something else flagged.
 
 next: run `gerenuk run --dry-run`

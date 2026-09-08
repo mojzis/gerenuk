@@ -22,7 +22,7 @@ a symbol.
 
 `gerenuk audit` asks `ty`'s type checker instead, through `tyf`. References
 resolve the way Python resolves them, and each one comes back as a file and a
-line. That costs one `tyf refs` call per symbol and needs `tyf` installed, which
+line. That costs one `tyf refs` call per file and needs `tyf` installed, which
 is why `audit` takes the files you name rather than a repository — it is shaped
 for confirming a specific suspicion, not for finding one.
 
@@ -83,7 +83,7 @@ directory, or its name matches `test_*.py` / `*_test.py`.
 
 ## What gets audited
 
-Only **callable** symbols — functions and methods. Within those, three groups
+Only **callable** symbols — functions and methods. Within those, four groups
 are skipped deliberately:
 
 - names starting with `_`, including dunder methods: private by convention, or
@@ -98,7 +98,15 @@ are skipped deliberately:
   warnings to 5 while keeping both genuine ones. Decorators that merely wrap
   (`@property`, `@staticmethod`, `@functools.wraps`) do not count, and those
   functions are still audited. See
-  [ADR 0012](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0012-a-decorator-is-a-reference.md).
+  [ADR 0012](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0012-a-decorator-is-a-reference.md);
+- methods a **framework calls on a subclass** — `filter` on a
+  `logging.Filter`, `run` on a `Thread`, `setUp` on a `TestCase`, `get` on a
+  view, `visit_*` on a `NodeVisitor`, `on_*` handlers. The base class is the
+  reference, and it lives outside the workspace where `tyf` cannot see the
+  call. Both halves are required: the class must declare a base other than
+  `object`, and the name must be one of the known hooks — `filter` on a plain
+  class and `helper` on a `logging.Filter` are both still audited. See
+  [ADR 0016](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0016-a-framework-hook-on-a-subclass-is-a-reference.md).
 
 The `N symbol(s) checked` count in the summary reports every symbol in the
 outline, including the skipped ones, so you can see how much of the file the
@@ -139,6 +147,7 @@ would call every file a test.
 
 ## Cost
 
-`audit` runs one `tyf list` per file plus one `tyf refs` per auditable symbol.
-On a large module that is a lot of LSP round-trips — pass the files you care
-about rather than the whole package.
+`audit` runs one `tyf list` per file plus one `tyf refs` per file, batching
+every auditable symbol's position into it. The batch still resolves each
+symbol inside `ty`, so a large module is still a lot of work — pass the files
+you care about rather than the whole package.

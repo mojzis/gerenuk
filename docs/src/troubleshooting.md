@@ -45,8 +45,9 @@ uv add --dev ty
 
 ## The audit is slow
 
-`audit` makes one `tyf refs` call per auditable symbol. A module with fifty
-public functions means fifty LSP round-trips. Narrow the input:
+`audit` makes one batched `tyf refs` call per file, but `ty` still resolves
+every auditable symbol in it. A module with fifty public functions is fifty
+lookups. Narrow the input:
 
 ```sh
 gerenuk audit pkg/the_one_file.py     # not pkg/*.py

@@ -269,6 +269,162 @@ fn a_deleted_symbol_is_chased_through_a_textual_scan() {
 }
 
 #[test]
+fn a_declared_suite_duration_does_not_short_circuit_an_inventory() {
+    // `suite-ms` is `run`'s economics; what could break is the same question
+    // however fast the suite is.
+    let tmp = TempDir::new().expect("temp dir");
+    let tyf = fake_tyf(&tmp, "[]", &refs_fixtures());
+    let repo = graph_repo();
+    repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 1\nignore-decorators = [\"registry.transformation\"]\n",
+    );
+    repo.commit("declare the suite");
+    touch_target(&repo);
+
+    let report = impacted(&repo, &tyf, &[]);
+
+    assert_eq!(report["verdict"], "selected", "{report}");
+    assert_eq!(report["impacted_tests"].as_array().map(Vec::len), Some(3), "{report}");
+}
+
+/// A test class with a helper method its tests call: `check` is neither
+/// collected, injected nor called by name, so the walk steps through it.
+const HELPER_TEST: &str = r"from mypkg.core import target
+
+
+class TestTarget:
+    def check(self, value):
+        return target(value) == value + 1
+
+    def test_one(self):
+        assert self.check(1)
+
+    def test_two(self):
+        assert self.check(2)
+";
+
+#[test]
+fn a_helper_in_a_test_file_is_stepped_through_to_the_tests_that_call_it() {
+    let tmp = TempDir::new().expect("temp dir");
+    let tyf = fake_tyf(
+        &tmp,
+        "[]",
+        &[
+            (
+                "src/mypkg/core.py:1:5",
+                r#"{"symbol": "target", "reference_count": 1, "references": [
+                      {"file": "src/mypkg/core.py", "line": 1, "column": 5, "context": "target"}
+                    ], "test_reference_count": 1, "test_references": [
+                      {"file": "tests/test_target.py", "line": 6, "column": 16, "context": "check"}
+                    ]}"#,
+            ),
+            (
+                "tests/test_target.py:5:9",
+                r#"{"symbol": "check", "reference_count": 0, "references": [],
+                    "test_reference_count": 3, "test_references": [
+                      {"file": "tests/test_target.py", "line": 5, "column": 9, "context": "check"},
+                      {"file": "tests/test_target.py", "line": 9, "column": 21, "context": "test_one"},
+                      {"file": "tests/test_target.py", "line": 12, "column": 21, "context": "test_two"}
+                    ]}"#,
+            ),
+        ],
+    );
+    let repo = TestRepo::new();
+    repo.write("pyproject.toml", "[project]\nname = \"mypkg\"\n");
+    repo.write("src/mypkg/__init__.py", "");
+    repo.write("src/mypkg/core.py", "def target(value):\n    return value + 1\n");
+    repo.write("tests/test_target.py", HELPER_TEST);
+    repo.commit("base");
+    repo.write("src/mypkg/core.py", "def target(value):\n    return value + 2\n");
+
+    let report = impacted(&repo, &tyf, &[]);
+
+    assert_eq!(
+        selected(&report),
+        vec![
+            (
+                "tests/test_target.py".to_string(),
+                Some("tests.test_target:TestTarget.test_one".to_string()),
+                vec!["tests.test_target:TestTarget.check".to_string()],
+                "mypkg.core:target".to_string(),
+            ),
+            (
+                "tests/test_target.py".to_string(),
+                Some("tests.test_target:TestTarget.test_two".to_string()),
+                vec!["tests.test_target:TestTarget.check".to_string()],
+                "mypkg.core:target".to_string(),
+            ),
+        ],
+        "the tests, through the helper, and never the helper as a test: {report}"
+    );
+    assert_eq!(report["stats"]["tyf_calls"], 2, "one level for the seed, one for the helper");
+}
+
+#[test]
+fn a_registrar_is_resolved_by_position_so_an_unrelated_name_stays_out() {
+    // Two `app`s: the Typer one `show` is registered on, and a FastAPI one in
+    // another module. A word scan for `app` selects both modules' tests; a
+    // reference query at the Typer binding selects only its own.
+    let tmp = TempDir::new().expect("temp dir");
+    let tyf = fake_tyf(
+        &tmp,
+        "[]",
+        &[
+            (
+                "src/mypkg/cli.py:7:5",
+                r#"{"symbol": "show", "reference_count": 1, "references": [
+                      {"file": "src/mypkg/cli.py", "line": 7, "column": 5, "context": "show"}
+                    ], "test_reference_count": 0, "test_references": []}"#,
+            ),
+            (
+                "src/mypkg/cli.py:3:1",
+                r#"{"symbol": "app", "reference_count": 2, "references": [
+                      {"file": "src/mypkg/cli.py", "line": 3, "column": 1, "context": "app"},
+                      {"file": "src/mypkg/cli.py", "line": 6, "column": 2, "context": "show"}
+                    ], "test_reference_count": 1, "test_references": [
+                      {"file": "tests/test_cli.py", "line": 5, "column": 12, "context": "test_show"}
+                    ]}"#,
+            ),
+        ],
+    );
+    let repo = TestRepo::new();
+    repo.write("pyproject.toml", "[project]\nname = \"mypkg\"\n");
+    repo.write("src/mypkg/__init__.py", "");
+    repo.write(
+        "src/mypkg/cli.py",
+        "import typer\n\napp = typer.Typer()\n\n\n@app.command()\ndef show():\n    return 1\n",
+    );
+    repo.write(
+        "src/mypkg/web.py",
+        "from fastapi import FastAPI\n\napp = FastAPI()\napp.include_router(None)\n",
+    );
+    repo.write(
+        "tests/test_cli.py",
+        "from mypkg.cli import app\n\n\ndef test_show():\n    assert app is not None\n",
+    );
+    repo.write(
+        "tests/test_web.py",
+        "from mypkg.web import app\n\n\ndef test_web():\n    assert app is not None\n",
+    );
+    repo.commit("base");
+    repo.write(
+        "src/mypkg/cli.py",
+        "import typer\n\napp = typer.Typer()\n\n\n@app.command()\ndef show():\n    return 2\n",
+    );
+
+    let report = impacted(&repo, &tyf, &[]);
+
+    assert_eq!(report["verdict"], "selected", "{report}");
+    assert_eq!(
+        selected(&report).into_iter().map(|(file, ..)| file).collect::<Vec<_>>(),
+        vec!["tests/test_cli.py"],
+        "the FastAPI `app` is a different object: {report}"
+    );
+    assert_eq!(report["stats"]["tyf_calls"], 2, "the seed level and one registrar query");
+}
+
+#[test]
 fn a_changed_test_file_is_passed_through_from_phase_one() {
     let tmp = TempDir::new().expect("temp dir");
     let tyf = fake_tyf(&tmp, "[]", &refs_fixtures());

@@ -31,6 +31,7 @@ pub mod fallback;
 pub mod fixtures;
 pub mod git;
 pub mod guide;
+pub mod hooks;
 pub mod impact;
 pub mod model;
 pub mod modpath;

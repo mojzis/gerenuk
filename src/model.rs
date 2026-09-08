@@ -169,12 +169,6 @@ impl DocumentSymbol {
             Some(node)
         })
     }
-
-    /// Dotted name of a child relative to this symbol, e.g. `Calculator.add`.
-    #[must_use]
-    pub fn qualified_child(&self, child: &Self) -> String {
-        format!("{}.{}", self.name, child.name)
-    }
 }
 
 /// Depth-first walk over a whole outline.
@@ -309,6 +303,5 @@ mod tests {
             vec!["Calculator", "add", "sub"],
             "walk should be parent-first, source-ordered"
         );
-        assert_eq!(outline[0].qualified_child(&outline[0].children[0]), "Calculator.add");
     }
 }

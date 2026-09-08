@@ -90,6 +90,15 @@ argv
 
 One argv element per line, deliberately: it is for reading, not for `$(…)`.
 
+When the argv is coarser than the report — a `conftest.py` reached by the walk
+expanded to its subtree, say, and the per-test node ids inside those files
+folded away — the dry run says so, because a reader who counted node ids in
+`impacted-tests` would otherwise take the collapse for a bug:
+
+```
+3 per-test node id(s) folded into 3 whole file(s): a file selected wholesale supersedes the node ids inside it
+```
+
 When the outcome is `run_all` and a [fallback command](#the-fallback-command)
 is configured, the dry run says so instead, and the argv is the fallback's:
 
@@ -179,11 +188,13 @@ is mostly mechanical and entirely about pytest's collection rules.
 
 ### The collectibility gate
 
-The walk records the *enclosing* symbol of a reference, which is frequently a
-helper or a fixture rather than a test. Handing pytest a non-collectible node id
-is a usage error (exit `4`) that fails the entire run, so each qualified name is
-checked segment by segment against pytest's defaults — `test*` functions,
-`Test*` classes with no `__init__`:
+The walk records the *enclosing* symbol of a reference. A plain helper is
+[stepped through](impacted-tests.md#how-the-walk-works) to the tests that call
+it, but what arrives here can still be a fixture, a `setup_method`, a helper
+nothing visible calls, or a `test_*` on a class pytest does not collect.
+Handing pytest a non-collectible node id is a usage error (exit `4`) that fails
+the entire run, so each qualified name is checked segment by segment against
+pytest's defaults — `test*` functions, `Test*` classes with no `__init__`:
 
 | The symbol is | Node id |
 |---|---|
@@ -274,6 +285,29 @@ After mapping and expansion, whole-file entries supersede their own per-test
 node ids — the same collapse [the closure
 applies](impacted-tests.md#reading-the-identifiers), re-run because expansion
 can introduce new whole-file entries. Superseded ids appear under `dropped`.
+
+## Fast suites
+
+A selection costs a few `tyf` round-trips before pytest starts — three to
+eight calls, 1.5–2 s warm on a typical repository. On a suite that finishes in
+one second, the selected run is slower than the full one. A repository can say
+so:
+
+```toml
+[tool.gerenuk]
+suite-ms = 800
+```
+
+`suite-ms` is how long the whole suite takes, from pytest's own summary line.
+When it is at or under the built-in selection cost (2000 ms) and the diff would
+have needed a walk, `run` skips the walk and says `run_all` with reason
+`fast_suite` — before `tyf` is looked for, so it also works in a checkout with
+no `ty`. A diff that seeds no walk — changed test files only — is not affected:
+the empty walk is free, and its answer (the changed files, or nothing) beats
+the full suite. `impacted-tests` ignores the key: an inventory has no
+economics. A configured [fallback command](#the-fallback-command) receives
+`fast_suite` like any other `run_all`. See [ADR
+0019](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0019-a-declared-suite-time-skips-the-walk.md).
 
 ## Finding pytest
 
@@ -385,6 +419,7 @@ anything. On its **stdin** it finds a JSON payload:
 | `max_symbols` | more than `max-symbols` symbols were visited |
 | `budget` | the wall-clock budget ran out |
 | `decorator_dispatch` | a changed symbol is dispatched by a decorator whose registrar could not be resolved |
+| `fast_suite` | the repository declared a suite (`suite-ms`) faster than a selection costs, so no walk was attempted |
 | `unspecified` | a replayed report said `run_all` with no `reason` |
 
 New variants may be added; existing names are never renamed within a payload

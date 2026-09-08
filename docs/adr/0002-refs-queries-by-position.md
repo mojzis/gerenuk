@@ -5,7 +5,10 @@
 ## Decision
 
 The closure asks `tyf refs <file>:<line>:<col>`, using the definition's *name*
-position — not `tyf refs <QualName>`, which is what `audit` uses.
+position — not `tyf refs <QualName>`. `audit` queried by name at first, and
+reported every closure called only inside its enclosing function as dead: for
+`outer.helper` the name form answers "no results", not an error. It now sends
+the same positions, one batched call per file.
 
 ## Why
 
