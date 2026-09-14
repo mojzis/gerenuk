@@ -10,6 +10,10 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
   "dropped": [],
   "expanded": [],
   "fallback": null,
+  "git_env": {
+    "policy": "isolate",
+    "removed": []
+  },
   "node_ids": [],
   "reason": "non_python_changes",
   "verdict": "run_all"

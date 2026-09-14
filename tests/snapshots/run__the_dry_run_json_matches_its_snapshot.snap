@@ -20,6 +20,10 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
     }
   ],
   "fallback": null,
+  "git_env": {
+    "policy": "isolate",
+    "removed": []
+  },
   "node_ids": [
     {
       "node_id": "tests/test_core.py::test_target",

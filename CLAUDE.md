@@ -86,6 +86,18 @@ When a test fails during implementation:
   an argv is a `pytest::Handoff` — stdin bytes and environment variables for
   the child — and the bytes go into an unlinked temp file that becomes fd 0,
   never a pipe, so a child that ignores its stdin cannot block (ADR 0014).
+- **pytest does not inherit the hook's git environment; the fallback does.**
+  `pytest::LOCAL_GIT_ENV` is git's own `rev-parse --local-env-vars` list, and
+  `GitEnv::Isolate` (the default; `git-env` / `--git-env`) puts the set ones
+  into `Handoff::remove`. Only pytest's handoff removes anything: the fallback
+  is the repository's own script and may need the hook's index (ADR 0020).
+  `removals` takes `is_set` as an argument so it stays pure; `tests/run.rs`
+  checks the list against the installed git, injects the variables to see
+  what each child gets, and commits through a real pre-commit hook in a plain
+  checkout and a linked worktree. The `run` fixture strips the list from
+  gerenuk's own environment, because the sandbox this is developed in
+  exports `GIT_CONFIG_COUNT` and the dry-run snapshots would otherwise depend
+  on the machine.
 - **The fallback command is exec'd through that seam and nowhere else, and
   only for `Decision::RunAll`.** `fallback.rs` is pure: resolution across
   `--fallback-command` → `GERENUK_FALLBACK` → `fallback-command` → default,

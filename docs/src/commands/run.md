@@ -5,7 +5,7 @@ Run pytest on exactly the tests the working tree's changes impact.
 ```
 gerenuk run [--base <REF> | --impact <FILE>]
             [--max-depth <N>] [--max-symbols <N>] [--budget-ms <MS>]
-            [--fallback-command <JSON_ARRAY>]
+            [--fallback-command <JSON_ARRAY>] [--git-env <POLICY>]
             [--dry-run] [-- <pytest args>…]
 ```
 
@@ -69,6 +69,7 @@ Prints the decision and the exact argv, and spawns nothing:
 $ gerenuk run --dry-run
 decision: selected
 gerenuk: 5 node id(s) from 1 origin(s) in 152 ms — details: gerenuk impacted-tests
+git env: isolate — no repository-local git variable is set
 
 tests/test_api.py
   ← sample_pkg.cli ← sample_pkg.cli:main ← sample_pkg.service:describe
@@ -89,6 +90,8 @@ argv
 ```
 
 One argv element per line, deliberately: it is for reading, not for `$(…)`.
+The `git env` line says what pytest would not inherit of [git's
+environment](#the-git-environment); from inside a hook it names the variables.
 
 When the argv is coarser than the report — a `conftest.py` reached by the walk
 expanded to its subtree, say, and the per-test node ids inside those files
@@ -105,6 +108,7 @@ is configured, the dry run says so instead, and the argv is the fallback's:
 ```
 decision: run_all
 gerenuk: full suite — non-Python files changed
+git env: inherit
 
 would exec fallback: ["/home/you/proj/scripts/pick-subprojects.sh","--from-gerenuk"] (reason: non_python_changes)
   from: fallback-command in pyproject.toml
@@ -116,7 +120,8 @@ argv
 
 `--format json` emits the selection as one object — the verdict and reason
 carried through from the impact report, plus `node_ids`, `expanded`, `dropped`,
-the assembled `argv`, and `fallback`:
+the assembled `argv`, `fallback`, and `git_env` (the policy, and the variables
+it would remove):
 
 ```json
 {
@@ -331,6 +336,52 @@ from running `pytest` yourself in a subdirectory.
 Everything after `--` is appended to the argv verbatim — `-x`, `-k`, `-n auto`,
 whatever. gerenuk has no opinion about ordering, parallelism or `--failed-first`.
 
+## The git environment
+
+A pre-commit hook runs with git's **repository-local variables** exported —
+`GIT_DIR`, `GIT_INDEX_FILE`, `GIT_WORK_TREE`, `GIT_PREFIX` and the rest of
+`git rev-parse --local-env-vars` — so that every git the hook spawns targets
+the repository being committed. On a partial commit `GIT_INDEX_FILE` is a
+temporary index; in a linked worktree `GIT_DIR` is an absolute path into the
+main repository. A test that creates a repository of its own under `tmp_path`
+and inherits them does not get its own repository: its `git init`, `git
+config`, `git add` and `git commit` land in the one being committed.
+
+So by default pytest does not inherit them. gerenuk takes its own diff first,
+in the hook's context — that is the index it has to read — and then execs
+pytest with those variables removed. Everything else in the environment is
+handed on untouched: `PATH`, the virtualenv, pytest's own configuration, and
+git variables that are not repository-local, such as `GIT_AUTHOR_NAME` or
+`GIT_CONFIG_GLOBAL`.
+
+```toml
+[tool.gerenuk]
+git-env = "isolate"   # the default; "inherit" hands them on
+```
+
+`--git-env <POLICY>` beats the key, for a one-off:
+
+```sh
+gerenuk run --git-env inherit -- -q
+```
+
+`--dry-run` states the policy and, from inside a hook, names the variables it
+would remove. Three things it is not:
+
+- **Not the fallback's.** The [fallback command](#the-fallback-command)
+  inherits everything, whatever `git-env` says. It is the repository's own
+  script, run from the hook it was configured for, and it may need the very
+  index git handed that hook. A fallback that runs pytest clears them itself.
+- **Not gerenuk's.** `changed-symbols` and the walk run before the exec, with
+  the hook's context intact; a partial commit's temporary index is exactly
+  what they should be reading.
+- **Not a sandbox.** A test that reads `GIT_DIR` from its own environment and
+  passes it on, or finds the outer repository by walking up from its cwd,
+  still reaches it. Helpers that deliberately target another repository
+  should sanitise their own subprocess environment; this is a safeguard on
+  top. See [ADR
+  0020](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0020-pytest-does-not-inherit-the-hooks-git.md).
+
 ## The fallback command
 
 A `run_all` outcome means gerenuk could not bound the impact of the change. By
@@ -375,9 +426,10 @@ is not pytest, and gerenuk does not know what its arguments mean.
 
 ### What it receives
 
-The fallback inherits gerenuk's environment, plus one variable,
-`GERENUK_FALLBACK_REASON=<reason>`, so a shell script can branch without parsing
-anything. On its **stdin** it finds a JSON payload:
+The fallback inherits gerenuk's environment — all of it, including the
+repository-local git variables [pytest does not get](#the-git-environment) —
+plus one variable, `GERENUK_FALLBACK_REASON=<reason>`, so a shell script can
+branch without parsing anything. On its **stdin** it finds a JSON payload:
 
 ```json
 {

@@ -58,10 +58,16 @@ summary around it are ordinary pure functions.
 
 The same seam execs the configured **fallback command** when the outcome is
 `run_all` ([ADR 0014](../adr/0014-run-all-delegates-to-a-fallback.md)). It
-takes a `pytest::Handoff` — bytes for the child's stdin, variables for its
-environment — and pytest gets an empty one. The bytes go into an unlinked
+takes a `pytest::Handoff` — bytes for the child's stdin, variables added to
+its environment, variables removed from it. The bytes go into an unlinked
 temporary file that becomes fd 0 rather than a pipe, so a child that never
-reads them cannot block. `fallback.rs` resolves the command from its three
+reads them cannot block. pytest's handoff adds nothing and, by default,
+removes git's repository-local variables — `GIT_DIR`, `GIT_INDEX_FILE` and the
+rest of `pytest::LOCAL_GIT_ENV` — which a hook exports and which would
+otherwise turn a test's `git -C tmp` into a write to the repository being
+committed ([ADR 0020](../adr/0020-pytest-does-not-inherit-the-hooks-git.md)).
+`git-env = "inherit"` keeps them. The fallback's handoff removes nothing: it is
+the repository's own script and may need that index. `fallback.rs` resolves the command from its three
 sources, decides where its program lives (repo-relative against the root,
 never the cwd) and builds the versioned payload; all of it is pure, and the
 exec is the one line in `cli.rs` that calls the seam.

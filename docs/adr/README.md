@@ -28,3 +28,4 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0017](0017-a-test-helper-is-a-step.md) | A helper in a test file is a step, not an answer | accepted |
 | [0018](0018-a-registrar-is-resolved-by-position.md) | A registrar is resolved by position before it is scanned by name | accepted, amends 0012 |
 | [0019](0019-a-declared-suite-time-skips-the-walk.md) | A declared suite time skips the walk | accepted |
+| [0020](0020-pytest-does-not-inherit-the-hooks-git.md) | pytest does not inherit the hook's git environment | accepted, amends 0011 and 0014 |

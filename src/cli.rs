@@ -194,6 +194,15 @@ pub enum Command {
         #[arg(long, value_name = "JSON_ARRAY")]
         fallback_command: Option<String>,
 
+        /// Whether pytest inherits git's repository-local environment
+        /// (`GIT_DIR`, `GIT_INDEX_FILE`, …), which a hook exports so every
+        /// git it spawns targets the repository being committed. `isolate`
+        /// removes them, so a test that creates a repository of its own does
+        /// not operate on that one; `inherit` hands them on. Beats `git-env`
+        /// in pyproject.toml. The fallback command always inherits.
+        #[arg(long, value_enum, value_name = "POLICY")]
+        git_env: Option<pytest::GitEnv>,
+
         /// Everything after `--`, appended to the pytest argv verbatim.
         #[arg(last = true, value_name = "PYTEST_ARGS", allow_hyphen_values = true)]
         pytest_args: Vec<OsString>,
@@ -291,21 +300,28 @@ impl Cli {
                 Ok(Outcome::Clean)
             }
             Command::Guide { .. } => unreachable!("handled before the workspace is resolved"),
-            Command::Run { base, impact, budgets, dry_run, fallback_command, pytest_args } => {
-                run_pytest(
-                    out,
-                    &root,
-                    &RunOptions {
-                        base: base.as_deref(),
-                        impact: impact.as_deref(),
-                        budgets: Budgets::from(&budgets),
-                        dry_run,
-                        format: self.format,
-                        fallback_command: fallback_command.as_deref(),
-                        pytest_args: &pytest_args,
-                    },
-                )
-            }
+            Command::Run {
+                base,
+                impact,
+                budgets,
+                dry_run,
+                fallback_command,
+                git_env,
+                pytest_args,
+            } => run_pytest(
+                out,
+                &root,
+                &RunOptions {
+                    base: base.as_deref(),
+                    impact: impact.as_deref(),
+                    budgets: Budgets::from(&budgets),
+                    dry_run,
+                    format: self.format,
+                    fallback_command: fallback_command.as_deref(),
+                    git_env,
+                    pytest_args: &pytest_args,
+                },
+            ),
         }
     }
 }
@@ -497,6 +513,8 @@ struct RunOptions<'a> {
     format: Format,
     /// `--fallback-command`, still as the JSON text it was given.
     fallback_command: Option<&'a str>,
+    /// `--git-env`; `None` means whatever `pyproject.toml` says.
+    git_env: Option<pytest::GitEnv>,
     pytest_args: &'a [OsString],
 }
 
@@ -557,12 +575,21 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
         Decision::RunAll => fallback.as_ref(),
         Decision::Selected | Decision::Nothing => None,
     };
+    // What pytest loses of the hook's environment. Decided here, after the
+    // diff: gerenuk's own git ran in the hook's context, and only the child
+    // leaves it. The fallback is not subject to it — it inherits everything.
+    let git_env = options.git_env.unwrap_or(repo.config.git_env);
+    let git_env_plan = if delegated.is_some() {
+        pytest::GitEnvPlan::inherited()
+    } else {
+        pytest::GitEnvPlan::new(git_env, is_env_set)
+    };
 
     if options.dry_run {
         let plan = delegated.map(|fallback| {
             fallback::Plan::new(fallback, Payload::new(selection.reason, changed.as_ref()))
         });
-        return dry_run(out, &repo, &selection, plan, elapsed, options);
+        return dry_run(out, &repo, &selection, plan, git_env_plan, elapsed, options);
     }
 
     // Said before the exec, because after it there is no gerenuk to say it.
@@ -586,7 +613,14 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
     let argv = runner.argv(&selection, options.pytest_args);
     // Nothing of ours may still be buffered: the next call replaces us.
     out.flush().context("could not flush gerenuk's own output before running pytest")?;
-    runner.exec(&argv, pytest::Handoff::default()).map(Outcome::Code)
+    runner.exec(&argv, pytest::Handoff::for_pytest(&git_env_plan.removed)).map(Outcome::Code)
+}
+
+/// Whether `name` is set in gerenuk's own environment, read here rather than
+/// inside [`pytest::GitEnv::removals`] for the same reason as
+/// [`pytest_override`]: the rule stays a pure function of its arguments.
+fn is_env_set(name: &str) -> bool {
+    std::env::var_os(name).is_some()
 }
 
 /// Become the fallback command, through the same seam pytest goes through.
@@ -629,6 +663,7 @@ fn dry_run(
     repo: &Repo,
     selection: &Selection,
     plan: Option<fallback::Plan<'_>>,
+    git_env: pytest::GitEnvPlan,
     elapsed_ms: u128,
     options: &RunOptions,
 ) -> Result<Outcome> {
@@ -649,7 +684,7 @@ fn dry_run(
         }
     };
 
-    let report = pytest::DryRun { selection, argv, elapsed_ms, fallback: plan };
+    let report = pytest::DryRun { selection, argv, elapsed_ms, fallback: plan, git_env };
     match options.format {
         Format::Human => write!(out, "{}", report.render_human())?,
         Format::Json => write!(out, "{}", report.render_json()?)?,
