@@ -15,6 +15,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 use crate::pysource::suffix_matches;
+use crate::pytest::GitEnv;
 
 /// Everything gerenuk reads out of `pyproject.toml`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
@@ -59,6 +60,15 @@ pub struct Config {
     /// [`crate::fallback::resolve`] refuses it, rather than silently meaning
     /// the default.
     pub fallback_command: Option<Vec<String>>,
+
+    /// Whether pytest inherits git's repository-local environment — `GIT_DIR`,
+    /// `GIT_INDEX_FILE` and the rest of what a hook exports.
+    ///
+    /// `isolate` (the default) removes them, so a test that creates a
+    /// repository of its own does not operate on the one being committed.
+    /// `inherit` hands them on. The fallback command is not governed by this
+    /// key: it inherits everything, always. `--git-env` beats it.
+    pub git_env: GitEnv,
 }
 
 /// Wrapper types mirroring `pyproject.toml`'s nesting: `[tool.gerenuk]`.
@@ -193,6 +203,7 @@ pub(crate) mod keys {
                 "budget-ms",
                 "pytest-command",
                 "fallback-command",
+                "git-env",
             ] {
                 assert!(keys.contains(expected), "`{expected}` should be accepted: {keys:?}");
             }
@@ -339,6 +350,33 @@ mod tests {
         let err = Config::load(tmp.path()).expect_err("a shell string is not an argv");
         let message = format!("{err:#}");
         assert!(message.contains("fallback-command"), "names the key, got: {message}");
+    }
+
+    #[test]
+    fn the_git_environment_is_isolated_by_default() {
+        assert_eq!(Config::default().git_env, GitEnv::Isolate, "the safe default needs no key");
+        let tmp = with_pyproject("[tool.gerenuk]\npytest-command = [\"pytest\"]\n");
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(config.git_env, GitEnv::Isolate, "and an unrelated table does not change it");
+    }
+
+    #[test]
+    fn the_git_environment_policy_is_read_in_lowercase() {
+        let tmp = with_pyproject("[tool.gerenuk]\ngit-env = \"inherit\"\n");
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(config.git_env, GitEnv::Inherit);
+        let tmp = with_pyproject("[tool.gerenuk]\ngit-env = \"isolate\"\n");
+        assert_eq!(Config::load(tmp.path()).expect("parses").git_env, GitEnv::Isolate);
+    }
+
+    #[test]
+    fn an_unknown_git_environment_policy_names_the_key_and_the_choices() {
+        let tmp = with_pyproject("[tool.gerenuk]\ngit-env = \"strip\"\n");
+        let err = Config::load(tmp.path()).expect_err("there is no third policy");
+        let message = format!("{err:#}");
+        assert!(message.contains("pyproject.toml"), "names the file, got: {message}");
+        assert!(message.contains("git-env"), "names the key, got: {message}");
+        assert!(message.contains("isolate") && message.contains("inherit"), "got: {message}");
     }
 
     #[test]

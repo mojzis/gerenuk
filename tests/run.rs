@@ -14,11 +14,15 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::cargo::CommandCargoExt;
 use assert_cmd::prelude::*;
-use common::{fake_fallback, fake_pytest, fake_tyf, gerenuk, json_output, recorded_argv, TestRepo};
+use common::{
+    fake_fallback, fake_pytest, fake_tyf, gerenuk, json_output, make_executable, recorded_argv,
+    recorded_env, TestRepo,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -102,9 +106,15 @@ impl Fixture {
         Self { tmp, repo: repo(), tyf, pytest, record }
     }
 
+    /// A `gerenuk` with both stubs wired up, and none of git's repository-local
+    /// variables: what a hook exports is injected by the tests that are about
+    /// it, so the rest do not depend on how this test process was started.
     fn command(&self) -> std::process::Command {
         let mut cmd = gerenuk(self.repo.path(), &self.tyf);
         cmd.env("GERENUK_PYTEST", &self.pytest);
+        for name in gerenuk::pytest::LOCAL_GIT_ENV {
+            cmd.env_remove(name);
+        }
         cmd
     }
 
@@ -868,4 +878,448 @@ fn the_dry_run_json_without_a_fallback_matches_its_snapshot() {
     insta::assert_snapshot!(
         serde_json::to_string_pretty(&report).expect("the report re-serialises")
     );
+}
+
+// --- The git environment ---
+//
+// A pre-commit hook runs with git's repository-local variables exported —
+// `GIT_DIR`, `GIT_INDEX_FILE`, `GIT_PREFIX` and the rest of `git rev-parse
+// --local-env-vars` — so that every git the hook spawns targets the repository
+// being committed. A test that creates a repository of its own and inherits
+// them operates on the outer repository instead. pytest must not inherit them;
+// gerenuk's own diff, and the fallback, must.
+
+/// The variables a hook exports, pointed at the fixture repository itself so
+/// gerenuk's own git calls keep working while the child would see them.
+fn hook_env(fixture: &Fixture) -> Vec<(&'static str, String)> {
+    let git_dir = fixture.repo.path().join(".git");
+    vec![
+        ("GIT_DIR", git_dir.display().to_string()),
+        ("GIT_INDEX_FILE", git_dir.join("index").display().to_string()),
+        ("GIT_WORK_TREE", fixture.repo.path().display().to_string()),
+        // Set but empty, which is how a hook at the root exports it.
+        ("GIT_PREFIX", String::new()),
+    ]
+}
+
+impl Fixture {
+    /// The environment the pytest stub recorded, or `None` when it never ran.
+    fn env(&self) -> Option<BTreeMap<String, String>> {
+        recorded_env(&self.record.with_extension("env"))
+    }
+
+    /// `gerenuk run <extra>` under the environment a hook provides, plus one
+    /// unrelated variable that has to come through untouched.
+    fn run_as_hook(&self, extra: &[&str]) -> std::process::Output {
+        self.command()
+            .envs(hook_env(self))
+            .env("KEEP_ME", "yes")
+            .arg("run")
+            .args(extra)
+            .output()
+            .expect("gerenuk should run")
+    }
+}
+
+impl FallbackStub {
+    fn env(&self) -> Option<BTreeMap<String, String>> {
+        recorded_env(&self.prefix.with_extension("env"))
+    }
+}
+
+#[test]
+fn pytest_does_not_inherit_the_hooks_repository_local_git_variables() {
+    let fixture = Fixture::new(0);
+    touch_target(&fixture.repo);
+
+    let output = fixture.run_as_hook(&[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(
+        fixture.argv().expect("pytest should have been spawned"),
+        vec!["tests/test_core.py::test_target", "tests/test_core.py::test_with_fixture"],
+        "the selection is still computed in the hook's own context"
+    );
+
+    let env = fixture.env().expect("the stub records its environment");
+    for (name, _) in hook_env(&fixture) {
+        assert!(!env.contains_key(name), "`{name}` must not reach pytest: {env:?}");
+    }
+    assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("yes"), "unrelated variables stay");
+    assert!(env.contains_key("PATH"), "and so does PATH: {env:?}");
+}
+
+#[test]
+fn the_git_environment_is_inherited_when_the_config_says_so() {
+    let fixture = Fixture::new(0);
+    fixture.configure("git-env = \"inherit\"\n");
+    touch_target(&fixture.repo);
+
+    let output = fixture.run_as_hook(&[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let env = fixture.env().expect("pytest should have been spawned");
+    for (name, value) in hook_env(&fixture) {
+        assert_eq!(env.get(name), Some(&value), "`{name}` is handed on verbatim: {env:?}");
+    }
+
+    // The flag beats the config, in the direction that matters for a one-off.
+    fixture.run_as_hook(&["--git-env", "isolate"]);
+    let env = fixture.env().expect("pytest should have been spawned");
+    assert!(!env.contains_key("GIT_DIR"), "`--git-env isolate` beats the config: {env:?}");
+}
+
+#[test]
+fn the_git_environment_is_inherited_when_the_flag_says_so() {
+    let fixture = Fixture::new(0);
+    touch_target(&fixture.repo);
+
+    let output = fixture.run_as_hook(&["--git-env", "inherit"]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let env = fixture.env().expect("pytest should have been spawned");
+    assert!(env.contains_key("GIT_INDEX_FILE"), "inherited on request: {env:?}");
+    assert_eq!(env.get("GIT_PREFIX").map(String::as_str), Some(""), "set-but-empty stays set");
+}
+
+#[test]
+fn an_unknown_git_env_policy_is_a_usage_error() {
+    let fixture = Fixture::new(0);
+    fixture
+        .command()
+        .args(["run", "--git-env", "strip"])
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("isolate"))
+        .stderr(predicates::str::contains("inherit"));
+    assert_eq!(fixture.argv(), None, "nothing ran");
+}
+
+#[test]
+fn an_unknown_git_env_policy_in_the_config_names_the_key() {
+    let fixture = Fixture::new(0);
+    fixture.configure("git-env = \"strip\"\n");
+    touch_target(&fixture.repo);
+    fixture
+        .command()
+        .arg("run")
+        .assert()
+        .code(2)
+        .stderr(predicates::str::contains("git-env"))
+        .stderr(predicates::str::contains("pyproject.toml"));
+    assert_eq!(fixture.argv(), None, "nothing ran");
+}
+
+#[test]
+fn the_fallback_inherits_the_hooks_git_variables() {
+    // The fallback is the repository's own script, run from the hook it was
+    // configured for: it may need the very index git handed the hook. It
+    // inherits everything, and the policy for pytest does not apply to it.
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&[]));
+    fixture.touch_non_python();
+
+    let output = fixture.run_as_hook(&[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let env = stub.env().expect("the fallback should have been exec'd");
+    for (name, value) in hook_env(&fixture) {
+        assert_eq!(env.get(name), Some(&value), "`{name}` reaches the fallback: {env:?}");
+    }
+    assert_eq!(env.get("GERENUK_FALLBACK_REASON").map(String::as_str), Some("non_python_changes"));
+    assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("yes"));
+}
+
+#[test]
+fn the_dry_run_reports_the_git_environment_policy() {
+    let fixture = Fixture::new(0);
+    touch_target(&fixture.repo);
+
+    let report = json_output(fixture.command().envs(hook_env(&fixture)).args([
+        "--format",
+        "json",
+        "run",
+        "--dry-run",
+    ]));
+    assert_eq!(report["git_env"]["policy"], "isolate");
+    let removed: Vec<&str> = report["git_env"]["removed"]
+        .as_array()
+        .expect("an array")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect();
+    assert_eq!(
+        removed,
+        vec!["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"],
+        "the variables that are set right now, in git's own order: {report}"
+    );
+
+    let text = String::from_utf8(
+        fixture
+            .command()
+            .envs(hook_env(&fixture))
+            .args(["run", "--dry-run"])
+            .output()
+            .expect("runs")
+            .stdout,
+    )
+    .expect("utf-8");
+    assert!(
+        text.contains(
+            "git env: isolate — removes GIT_DIR, GIT_WORK_TREE, GIT_INDEX_FILE, GIT_PREFIX"
+        ),
+        "got:\n{text}"
+    );
+
+    let report = json_output(fixture.command().envs(hook_env(&fixture)).args([
+        "--format",
+        "json",
+        "run",
+        "--dry-run",
+        "--git-env",
+        "inherit",
+    ]));
+    assert_eq!(report["git_env"]["policy"], "inherit");
+    assert_eq!(report["git_env"]["removed"], Value::Array(Vec::new()), "nothing is removed");
+}
+
+#[test]
+fn the_removed_variables_cover_gits_own_list() {
+    // Git publishes the list; gerenuk's copy is pure so the rules stay
+    // testable without git. This is the one place the two are compared, so
+    // a newer git that adds a variable fails here rather than in a hook.
+    let output = std::process::Command::new("git")
+        .args(["rev-parse", "--local-env-vars"])
+        .output()
+        .expect("git should be on PATH for the test suite");
+    assert!(output.status.success());
+    let listed: Vec<&str> = std::str::from_utf8(&output.stdout).expect("utf-8").lines().collect();
+    assert!(!listed.is_empty(), "git names at least GIT_DIR");
+    for name in listed {
+        assert!(
+            gerenuk::pytest::LOCAL_GIT_ENV.contains(&name),
+            "git lists `{name}` as repository-local and gerenuk does not remove it"
+        );
+    }
+}
+
+// --- Through a real hook ---
+//
+// The deterministic tests above inject the variables. These let git export
+// them: a pre-commit hook runs `gerenuk run`, and the "pytest" it execs does
+// what the test in the report did — initialises a second repository,
+// configures an identity there, stages a file and commits it with `git -C`.
+// The outer repository must come out of the commit with exactly the commit
+// the user asked for, and nothing of the fixture's.
+
+/// A pytest that commits to a repository of its own, and records what it did.
+struct GitUsingPytest {
+    bin: PathBuf,
+    inner: PathBuf,
+    record: PathBuf,
+}
+
+impl GitUsingPytest {
+    fn new(dir: &Path) -> Self {
+        let inner = dir.join("inner");
+        let record = dir.join("git-pytest-record");
+        let bin = dir.join("git-pytest");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/usr/bin/env bash
+set -euo pipefail
+inner='{inner}'
+printf '%s\n' "$@" > '{record}.argv'
+mkdir -p "$inner"
+git -C "$inner" init -q --initial-branch=main
+git -C "$inner" config user.email fixture@example.com
+git -C "$inner" config user.name Fixture
+printf 'data\n' > "$inner/fixture.txt"
+git -C "$inner" add fixture.txt
+git -C "$inner" commit -qm fixture
+git -C "$inner" rev-parse HEAD > '{record}.head'
+"#,
+                inner = inner.display(),
+                record = record.display(),
+            ),
+        )
+        .expect("write the git-using pytest");
+        make_executable(&bin);
+        Self { bin, inner, record }
+    }
+
+    fn argv(&self) -> Option<Vec<String>> {
+        recorded_argv(&self.record.with_extension("argv"))
+    }
+
+    fn inner_head(&self) -> Option<String> {
+        std::fs::read_to_string(self.record.with_extension("head"))
+            .ok()
+            .map(|s| s.trim().to_string())
+    }
+}
+
+/// A fixture repository with a pre-commit hook that runs `gerenuk run`.
+struct Hooked {
+    fixture: Fixture,
+    pytest: GitUsingPytest,
+}
+
+impl Hooked {
+    fn new() -> Self {
+        let fixture = Fixture::new(0);
+        let pytest = GitUsingPytest::new(fixture.tmp.path());
+        let hook = fixture.repo.path().join(".git/hooks/pre-commit");
+        std::fs::write(
+            &hook,
+            format!("#!/usr/bin/env bash\nexec '{}' run\n", env!("CARGO_BIN_EXE_gerenuk")),
+        )
+        .expect("write the hook");
+        make_executable(&hook);
+        Self { fixture, pytest }
+    }
+
+    /// `git <args>` in `dir`, with what a hooked `gerenuk run` needs: the
+    /// `tyf` stub and the git-using pytest, and nothing of this machine's
+    /// git config.
+    fn git(&self, dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GERENUK_TYF", &self.fixture.tyf)
+            .env("GERENUK_PYTEST", &self.pytest.bin)
+            .env_remove("GERENUK_FALLBACK")
+            .args(args)
+            .output()
+            .expect("git should be on PATH for the test suite")
+    }
+
+    fn git_ok(&self, dir: &Path, args: &[&str]) -> String {
+        let output = self.git(dir, args);
+        assert!(
+            output.status.success(),
+            "git {args:?} failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// The commit went through, pytest saw the selection, the fixture's commit
+    /// landed in the fixture's repository, and the outer one carries nothing
+    /// of it.
+    fn assert_only_the_outer_commit_happened(&self, dir: &Path, head_before: &str) {
+        assert_eq!(
+            self.pytest.argv().expect("the hook should have reached pytest"),
+            vec!["tests/test_core.py::test_target", "tests/test_core.py::test_with_fixture"],
+            "the selection was computed in the hook's context"
+        );
+
+        let head = self.git_ok(dir, &["rev-parse", "HEAD"]);
+        assert_ne!(head, head_before, "the outer commit was created");
+        assert_eq!(
+            self.git_ok(dir, &["rev-parse", "HEAD~1"]),
+            head_before,
+            "exactly one commit, the outer one"
+        );
+        let tree = self.git_ok(dir, &["ls-tree", "-r", "--name-only", "HEAD"]);
+        assert!(
+            !tree.contains("fixture.txt"),
+            "the fixture's file is not in the outer commit:\n{tree}"
+        );
+        assert_eq!(self.git_ok(dir, &["status", "--porcelain"]), "", "the outer index is clean");
+        assert_eq!(
+            self.git_ok(dir, &["config", "user.email"]),
+            "test@example.com",
+            "the outer identity is untouched"
+        );
+        assert_eq!(
+            self.git_ok(dir, &["log", "--format=%ae", "-1"]),
+            "test@example.com",
+            "and the outer commit was made with it"
+        );
+
+        let inner_head = self.pytest.inner_head().expect("the fixture recorded its commit");
+        assert_ne!(inner_head, head, "the fixture committed somewhere else");
+        assert_eq!(
+            self.git_ok(&self.pytest.inner, &["log", "--format=%s"]),
+            "fixture",
+            "one commit, its own"
+        );
+        assert_eq!(
+            self.git_ok(&self.pytest.inner, &["rev-parse", "HEAD"]),
+            inner_head,
+            "and it is the fixture repository that carries it"
+        );
+    }
+}
+
+#[test]
+fn a_hooked_run_lets_a_test_commit_to_its_own_repository_and_not_the_outer_one() {
+    let hooked = Hooked::new();
+    let root = hooked.fixture.repo.path().to_path_buf();
+    touch_target(&hooked.fixture.repo);
+    hooked.git_ok(&root, &["add", "-A"]);
+    let before = hooked.git_ok(&root, &["rev-parse", "HEAD"]);
+
+    // A partial commit: git hands the hook an absolute path to a temporary
+    // index, which is the variable that turned the fixture's `git add` into
+    // a write to the outer index.
+    let output = hooked.git(&root, &["commit", "-qm", "change", "--", "src/mypkg/core.py"]);
+    assert!(
+        output.status.success(),
+        "the hook should pass:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    hooked.assert_only_the_outer_commit_happened(&root, &before);
+}
+
+#[test]
+fn a_hooked_run_in_a_linked_worktree_leaves_the_worktree_and_its_branch_alone() {
+    let hooked = Hooked::new();
+    let worktree = hooked.fixture.tmp.path().join("worktree");
+    hooked.fixture.repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        "-b",
+        "task",
+        &worktree.display().to_string(),
+    ]);
+    std::fs::write(
+        worktree.join("src/mypkg/core.py"),
+        CORE.replace("return value + 1", "return value + 2"),
+    )
+    .expect("write the change in the worktree");
+    hooked.git_ok(&worktree, &["add", "-A"]);
+    let before = hooked.git_ok(&worktree, &["rev-parse", "HEAD"]);
+    let main_before = hooked.git_ok(&worktree, &["rev-parse", "main"]);
+
+    // In a linked worktree git exports an absolute `GIT_DIR`, which is the
+    // variable that turned the fixture's `git config` and `git commit` into
+    // writes to the outer repository and its branch.
+    let output = hooked.git(&worktree, &["commit", "-qm", "change"]);
+    assert!(
+        output.status.success(),
+        "the hook should pass:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    hooked.assert_only_the_outer_commit_happened(&worktree, &before);
+    assert_eq!(hooked.git_ok(&worktree, &["rev-parse", "main"]), main_before, "main is untouched");
+    assert_eq!(hooked.git_ok(&worktree, &["rev-parse", "--abbrev-ref", "HEAD"]), "task");
+}
+
+#[test]
+fn a_hooked_run_still_propagates_pytests_failure() {
+    let hooked = Hooked::new();
+    let root = hooked.fixture.repo.path().to_path_buf();
+    // A pytest that fails, so the hook has to block the commit.
+    std::fs::write(&hooked.pytest.bin, "#!/usr/bin/env bash\nexit 1\n").expect("rewrite the stub");
+    touch_target(&hooked.fixture.repo);
+    hooked.git_ok(&root, &["add", "-A"]);
+    let before = hooked.git_ok(&root, &["rev-parse", "HEAD"]);
+
+    let output = hooked.git(&root, &["commit", "-qm", "change"]);
+    assert!(!output.status.success(), "a red suite blocks the commit");
+    assert_eq!(hooked.git_ok(&root, &["rev-parse", "HEAD"]), before, "no commit was created");
 }

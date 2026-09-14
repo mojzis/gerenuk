@@ -22,9 +22,19 @@
 //! never reads them cannot block and nothing of gerenuk's lingers to write
 //! them. See `docs/adr/0014-run-all-delegates-to-a-fallback.md`.
 //!
-//! Everything else here — resolving the runner, assembling the argv, writing
-//! the one-line summary — is pure and unit-tested with no spawn anywhere near
-//! it.
+//! **pytest does not inherit the hook's git.** A pre-commit hook runs with
+//! git's repository-local variables exported — `GIT_DIR`, `GIT_INDEX_FILE` and
+//! the rest of [`LOCAL_GIT_ENV`] — so that every git the hook spawns targets
+//! the repository being committed. A test that creates a repository of its own
+//! and inherits them operates on the outer one instead, so by default
+//! ([`GitEnv::Isolate`]) the [`Handoff`] for pytest removes them. gerenuk's
+//! own diff was taken before, in the hook's context, and the fallback inherits
+//! everything: it is the repository's own script and may need that index. See
+//! `docs/adr/0020-pytest-does-not-inherit-the-hooks-git.md`.
+//!
+//! Everything else here — resolving the runner, assembling the argv, deciding
+//! which variables go, writing the one-line summary — is pure and unit-tested
+//! with no spawn anywhere near it.
 
 use std::ffi::OsString;
 use std::io::{Seek, SeekFrom, Write};
@@ -32,6 +42,7 @@ use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
 use crate::fallback::Plan;
@@ -43,15 +54,129 @@ pub const DEFAULT_PYTEST_BIN: &str = "pytest";
 /// Environment variable that overrides which pytest is run.
 pub const PYTEST_BIN_ENV: &str = "GERENUK_PYTEST";
 
-/// What the child receives besides its argv. pytest gets neither.
+/// The variables git exports to a hook so that every git the hook spawns
+/// targets the repository being operated on — `git rev-parse
+/// --local-env-vars`, in git's own order.
+///
+/// A copy rather than a query, so the rule stays pure; `tests/run.rs` checks
+/// it against the installed git's answer, which is where drift would show.
+pub const LOCAL_GIT_ENV: &[&str] = &[
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+];
+
+/// Whether pytest inherits git's repository-local environment.
+///
+/// `[tool.gerenuk] git-env` and `run --git-env`. The fallback command is not
+/// governed by it: it inherits everything, always.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum GitEnv {
+    /// Remove git's repository-local variables (`GIT_DIR`, `GIT_INDEX_FILE`, ...)
+    /// from pytest's environment
+    #[default]
+    Isolate,
+    /// Hand pytest gerenuk's environment as it is
+    Inherit,
+}
+
+impl GitEnv {
+    /// The variables pytest will not inherit: under `Isolate`, every one of
+    /// [`LOCAL_GIT_ENV`] that `is_set` says is present; under `Inherit`, none.
+    ///
+    /// Only the set ones, so the dry run can say exactly what a hook exported.
+    /// `is_set` arrives as an argument rather than being `std::env::var_os`
+    /// here, so this stays a pure function of what it is given.
+    #[must_use]
+    pub fn removals(self, is_set: impl Fn(&str) -> bool) -> Vec<&'static str> {
+        match self {
+            Self::Isolate => LOCAL_GIT_ENV.iter().copied().filter(|name| is_set(name)).collect(),
+            Self::Inherit => Vec::new(),
+        }
+    }
+
+    /// The value as `pyproject.toml` and `--git-env` spell it.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Isolate => "isolate",
+            Self::Inherit => "inherit",
+        }
+    }
+}
+
+/// What the child receives besides its argv.
+///
+/// pytest gets no stdin and no added variables, and by default loses the
+/// hook's git ones; the fallback gets its payload and its reason, and loses
+/// nothing.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Handoff {
     /// Bytes the child finds on its stdin. Delivered from an unlinked
     /// temporary file rather than a pipe: there is no writer left after the
     /// exec, and a child that ignores its stdin must not hang or fail.
     pub stdin: Option<Vec<u8>>,
-    /// Variables added to the environment the child inherits.
+    /// Variables added to the environment the child inherits. Applied after
+    /// `remove`, so an addition always wins.
     pub env: Vec<(OsString, OsString)>,
+    /// Variables removed from the environment the child inherits.
+    pub remove: Vec<OsString>,
+}
+
+impl Handoff {
+    /// pytest's handoff: nothing added, `removed` taken away.
+    #[must_use]
+    pub fn for_pytest(removed: &[&str]) -> Self {
+        Self { remove: removed.iter().map(OsString::from).collect(), ..Self::default() }
+    }
+}
+
+/// What `--dry-run` reports about the child's git environment.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct GitEnvPlan {
+    pub policy: GitEnv,
+    /// The variables that are set right now and would be removed.
+    pub removed: Vec<&'static str>,
+}
+
+impl GitEnvPlan {
+    #[must_use]
+    pub fn new(policy: GitEnv, is_set: impl Fn(&str) -> bool) -> Self {
+        Self { policy, removed: policy.removals(is_set) }
+    }
+
+    /// The fallback's: it inherits everything, whatever the policy says.
+    #[must_use]
+    pub const fn inherited() -> Self {
+        Self { policy: GitEnv::Inherit, removed: Vec::new() }
+    }
+
+    /// The line the human dry run prints for it.
+    #[must_use]
+    pub fn render_human(&self) -> String {
+        match (self.policy, self.removed.is_empty()) {
+            (GitEnv::Inherit, _) => "git env: inherit".to_string(),
+            (GitEnv::Isolate, true) => {
+                "git env: isolate — no repository-local git variable is set".to_string()
+            }
+            (GitEnv::Isolate, false) => {
+                format!("git env: isolate — removes {}", self.removed.join(", "))
+            }
+        }
+    }
 }
 
 /// The pytest invocation gerenuk will exec, minus the node ids.
@@ -135,7 +260,11 @@ impl Runner {
             argv.split_first().context("the command resolved to an empty argv")?;
 
         let mut command = std::process::Command::new(program);
-        command.args(rest).current_dir(&self.root).envs(handoff.env);
+        command.args(rest).current_dir(&self.root);
+        for name in &handoff.remove {
+            command.env_remove(name);
+        }
+        command.envs(handoff.env);
 
         if let Some(bytes) = handoff.stdin {
             // A file, not a pipe: the payload is complete before the child
@@ -201,6 +330,8 @@ pub struct DryRun<'a> {
     /// The fallback that would have been exec'd: set only when the decision is
     /// `run_all` and one is configured. Then `argv` is its argv.
     pub fallback: Option<Plan<'a>>,
+    /// What the child would and would not inherit of git's environment.
+    pub git_env: GitEnvPlan,
 }
 
 impl DryRun<'_> {
@@ -211,6 +342,9 @@ impl DryRun<'_> {
         let mut out = String::new();
         let _ = writeln!(out, "decision: {}", decision_label(self.selection.decision));
         let _ = writeln!(out, "gerenuk: {}", summary(self.selection, self.elapsed_ms));
+        if self.selection.decision != Decision::Nothing {
+            let _ = writeln!(out, "{}", self.git_env.render_human());
+        }
 
         if !self.selection.node_ids.is_empty() {
             let _ = writeln!(out);
@@ -297,6 +431,9 @@ impl DryRun<'_> {
             let fallback = serde_json::to_value(&self.fallback)
                 .context("could not serialise the fallback plan")?;
             object.insert("fallback".to_string(), fallback);
+            let git_env = serde_json::to_value(&self.git_env)
+                .context("could not serialise the git environment plan")?;
+            object.insert("git_env".to_string(), git_env);
         }
         serde_json::to_string_pretty(&value).context("could not render the dry run as JSON")
     }
@@ -341,6 +478,11 @@ mod tests {
 
     fn runner() -> Runner {
         Runner::with_command(["uv", "run", "pytest"], "/repo")
+    }
+
+    /// The plan outside a hook: isolating, with nothing to remove.
+    fn no_git() -> GitEnvPlan {
+        GitEnvPlan::new(GitEnv::Isolate, |_| false)
     }
 
     fn argv_of(selection: &Selection, passthrough: &[&str]) -> Vec<String> {
@@ -425,8 +567,14 @@ mod tests {
     fn the_dry_run_lists_the_argv_one_element_per_line() {
         let selection = selection(Decision::Selected, &[("tests/test_a.py::test_x", "pkg.a:f")]);
         let argv = runner().argv(&selection, &[]);
-        let text =
-            DryRun { selection: &selection, argv, elapsed_ms: 12, fallback: None }.render_human();
+        let text = DryRun {
+            selection: &selection,
+            argv,
+            elapsed_ms: 12,
+            fallback: None,
+            git_env: no_git(),
+        }
+        .render_human();
 
         assert!(text.contains("decision: selected"), "got:\n{text}");
         assert!(text.contains("\n  uv\n  run\n  pytest\n"), "not interpolatable, got:\n{text}");
@@ -439,9 +587,14 @@ mod tests {
     #[test]
     fn the_dry_run_of_an_empty_selection_offers_no_argv() {
         let selection = selection(Decision::Nothing, &[]);
-        let text =
-            DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 3, fallback: None }
-                .render_human();
+        let text = DryRun {
+            selection: &selection,
+            argv: Vec::new(),
+            elapsed_ms: 3,
+            fallback: None,
+            git_env: no_git(),
+        }
+        .render_human();
         assert!(text.contains("decision: nothing"), "got:\n{text}");
         assert!(text.contains("argv: none"), "there is nothing to run, got:\n{text}");
     }
@@ -459,9 +612,14 @@ mod tests {
             why: DropReason::Superseded,
         }];
 
-        let text =
-            DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 0, fallback: None }
-                .render_human();
+        let text = DryRun {
+            selection: &selection,
+            argv: Vec::new(),
+            elapsed_ms: 0,
+            fallback: None,
+            git_env: no_git(),
+        }
+        .render_human();
         assert!(text.contains("expanded tests.conftest:shelter (fixture)"), "got:\n{text}");
         assert!(text.contains("covered by the whole file"), "got:\n{text}");
         assert!(
@@ -473,9 +631,14 @@ mod tests {
     #[test]
     fn the_dry_run_says_nothing_about_folding_when_nothing_folded() {
         let selection = selection(Decision::Selected, &[("tests/test_a.py::test_x", "pkg.a:f")]);
-        let text =
-            DryRun { selection: &selection, argv: Vec::new(), elapsed_ms: 0, fallback: None }
-                .render_human();
+        let text = DryRun {
+            selection: &selection,
+            argv: Vec::new(),
+            elapsed_ms: 0,
+            fallback: None,
+            git_env: no_git(),
+        }
+        .render_human();
         assert!(!text.contains("folded"), "got:\n{text}");
     }
 
@@ -483,9 +646,15 @@ mod tests {
     fn the_dry_run_json_carries_the_argv_alongside_the_selection() {
         let selection = selection(Decision::Selected, &[("tests/test_a.py::test_x", "pkg.a:f")]);
         let argv = runner().argv(&selection, &["-q".into()]);
-        let text = DryRun { selection: &selection, argv, elapsed_ms: 0, fallback: None }
-            .render_json()
-            .expect("the selection serialises");
+        let text = DryRun {
+            selection: &selection,
+            argv,
+            elapsed_ms: 0,
+            fallback: None,
+            git_env: no_git(),
+        }
+        .render_json()
+        .expect("the selection serialises");
         let value: serde_json::Value = serde_json::from_str(&text).expect("valid JSON");
 
         assert_eq!(value["decision"], "selected");
@@ -514,6 +683,7 @@ mod tests {
             argv: fallback.argv().to_vec(),
             elapsed_ms: 0,
             fallback: Some(plan),
+            git_env: GitEnvPlan::inherited(),
         };
 
         let text = report.render_human();
@@ -581,5 +751,113 @@ mod tests {
         let runner = Runner::with_command(Vec::<OsString>::new(), "/repo");
         let err = runner.exec(&[], Handoff::default()).expect_err("there is no program to run");
         assert!(format!("{err:#}").contains("empty argv"), "got: {err:#}");
+    }
+
+    // --- The git environment ---
+
+    #[test]
+    fn the_local_git_variables_are_the_ones_a_hook_exports() {
+        for name in ["GIT_DIR", "GIT_INDEX_FILE", "GIT_WORK_TREE", "GIT_PREFIX", "GIT_COMMON_DIR"] {
+            assert!(LOCAL_GIT_ENV.contains(&name), "`{name}` is what the incidents were about");
+        }
+        for name in ["GIT_AUTHOR_NAME", "GIT_EDITOR", "GIT_CONFIG_GLOBAL", "PATH"] {
+            assert!(!LOCAL_GIT_ENV.contains(&name), "`{name}` is not repository-local");
+        }
+    }
+
+    #[test]
+    fn isolating_removes_only_the_variables_that_are_set() {
+        let set = |name: &str| name == "GIT_DIR" || name == "GIT_INDEX_FILE";
+        assert_eq!(
+            GitEnv::Isolate.removals(set),
+            vec!["GIT_DIR", "GIT_INDEX_FILE"],
+            "in git's own order, and nothing that is not there"
+        );
+        assert_eq!(GitEnv::Isolate.removals(|_| false), Vec::<&str>::new(), "outside a hook");
+    }
+
+    #[test]
+    fn inheriting_removes_nothing_even_when_everything_is_set() {
+        assert_eq!(GitEnv::Inherit.removals(|_| true), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn the_default_policy_is_to_isolate() {
+        assert_eq!(GitEnv::default(), GitEnv::Isolate, "the safe default needs no config");
+        assert_eq!(GitEnv::Isolate.name(), "isolate");
+        assert_eq!(GitEnv::Inherit.name(), "inherit");
+    }
+
+    #[test]
+    fn the_policy_names_are_what_serde_reads_and_writes() {
+        for policy in [GitEnv::Isolate, GitEnv::Inherit] {
+            let json = serde_json::to_string(&policy).expect("serialises");
+            assert_eq!(json, format!("\"{}\"", policy.name()), "`name` pins the wire form");
+            let back: GitEnv = serde_json::from_str(&json).expect("round-trips");
+            assert_eq!(back, policy);
+        }
+        assert!(serde_json::from_str::<GitEnv>("\"strip\"").is_err(), "no third value");
+    }
+
+    #[test]
+    fn pytests_handoff_removes_and_adds_nothing_else() {
+        let handoff = Handoff::for_pytest(&["GIT_DIR", "GIT_PREFIX"]);
+        assert_eq!(handoff.remove, vec![OsString::from("GIT_DIR"), OsString::from("GIT_PREFIX")]);
+        assert_eq!(handoff.stdin, None, "pytest reads nothing from gerenuk");
+        assert!(handoff.env.is_empty(), "and gets no variable of gerenuk's");
+        assert_eq!(Handoff::default().remove, Vec::<OsString>::new(), "the fallback's loses none");
+    }
+
+    #[test]
+    fn the_git_env_plan_says_what_would_go() {
+        let plan =
+            GitEnvPlan::new(GitEnv::Isolate, |name| name == "GIT_DIR" || name == "GIT_PREFIX");
+        assert_eq!(plan.render_human(), "git env: isolate — removes GIT_DIR, GIT_PREFIX");
+        assert_eq!(
+            no_git().render_human(),
+            "git env: isolate — no repository-local git variable is set",
+            "outside a hook the policy is still stated, so a reader knows it applies"
+        );
+        assert_eq!(GitEnvPlan::new(GitEnv::Inherit, |_| true).render_human(), "git env: inherit");
+        assert_eq!(
+            GitEnvPlan::inherited(),
+            GitEnvPlan { policy: GitEnv::Inherit, removed: vec![] }
+        );
+
+        let value = serde_json::to_value(&plan).expect("serialises");
+        assert_eq!(value["policy"], "isolate");
+        assert_eq!(value["removed"][1], "GIT_PREFIX");
+    }
+
+    #[test]
+    fn the_dry_run_states_the_git_env_for_every_outcome_that_runs_something() {
+        let selection = selection(Decision::Selected, &[("tests/test_a.py::test_x", "pkg.a:f")]);
+        let git_env = GitEnvPlan::new(GitEnv::Isolate, |name| name == "GIT_INDEX_FILE");
+        let report = DryRun {
+            selection: &selection,
+            argv: Vec::new(),
+            elapsed_ms: 0,
+            fallback: None,
+            git_env,
+        };
+        let text = report.render_human();
+        assert!(text.contains("\ngit env: isolate — removes GIT_INDEX_FILE\n"), "got:\n{text}");
+        let value: serde_json::Value =
+            serde_json::from_str(&report.render_json().expect("serialises")).expect("JSON");
+        assert_eq!(value["git_env"]["policy"], "isolate");
+        assert_eq!(value["git_env"]["removed"][0], "GIT_INDEX_FILE");
+
+        let nothing = self::selection(Decision::Nothing, &[]);
+        let report = DryRun {
+            selection: &nothing,
+            argv: Vec::new(),
+            elapsed_ms: 0,
+            fallback: None,
+            git_env: no_git(),
+        };
+        assert!(
+            !report.render_human().contains("git env"),
+            "nothing runs, so there is no child to describe"
+        );
     }
 }

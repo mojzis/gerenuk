@@ -220,11 +220,14 @@ impl<'a> Payload<'a> {
     }
 
     /// Everything the fallback receives besides its argv: the payload on
-    /// stdin and the reason in its environment.
+    /// stdin and the reason in its environment. Nothing is removed — the
+    /// fallback is the repository's own script, run from the hook it was
+    /// configured for, and it may need the very index git handed that hook.
     pub fn handoff(&self) -> Result<Handoff> {
         Ok(Handoff {
             stdin: Some(self.render()?),
             env: vec![(OsString::from(REASON_ENV), OsString::from(self.reason))],
+            remove: Vec::new(),
         })
     }
 }
@@ -424,6 +427,7 @@ mod tests {
             vec![(OsString::from(REASON_ENV), OsString::from("budget"))],
             "the reason alone, so a shell script can branch without parsing JSON"
         );
+        assert!(handoff.remove.is_empty(), "the fallback inherits everything, git's included");
     }
 
     #[test]

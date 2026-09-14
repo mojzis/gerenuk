@@ -18,6 +18,24 @@ GERENUK_TYF=/path/to/tyf gerenuk doctor
 GERENUK_GIT=/path/to/git gerenuk changed-symbols
 ```
 
+## A test's `git` touched the repository being committed
+
+A pre-commit hook runs with `GIT_DIR`, `GIT_INDEX_FILE` and the rest of `git
+rev-parse --local-env-vars` exported, so a test that creates a repository of
+its own under `tmp_path` and inherits them operates on the outer one instead.
+`gerenuk run` removes them from pytest's environment by default; check that
+nothing has turned that off:
+
+```sh
+gerenuk run --dry-run | grep 'git env'
+```
+
+`git env: isolate` is the default. `git env: inherit` means `git-env` in
+`pyproject.toml` or `--git-env` asked for it. A [fallback
+command](commands/run.md#the-fallback-command) always inherits, so a fallback
+that runs pytest has to clear them itself. See [the git
+environment](commands/run.md#the-git-environment).
+
 ## `no Python project root above ...`
 
 Nothing above the current directory holds a `pyproject.toml`, `setup.py`,

@@ -12,6 +12,7 @@
     reason = "these are test helpers; a failed setup step should abort loudly"
 )]
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -245,8 +246,9 @@ pub fn failing_tyf(dir: &TempDir, message: &str) -> PathBuf {
 /// Write an executable stub that stands in for pytest.
 ///
 /// It records the argv it was handed — one element per line, argv[0] excluded —
-/// and exits with `code`. The recording file is the assertion: a run that
-/// selects nothing must never create it, because it must never spawn anything.
+/// and the environment it found, then exits with `code`. The argv file is the
+/// assertion: a run that selects nothing must never create it, because it must
+/// never spawn anything. The environment goes next to it, as `<record>.env`.
 ///
 /// `GERENUK_PYTEST` takes a single binary, the same shape as `GERENUK_TYF`, so
 /// the whole stub has to fit in one script.
@@ -255,8 +257,9 @@ pub fn fake_pytest(dir: &TempDir, record: &Path, code: u8) -> PathBuf {
     std::fs::write(
         &path,
         format!(
-            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{}'\nexit {code}\n",
-            record.display()
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > '{}'\nenv > '{}'\nexit {code}\n",
+            record.display(),
+            record.with_extension("env").display()
         ),
     )
     .expect("write fake pytest script");
@@ -270,7 +273,19 @@ pub fn recorded_argv(record: &Path) -> Option<Vec<String>> {
     Some(text.lines().map(ToString::to_string).collect())
 }
 
-fn make_executable(path: &Path) {
+/// The environment a stub recorded, as `NAME` → `value`, or `None` when it
+/// never ran. `record` is the file the stub wrote its environment to.
+pub fn recorded_env(record: &Path) -> Option<BTreeMap<String, String>> {
+    let text = std::fs::read_to_string(record).ok()?;
+    Some(
+        text.lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect(),
+    )
+}
+
+pub fn make_executable(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -363,6 +378,7 @@ prefix='{prefix}'
 printf '%s\n' "$@" > "$prefix.argv"
 printf '%s' "${{GERENUK_FALLBACK_REASON-unset}}" > "$prefix.reason"
 printf '%s' "$PWD" > "$prefix.cwd"
+env > "$prefix.env"
 if [[ "${{1:-}}" != "--skip-stdin" ]]; then
   cat > "$prefix.stdin"
 fi

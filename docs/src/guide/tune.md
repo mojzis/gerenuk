@@ -6,11 +6,9 @@ once a `run_all` reason keeps repeating.
 
 **Where the diff comes from.** `--base <REF>` names the ref to diff against;
 by default `origin/main`, then `main`, then `master`, whichever exists first.
-The diff is taken from the merge-base, so commits already on the base do not
-count, and it is the working tree that is diffed - staged, unstaged and
+The working tree is diffed from the merge-base - staged, unstaged and
 untracked alike. `--workspace <PATH>` names the project root instead of
-walking up from the current directory to the nearest `pyproject.toml`,
-`setup.py`, `setup.cfg` or `.git`.
+walking up to the nearest `pyproject.toml`, `setup.py`, `setup.cfg` or `.git`.
 
 **Budgets.** The walk stops and says `run_all` at whichever limit it hits
 first. A flag beats `[tool.gerenuk]` in `pyproject.toml`, which beats the
@@ -37,21 +35,23 @@ fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
   whenever the diff would have needed one. `impacted-tests` ignores it.
 - `ignore-decorators`: dotted names, suffix-matched syntactically, of
   decorators that register a function with a runner. A changed symbol
-  carrying one is reported as ignored instead of walked; import aliases are
-  not resolved.
+  carrying one is reported as ignored; import aliases are not resolved.
 - `pytest-command`: an argv, never a string, because the common value has
   arguments. Empty means `pytest` on `PATH`; `GERENUK_PYTEST` beats both.
   `-o addopts=` drops a coverage-carrying `addopts` for the hook run only.
 - `fallback-command`: what `run` execs instead of the whole suite on
-  `run_all`. It receives the reason in `GERENUK_FALLBACK_REASON` and the
-  `changed-symbols` report as JSON on stdin, and its exit code becomes the
-  hook's. `--fallback-command <JSON_ARRAY>` and `GERENUK_FALLBACK` override
-  it, in that order. An empty array anywhere is an error at startup.
+  `run_all`. It gets the reason in `GERENUK_FALLBACK_REASON`, the
+  `changed-symbols` report as JSON on stdin, and its exit code is the hook's.
+  `--fallback-command <JSON_ARRAY>` and `GERENUK_FALLBACK` override it, in
+  that order. An empty array anywhere is an error at startup.
+- `git-env`: `isolate` (the default) removes `GIT_DIR`, `GIT_INDEX_FILE` and
+  the rest of what a hook exports from pytest's environment, so a test that
+  creates a repository of its own never touches the one being committed;
+  `inherit` keeps them. `--git-env <POLICY>` beats it. The fallback inherits.
 
 **Binaries.** `GERENUK_TYF`, `GERENUK_GIT` and `GERENUK_PYTEST` each name one
 executable and skip the `PATH` lookup. `tyf` is looked for only once a walk
-is actually needed, so `changed-symbols` and a `run_all` settled by the diff
-alone work in a checkout with no `ty` at all.
+is needed, so `changed-symbols` works in a checkout with no `ty` at all.
 
 **Audit.** `gerenuk audit src/app.py` reads the same graph backwards for the
 files you name: symbols nothing references, and symbols only tests reach.

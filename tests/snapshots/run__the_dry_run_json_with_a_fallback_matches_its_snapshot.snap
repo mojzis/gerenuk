@@ -34,6 +34,10 @@ expression: pinned_dry_run(&fixture)
     "reason": "non_python_changes",
     "source": "config"
   },
+  "git_env": {
+    "policy": "inherit",
+    "removed": []
+  },
   "node_ids": [],
   "reason": "non_python_changes",
   "verdict": "run_all"
