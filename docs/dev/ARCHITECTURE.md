@@ -90,7 +90,9 @@ what moved and `tree-sitter` who owns those lines; it never constructs a
 `tyf::Runner`, which is why it works in a checkout with no `ty` installed.
 `impacted-tests` is the one that needs both — but only after the verdicts that
 need neither (`non_python_changes`, `parse_errors`) have been settled, so a
-diff of a `pyproject.toml` alone still answers with no `ty` installed. `run`
+diff of a `pyproject.toml` alone still answers with no `ty` installed. A
+non-Python file an `ignore-paths` pattern matches is not a `non_python_changes`
+entry at all: phase 1 lists it under `ignored_paths` (ADR 0021). `run`
 adds a fourth source that is neither `tyf` nor `git`: the test files themselves,
 parsed for their fixtures and their collectible names.
 

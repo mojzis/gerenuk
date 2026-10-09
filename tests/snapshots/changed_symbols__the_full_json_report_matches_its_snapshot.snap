@@ -23,6 +23,7 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
     }
   ],
   "errors": [],
+  "ignored_paths": [],
   "ignored_symbols": [],
   "merge_base": "<sha>",
   "module_level_changes": [],

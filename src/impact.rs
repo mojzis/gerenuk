@@ -50,6 +50,9 @@ pub struct ImpactReport {
     /// itself, with no walking needed.
     pub test_files_changed: Vec<String>,
     pub ignored_symbols: Vec<IgnoredSymbol>,
+    /// Non-Python files `ignore-paths` set aside, passed through from phase 1
+    /// so a reader can see what did not force `run_all`.
+    pub ignored_paths: Vec<String>,
     pub stats: Stats,
     pub errors: Vec<String>,
 }
@@ -136,6 +139,7 @@ pub fn analyze(
         impacted_tests: closure.impacted,
         test_files_changed: changed.test_files_changed.clone(),
         ignored_symbols: closure.ignored,
+        ignored_paths: changed.ignored_paths.clone(),
         stats: closure.stats,
         errors: closure.errors,
     }
@@ -157,6 +161,7 @@ pub(crate) fn run_all(
         impacted_tests: Vec::new(),
         test_files_changed: changed.test_files_changed.clone(),
         ignored_symbols: Vec::new(),
+        ignored_paths: changed.ignored_paths.clone(),
         stats: Stats::default(),
         errors,
     }
@@ -198,6 +203,7 @@ impl ImpactReport {
             }
         }
 
+        list_section(&mut out, "ignored paths", &self.ignored_paths);
         list_section(&mut out, "errors", &self.errors);
 
         let _ = writeln!(
@@ -537,6 +543,40 @@ mod tests {
     }
 
     #[test]
+    fn an_ignored_path_is_no_up_front_verdict() {
+        let mut report = changed();
+        report.ignored_paths = vec!["README.md".to_string()];
+        assert_eq!(upfront_reason(&report), None, "`ignore-paths` exists to not run everything");
+    }
+
+    /// A [`Refs`] with nothing to say, for a walk that has no seeds.
+    struct NoRefs;
+
+    impl Refs for NoRefs {
+        fn refs(&self, _queries: &[SymbolQuery]) -> Result<Vec<RefAnswer>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn the_ignored_paths_are_carried_into_both_kinds_of_report() {
+        let mut report = changed();
+        report.ignored_paths = vec!["docs/index.md".to_string()];
+
+        let unwalked = run_all(&report, Reason::ParseErrors, Vec::new());
+        assert_eq!(unwalked.ignored_paths, vec!["docs/index.md".to_string()], "a run_all");
+
+        let tmp = TempDir::new().expect("temp dir");
+        let index = FsIndex::new(tmp.path(), &[]);
+        let walked = analyze(&report, &NoRefs, &index, &Config::default(), &Limits::default());
+        assert_eq!(walked.verdict, Verdict::Selected, "nothing to walk");
+        assert_eq!(walked.ignored_paths, vec!["docs/index.md".to_string()], "and a selection");
+
+        let text = walked.render(Format::Human).expect("human rendering cannot fail");
+        assert!(text.contains("ignored paths (1)\n  docs/index.md"), "listed, got:\n{text}");
+    }
+
+    #[test]
     fn a_clean_python_only_diff_has_no_up_front_verdict() {
         assert_eq!(upfront_reason(&changed()), None, "nothing to stop the walk");
     }
@@ -587,6 +627,7 @@ mod tests {
             impacted_tests: tests,
             test_files_changed: vec![],
             ignored_symbols: vec![],
+            ignored_paths: vec![],
             stats: Stats { visited: 3, tyf_calls: 2, ..Stats::default() },
             errors: vec![],
         }

@@ -697,6 +697,34 @@ fn a_repo_relative_fallback_is_resolved_against_the_repo_root_not_the_cwd() {
 }
 
 #[test]
+fn a_diff_of_only_ignored_paths_runs_nothing_and_never_falls_back() {
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&format!("ignore-paths = [\"**/*.md\"]\n{}", stub.config(&[])));
+    fixture.repo.write("README.md", "# mypkg\n");
+
+    let output = fixture.run(&[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fixture.argv(), None, "nothing is impacted, so pytest is not spawned");
+    assert_eq!(stub.argv(), None, "and it is not a run_all, so the fallback is not either");
+}
+
+#[test]
+fn an_ignored_path_beside_a_code_change_keeps_the_selection() {
+    let fixture = Fixture::new(0);
+    fixture.configure("ignore-paths = [\"**/*.md\"]\n");
+    fixture.repo.write("docs/notes.md", "# Notes\n");
+    touch_target(&fixture.repo);
+
+    fixture.run(&[]);
+    assert_eq!(
+        fixture.argv().expect("pytest should have been spawned"),
+        vec!["tests/test_core.py::test_target", "tests/test_core.py::test_with_fixture"],
+        "the same node ids as with no doc edit at all"
+    );
+}
+
+#[test]
 fn the_fallback_is_not_invoked_for_a_selected_outcome() {
     let fixture = Fixture::new(0);
     let stub = fixture.fallback("fallback", 0);

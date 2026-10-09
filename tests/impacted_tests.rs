@@ -455,6 +455,64 @@ fn a_non_python_change_bails_out_before_tyf_is_ever_looked_for() {
     assert_eq!(report["reason"], "non_python_changes");
 }
 
+/// Commit an `ignore-paths` list into [`graph_repo`]'s `pyproject.toml`.
+fn ignore_paths(repo: &TestRepo, patterns: &str) {
+    repo.write(
+        "pyproject.toml",
+        &format!(
+            "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\n\
+             ignore-decorators = [\"registry.transformation\"]\nignore-paths = {patterns}\n"
+        ),
+    );
+    repo.commit("configure");
+}
+
+#[test]
+fn an_ignored_path_does_not_turn_a_selection_into_run_all() {
+    let tmp = TempDir::new().expect("temp dir");
+    let tyf = fake_tyf(&tmp, "[]", &refs_fixtures());
+    let repo = graph_repo();
+    ignore_paths(&repo, r#"["**/*.md", "docs/**"]"#);
+    repo.write("README.md", "# mypkg\n");
+    repo.write("docs/guide/index.md", "# Guide\n");
+    touch_target(&repo);
+
+    let report = impacted(&repo, &tyf, &[]);
+    assert_eq!(report["verdict"], "selected", "a doc edit is not a reason to run everything");
+    assert_eq!(
+        report["ignored_paths"],
+        serde_json::json!(["README.md", "docs/guide/index.md"]),
+        "and the report says what it set aside: {report}"
+    );
+    assert!(!selected(&report).is_empty(), "the walk still ran: {report}");
+}
+
+#[test]
+fn a_path_no_pattern_matches_still_bails_out_and_the_ignored_ones_are_listed() {
+    let repo = graph_repo();
+    ignore_paths(&repo, r#"["**/*.md"]"#);
+    repo.write("README.md", "# mypkg\n");
+    repo.write("requirements.txt", "requests==2.0\n");
+
+    let report =
+        json_output(gerenuk_no_tyf(repo.path()).args(["--format", "json", "impacted-tests"]));
+    assert_eq!(report["reason"], "non_python_changes", "the default stays conservative");
+    assert_eq!(report["ignored_paths"], serde_json::json!(["README.md"]));
+}
+
+#[test]
+fn an_unreadable_ignore_paths_pattern_is_a_failed_run() {
+    let repo = graph_repo();
+    ignore_paths(&repo, r#"["docs/[ab].md"]"#);
+    touch_target(&repo);
+
+    let output =
+        gerenuk_no_tyf(repo.path()).args(["impacted-tests"]).output().expect("gerenuk should run");
+    assert_eq!(output.status.code(), Some(2), "a pattern that cannot match is a broken config");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ignore-paths"), "names the key: {stderr}");
+}
+
 #[test]
 fn a_file_phase_one_could_not_parse_bails_out_too() {
     let repo = graph_repo();

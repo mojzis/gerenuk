@@ -1,18 +1,15 @@
 # Tune gerenuk
 
-Reference for the knobs. The defaults are conservative on purpose: every
-degrade widens the selection and never narrows it, so tune for speed only
-once a `run_all` reason keeps repeating.
+Reference for the knobs. The defaults are conservative on purpose: tune
+for speed only once a `run_all` reason keeps repeating.
 
 **Where the diff comes from.** `--base <REF>` names the ref to diff against;
-by default `origin/main`, then `main`, then `master`, whichever exists first.
-The working tree is diffed from the merge-base - staged, unstaged and
-untracked alike. `--workspace <PATH>` names the project root instead of
-walking up to the nearest `pyproject.toml`, `setup.py`, `setup.cfg` or `.git`.
+by default `origin/main`, then `main`, then `master`. The working tree -
+staged, unstaged and untracked - is diffed from the merge-base.
+`--workspace <PATH>` names the project root instead of walking up to it.
 
-**Budgets.** The walk stops and says `run_all` at whichever limit it hits
-first. A flag beats `[tool.gerenuk]` in `pyproject.toml`, which beats the
-built-in default.
+**Budgets.** The walk says `run_all` at the first limit it hits. A flag
+beats `[tool.gerenuk]` in `pyproject.toml`, which beats the default.
 
 | Flag | Key | Default | Meaning |
 |---|---|---|---|
@@ -25,6 +22,7 @@ built-in default.
 max-depth = 20
 suite-ms = 800
 ignore-decorators = ["transformation", "celery.task"]
+ignore-paths = ["**/*.md", "docs/**"]
 pytest-command = ["uv", "run", "pytest", "-o", "addopts="]
 fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
 ```
@@ -36,6 +34,9 @@ fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
 - `ignore-decorators`: dotted names, suffix-matched syntactically, of
   decorators that register a function with a runner. A changed symbol
   carrying one is reported as ignored; import aliases are not resolved.
+- `ignore-paths`: non-Python files that never force `run_all`, matched on
+  the repo-relative path (`*`, `?`, `**`) and listed as `ignored_paths`; a
+  `.py` file never is. Leave out anything a test reads, like checked docs.
 - `pytest-command`: an argv, never a string, because the common value has
   arguments. Empty means `pytest` on `PATH`; `GERENUK_PYTEST` beats both.
   `-o addopts=` drops a coverage-carrying `addopts` for the hook run only.
@@ -50,11 +51,10 @@ fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
   `inherit` keeps them. `--git-env <POLICY>` beats it. The fallback inherits.
 
 **Binaries.** `GERENUK_TYF`, `GERENUK_GIT` and `GERENUK_PYTEST` each name one
-executable and skip the `PATH` lookup. `tyf` is looked for only once a walk
-is needed, so `changed-symbols` works in a checkout with no `ty` at all.
+executable and skip the `PATH` lookup.
 
 **Audit.** `gerenuk audit src/app.py` reads the same graph backwards for the
 files you name: symbols nothing references, and symbols only tests reach.
-Exit `1` on findings. A verifier for a candidate something else flagged.
+Exit `1` on findings.
 
 next: run `gerenuk run --dry-run`
