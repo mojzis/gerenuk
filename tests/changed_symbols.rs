@@ -226,6 +226,26 @@ fn a_non_python_change_is_partitioned_off() {
 }
 
 #[test]
+fn a_non_python_change_matching_ignore_paths_is_listed_apart() {
+    let repo = src_layout_repo();
+    repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nignore-paths = [\"**/*.md\"]\n",
+    );
+    repo.commit("configure");
+    repo.write("docs/notes.md", "# Notes\n");
+    repo.write("data/schema.sql", "CREATE TABLE t (id INT);\n");
+
+    let report = repo.changed_symbols(&[]);
+    assert_eq!(strings(&report, "ignored_paths"), vec!["docs/notes.md".to_string()]);
+    assert_eq!(
+        strings(&report, "non_python_changes"),
+        vec!["data/schema.sql".to_string()],
+        "a file no pattern matches still counts"
+    );
+}
+
+#[test]
 fn a_syntax_error_is_reported_instead_of_crashing() {
     let repo = src_layout_repo();
     repo.write("src/mypkg/service.py", "def broken(:\n    pass\n");

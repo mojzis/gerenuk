@@ -100,6 +100,10 @@ pub struct ChangedSymbols {
     pub module_level_changes: Vec<ModuleChange>,
     #[serde(default)]
     pub non_python_changes: Vec<String>,
+    /// Non-Python files an `ignore-paths` pattern matched. Listed so the
+    /// decision is auditable, and never a reason to run everything.
+    #[serde(default)]
+    pub ignored_paths: Vec<String>,
     #[serde(default)]
     pub test_files_changed: Vec<String>,
     /// Files that could not be parsed; each is also a module-level change.
@@ -225,7 +229,14 @@ pub fn analyze(
         let Some(reported) = change.reported_path() else { continue };
 
         if change.binary || !is_python(reported) {
-            acc.non_python.insert(display(reported));
+            // `is_python` again rather than `binary`: a `.py` git calls binary
+            // is untrusted, never ignorable, so the option cannot hide code.
+            let path = display(reported);
+            if !is_python(reported) && config.matching_path(&path).is_some() {
+                acc.ignored_paths.insert(path);
+            } else {
+                acc.non_python.insert(path);
+            }
             continue;
         }
         if is_test_path(reported, root) {
@@ -455,6 +466,7 @@ struct Accumulator {
     /// module's, which is what the report sorts by.
     module_level: BTreeSet<(String, String)>,
     non_python: BTreeSet<String>,
+    ignored_paths: BTreeSet<String>,
     test_files: BTreeSet<String>,
     errors: BTreeSet<String>,
 }
@@ -472,6 +484,7 @@ impl Accumulator {
                 .map(|(module, file)| ModuleChange { module, file })
                 .collect(),
             non_python_changes: self.non_python.into_iter().collect(),
+            ignored_paths: self.ignored_paths.into_iter().collect(),
             test_files_changed: self.test_files.into_iter().collect(),
             errors: self.errors.into_iter().collect(),
         }
@@ -491,13 +504,14 @@ fn sorted(mut entries: Vec<SymbolChange>) -> Vec<SymbolChange> {
 }
 
 impl ChangedSymbols {
-    /// True when the diff touched no Python at all.
+    /// True when the diff touched nothing at all, ignored paths included.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.changed_symbols.is_empty()
             && self.ignored_symbols.is_empty()
             && self.module_level_changes.is_empty()
             && self.non_python_changes.is_empty()
+            && self.ignored_paths.is_empty()
             && self.test_files_changed.is_empty()
     }
 
@@ -535,6 +549,7 @@ impl ChangedSymbols {
         module_section(&mut out, "module-level changes", &self.module_level_changes);
         list_section(&mut out, "changed test files", &self.test_files_changed);
         list_section(&mut out, "non-Python changes", &self.non_python_changes);
+        list_section(&mut out, "ignored paths", &self.ignored_paths);
         list_section(&mut out, "parse errors", &self.errors);
 
         out
@@ -1126,6 +1141,67 @@ class Row:
             ],
             "stubs are a phase-1 non-goal, so .pyi counts as non-Python"
         );
+    }
+
+    #[test]
+    fn a_non_python_file_matching_ignore_paths_is_set_aside() {
+        let config = Config {
+            ignore_paths: vec!["**/*.md".to_string(), "docs/**".to_string()],
+            ..Config::default()
+        };
+        let report = run_with(
+            &[
+                modified("README.md", hunks(&[(1, 1)], &[(1, 1)])),
+                modified("docs/logo.png", hunks(&[], &[])),
+                modified("requirements.txt", hunks(&[(1, 1)], &[(1, 1)])),
+            ],
+            &MapSources::default(),
+            &config,
+        );
+
+        assert_eq!(
+            report.ignored_paths,
+            vec!["README.md".to_string(), "docs/logo.png".to_string()],
+            "listed, so the decision stays auditable"
+        );
+        assert_eq!(
+            report.non_python_changes,
+            vec!["requirements.txt".to_string()],
+            "and only what no pattern matched still counts"
+        );
+    }
+
+    #[test]
+    fn a_python_file_is_analysed_whatever_ignore_paths_says() {
+        let config = Config { ignore_paths: vec!["src/**".to_string()], ..Config::default() };
+        let sources = MapSources::default().with_both("src/pkg/mod.py", BEFORE);
+        let mut binary = modified("src/pkg/blob.py", hunks(&[], &[]));
+        binary.binary = true;
+        let report = run_with(
+            &[modified("src/pkg/mod.py", hunks(&[(7, 1)], &[(7, 1)])), binary],
+            &sources,
+            &config,
+        );
+
+        assert!(report.ignored_paths.is_empty(), "the option cannot hide a code change");
+        assert_eq!(pairs(&report.changed_symbols), vec![("pkg.mod:keep".into(), Change::Modified)]);
+        assert_eq!(
+            report.non_python_changes,
+            vec!["src/pkg/blob.py".to_string()],
+            "a binary .py is still untrusted, not ignored"
+        );
+    }
+
+    #[test]
+    fn a_diff_of_only_ignored_paths_is_not_empty() {
+        let config = Config { ignore_paths: vec!["*.md".to_string()], ..Config::default() };
+        let report = run_with(
+            &[modified("CHANGELOG.md", hunks(&[(1, 1)], &[(1, 1)]))],
+            &MapSources::default(),
+            &config,
+        );
+        assert!(!report.is_empty(), "the human report says what it set aside");
+        assert!(report.render_human().contains("ignored paths (1)"), "{}", report.render_human());
     }
 
     #[test]

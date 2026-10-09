@@ -30,7 +30,7 @@ everything" rather than a short list or a crash.
 
 | `reason` | Why |
 |---|---|
-| `non_python_changes` | The diff touched files symbol analysis cannot read |
+| `non_python_changes` | The diff touched files symbol analysis cannot read, and no [`ignore-paths`](changed-symbols.md#ignoring-non-python-paths) pattern matched them |
 | `parse_errors` | A changed file did not parse, so its symbols are unknown |
 | `tyf_unavailable` | `tyf` is not installed, so no reference can be resolved |
 | `refs_failed` | `tyf` failed or answered unparseably part-way through |
@@ -114,6 +114,7 @@ the chain makes it legible.
   ],
   "test_files_changed": [],
   "ignored_symbols": [],
+  "ignored_paths": [],
   "stats": {
     "seeds": 1,
     "visited": 5,
@@ -165,7 +166,10 @@ existed replays with every entry read as `test`.
 
 `test_files_changed` passes straight through from
 [`changed-symbols`](changed-symbols.md): a changed test selects itself, and
-needs no walking.
+needs no walking. So does `ignored_paths`: the non-Python files an
+[`ignore-paths`](changed-symbols.md#ignoring-non-python-paths) pattern set
+aside, which is why they are not a `non_python_changes` reason. The human
+report lists them under `ignored paths`.
 
 ## How the walk works
 

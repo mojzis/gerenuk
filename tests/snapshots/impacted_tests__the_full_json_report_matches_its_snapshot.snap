@@ -5,6 +5,7 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
 {
   "base": "main",
   "errors": [],
+  "ignored_paths": [],
   "ignored_symbols": [
     {
       "file": "src/mypkg/jobs.py",

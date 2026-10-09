@@ -442,6 +442,7 @@ branch without parsing anything. On its **stdin** it finds a JSON payload:
     "ignored_symbols": [],
     "module_level_changes": [],
     "non_python_changes": ["requirements.txt"],
+    "ignored_paths": [],
     "test_files_changed": [],
     "errors": []
   }
@@ -453,7 +454,8 @@ branch without parsing anything. On its **stdin** it finds a JSON payload:
 - `report` is the [`changed-symbols` report](changed-symbols.md#example)
   the run was computed from, in exactly the shape that command prints — the
   changed symbols with their files, the module-level changes, the non-Python
-  changes, the changed test files and the parse errors. It is `null` when
+  changes, the paths `ignore-paths` set aside, the changed test files and the
+  parse errors. It is `null` when
   [`--impact`](#replaying-a-saved-report) replayed a saved impact report, since
   no diff was taken; a fabricated empty report would read as "nothing changed".
 - `reason` is why the outcome is `run_all` — the same value

@@ -67,6 +67,7 @@ non-Python changes (1)
     }
   ],
   "non_python_changes": ["schema.sql"],
+  "ignored_paths": [],
   "test_files_changed": [],
   "errors": []
 }
@@ -145,7 +146,8 @@ Checked in this order, so the first row that matches wins:
 
 | Kind | Where it goes |
 |---|---|
-| Anything that is not `.py`, including `.pyi` stubs and binaries | `non_python_changes` |
+| Anything that is not `.py`, including `.pyi` stubs, that an [`ignore-paths`](#ignoring-non-python-paths) pattern matches | `ignored_paths` |
+| Anything else that is not `.py`, including `.pyi` stubs and binaries | `non_python_changes` |
 | Test files — a `tests`/`test` directory, or `test_*.py` / `*_test.py` | `test_files_changed` |
 | Files that do not parse | `errors`, and the module is reported as module-level |
 
@@ -183,8 +185,39 @@ decorated definition only, never to its neighbours.
 transformation as t` followed by `@t` will not match, because the check never
 leaves the file's syntax.
 
+## Ignoring non-Python paths
+
+Any entry in `non_python_changes` makes `impacted-tests` and `run` answer
+`run_all`, and the diff is branch-wide: one README edit early on a branch
+widens every later hook run on it. Files no test can read — documentation,
+changelogs, agent instructions — can be set aside instead:
+
+```toml
+[tool.gerenuk]
+ignore-paths = ["**/*.md", "docs/**", "CHANGELOG.md"]
+```
+
+A matching file goes to `ignored_paths` rather than `non_python_changes`, so it
+never widens a selection, and it is still listed so the decision can be
+audited. The list is empty by default.
+
+Patterns match the whole repository-relative path. `*` and `?` stay within one
+path segment, and `**` as a whole segment spans any number of them, so `*.md`
+is the root's Markdown and `**/*.md` all of it. Character classes, brace
+alternation and backslashes are refused when the config is loaded — exit `2`,
+naming the key — rather than read literally and never matching.
+
+A `.py` file is never ignored, whatever the pattern: a pattern as broad as
+`**` still cannot hide a code change. A `.py` file git calls binary stays a
+non-Python change too.
+
+**Caveat:** keep out anything a test reads. If a test lints the docs or checks
+an agent instruction file, those paths are inputs, and ignoring them selects
+around the one test that would catch the change.
+
 ## Exit codes
 
 `0` on any successful run, including one that reports hundreds of symbols — the
 output is an inventory, not a verdict. `2` when the run could not complete: not
-a git repository, or a `--base` that does not resolve.
+a git repository, a `--base` that does not resolve, or an `ignore-paths`
+pattern that cannot be read.

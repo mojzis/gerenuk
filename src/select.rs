@@ -523,6 +523,7 @@ mod tests {
             impacted_tests: tests,
             test_files_changed: changed_tests.into_iter().map(ToString::to_string).collect(),
             ignored_symbols: Vec::new(),
+            ignored_paths: Vec::new(),
             stats: Stats::default(),
             errors: Vec::new(),
         }

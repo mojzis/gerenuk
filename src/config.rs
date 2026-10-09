@@ -14,6 +14,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::glob;
 use crate::pysource::suffix_matches;
 use crate::pytest::GitEnv;
 
@@ -69,6 +70,16 @@ pub struct Config {
     /// `inherit` hands them on. The fallback command is not governed by this
     /// key: it inherits everything, always. `--git-env` beats it.
     pub git_env: GitEnv,
+
+    /// Patterns for non-Python files the diff may touch without forcing
+    /// `run_all`: documentation, changelogs, agent instructions.
+    ///
+    /// Empty by default, so any non-Python change still runs everything. A
+    /// matched file is reported under `ignored_paths` instead of
+    /// `non_python_changes`. A `.py` file is never matched, whatever the
+    /// pattern says: the option cannot hide a code change. Syntax in
+    /// [`crate::glob`]; a pattern it cannot read fails [`Config::load`].
+    pub ignore_paths: Vec<String>,
 }
 
 /// Wrapper types mirroring `pyproject.toml`'s nesting: `[tool.gerenuk]`.
@@ -99,7 +110,21 @@ impl Config {
 
         let parsed: PyProject =
             toml::from_str(&text).with_context(|| format!("cannot parse {}", path.display()))?;
-        Ok(parsed.tool.gerenuk)
+        let config = parsed.tool.gerenuk;
+        for pattern in &config.ignore_paths {
+            glob::validate(pattern)
+                .with_context(|| format!("invalid `ignore-paths` entry in {}", path.display()))?;
+        }
+        Ok(config)
+    }
+
+    /// The `ignore-paths` pattern that matches `path`, if any.
+    ///
+    /// `path` is repository-relative. Callers decide whether the file is
+    /// Python; this only matches.
+    #[must_use]
+    pub fn matching_path(&self, path: &str) -> Option<&str> {
+        self.ignore_paths.iter().find(|pattern| glob::matches(pattern, path)).map(String::as_str)
     }
 
     /// The decorator entry that causes `decorator` to be ignored, if any.
@@ -204,6 +229,7 @@ pub(crate) mod keys {
                 "pytest-command",
                 "fallback-command",
                 "git-env",
+                "ignore-paths",
             ] {
                 assert!(keys.contains(expected), "`{expected}` should be accepted: {keys:?}");
             }
@@ -377,6 +403,33 @@ mod tests {
         assert!(message.contains("pyproject.toml"), "names the file, got: {message}");
         assert!(message.contains("git-env"), "names the key, got: {message}");
         assert!(message.contains("isolate") && message.contains("inherit"), "got: {message}");
+    }
+
+    #[test]
+    fn no_path_is_ignored_by_default() {
+        let config = Config::default();
+        assert!(config.ignore_paths.is_empty(), "the conservative behaviour needs no key");
+        assert_eq!(config.matching_path("README.md"), None, "so nothing matches");
+    }
+
+    #[test]
+    fn the_ignored_paths_are_read_in_kebab_case() {
+        let tmp = with_pyproject("[tool.gerenuk]\nignore-paths = [\"**/*.md\", \"docs/**\"]\n");
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(config.ignore_paths, vec!["**/*.md".to_string(), "docs/**".to_string()]);
+        assert_eq!(config.matching_path("docs/guide/setup.md"), Some("**/*.md"), "the first wins");
+        assert_eq!(config.matching_path("docs/logo.png"), Some("docs/**"));
+        assert_eq!(config.matching_path("requirements.txt"), None);
+    }
+
+    #[test]
+    fn an_unsupported_path_pattern_fails_at_load_and_names_the_key() {
+        let tmp = with_pyproject("[tool.gerenuk]\nignore-paths = [\"**/*.{md,rst}\"]\n");
+        let err = Config::load(tmp.path()).expect_err("a pattern that would never match");
+        let message = format!("{err:#}");
+        assert!(message.contains("pyproject.toml"), "names the file, got: {message}");
+        assert!(message.contains("ignore-paths"), "names the key, got: {message}");
+        assert!(message.contains("{md,rst}"), "names the pattern, got: {message}");
     }
 
     #[test]

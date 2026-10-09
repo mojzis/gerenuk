@@ -19,9 +19,9 @@
 **The `run_all` ladder.** Take the first reason that matches.
 
 1. `non-Python files changed`: the diff touched a file gerenuk cannot reason
-   about - config, a template, data - and any test may depend on it. Commit
-   those files separately, or accept the full run; `fallback-command` is the
-   knob for repositories where the full suite is too slow.
+   about - config, a template, data - and any test may depend on it. Files no
+   test reads, like docs, go in `ignore-paths`; otherwise accept the full
+   run, or set `fallback-command` where the full suite is too slow.
 2. `a changed file did not parse`: fix the syntax error, then rerun.
 3. `tyf is not available`: `uv add --dev ty-find`, then `gerenuk doctor`.
 4. `tyf failed during the walk` or `the working tree could not be read`:
@@ -40,7 +40,7 @@
 **JSON.** `--format json` prints one object: `verdict`, `reason` (`null` when
 selected), `base`, `merge_base`, `impacted_tests` as `{file, symbol, via,
 origin}` (`symbol` null for a whole file), `test_files_changed`,
-`ignored_symbols`, `stats` and `errors`.
+`ignored_symbols`, `ignored_paths`, `stats` and `errors`.
 
 **Replay.** Save one walk and map it more than once:
 

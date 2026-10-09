@@ -10,8 +10,9 @@
 //!
 //! Supporting them: [`model`] (wire types for `tyf`'s JSON), [`workspace`]
 //! (project root, test-path heuristic), [`analyze`] (the audit rules),
-//! [`diff`], [`modpath`], [`config`], [`changed`], [`impact`], [`report`] and
-//! [`fallback`] (what `run` delegates to when the outcome is `run_all`).
+//! [`diff`], [`modpath`], [`config`], [`glob`] (the `ignore-paths` patterns),
+//! [`changed`], [`impact`], [`report`] and [`fallback`] (what `run` delegates
+//! to when the outcome is `run_all`).
 //!
 //! [`tyf::Runner::run`] and [`git::Git`]'s private `output` are the only two
 //! places in the crate that spawn a process — every `git` call in it goes
@@ -30,6 +31,7 @@ pub mod diff;
 pub mod fallback;
 pub mod fixtures;
 pub mod git;
+pub mod glob;
 pub mod guide;
 pub mod hooks;
 pub mod impact;

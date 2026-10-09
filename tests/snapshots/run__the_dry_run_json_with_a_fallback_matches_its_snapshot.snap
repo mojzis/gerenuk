@@ -22,6 +22,7 @@ expression: pinned_dry_run(&fixture)
         "base": "main",
         "changed_symbols": [],
         "errors": [],
+        "ignored_paths": [],
         "ignored_symbols": [],
         "merge_base": "<sha>",
         "module_level_changes": [],

@@ -218,6 +218,13 @@ When a test fails during implementation:
   either half turns every `run` and `filter` in a project into a silent skip.
   New names go into `hooks::EXACT` under their framework's comment; a name
   reached by a convention goes into `PREFIXES` or `SUFFIXES`.
+- **`ignore-paths` only ever sees non-Python files.** `changed::analyze`
+  consults `Config::matching_path` only for a path that is not `.py`, so a
+  pattern as broad as `**` cannot hide a code change, and a binary `.py` stays
+  a `non_python_changes` entry. A matched file is listed in `ignored_paths`,
+  never dropped. `glob.rs` is pure and refuses syntax it does not implement at
+  `Config::load`, because a pattern read literally would never match (ADR
+  0021).
 - **Do not trust `tyf`'s production/test split.** Its heuristic reads the whole
   absolute path, so a project under a `tests/` directory has every reference
   filed as a test. `analyze::split_refs` re-derives the buckets from paths
