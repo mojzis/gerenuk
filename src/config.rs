@@ -80,6 +80,25 @@ pub struct Config {
     /// pattern says: the option cannot hide a code change. Syntax in
     /// [`crate::glob`]; a pattern it cannot read fails [`Config::load`].
     pub ignore_paths: Vec<String>,
+
+    /// Whether a line holding only a docstring changes the symbol it sits in.
+    ///
+    /// `ignore` (the default) sets docstring-only edits aside under
+    /// `docstring_changes`, so rewording one selects no tests. `code` counts
+    /// them like any other line, for a project whose behaviour reads
+    /// `__doc__` — docopt, a CLI's `--help`, an API schema.
+    pub docstrings: Docstrings,
+}
+
+/// `[tool.gerenuk] docstrings`: what a docstring-only edit means.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Docstrings {
+    /// A docstring-only edit changes no symbol.
+    #[default]
+    Ignore,
+    /// A docstring line is code like any other.
+    Code,
 }
 
 /// Wrapper types mirroring `pyproject.toml`'s nesting: `[tool.gerenuk]`.
@@ -230,6 +249,7 @@ pub(crate) mod keys {
                 "fallback-command",
                 "git-env",
                 "ignore-paths",
+                "docstrings",
             ] {
                 assert!(keys.contains(expected), "`{expected}` should be accepted: {keys:?}");
             }
@@ -482,5 +502,29 @@ mod tests {
     fn nothing_matches_an_empty_ignore_list() {
         let config = Config::default();
         assert_eq!(config.matching_decorator("transformation"), None, "empty config ignores none");
+    }
+
+    #[test]
+    fn docstrings_are_ignored_by_default() {
+        let tmp = with_pyproject("[tool.gerenuk]\n");
+        let config = Config::load(tmp.path()).expect("loads");
+        assert_eq!(
+            config.docstrings,
+            Docstrings::Ignore,
+            "docstring edits select nothing by default"
+        );
+    }
+
+    #[test]
+    fn docstrings_can_count_as_code() {
+        let tmp = with_pyproject("[tool.gerenuk]\ndocstrings = \"code\"\n");
+        let config = Config::load(tmp.path()).expect("loads");
+        assert_eq!(config.docstrings, Docstrings::Code);
+    }
+
+    #[test]
+    fn an_unknown_docstrings_policy_is_an_error() {
+        let tmp = with_pyproject("[tool.gerenuk]\ndocstrings = \"skip\"\n");
+        assert!(Config::load(tmp.path()).is_err(), "a typo must not silently mean the default");
     }
 }

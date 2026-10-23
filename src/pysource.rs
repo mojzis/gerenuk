@@ -174,6 +174,13 @@ pub struct Module {
     /// Every name bound at module scope by an assignment or an import, in
     /// source order.
     pub bindings: Vec<Binding>,
+    /// Lines that hold nothing but a docstring, as inclusive ranges.
+    ///
+    /// A docstring is the first statement of a module, class or `def` body
+    /// when it is a plain string literal — not an f-string, not bytes. Only
+    /// lines the string has to itself count: `def f(): \"\"\"doc\"\"\"` leaves
+    /// line 1 as code.
+    pub docstrings: Vec<(u32, u32)>,
     /// The source did not parse cleanly. Callers treat the whole file as
     /// module-level rather than trusting a partial tree.
     pub has_error: bool,
@@ -259,6 +266,12 @@ impl Module {
         self.imports.iter().any(|&(start, end)| line >= start && line <= end)
     }
 
+    /// Whether `line` holds nothing but (part of) a docstring.
+    #[must_use]
+    pub fn is_docstring_line(&self, line: u32) -> bool {
+        self.docstrings.iter().any(|&(start, end)| line >= start && line <= end)
+    }
+
     /// Definitions at module level — those whose qualname has no dot.
     pub fn top_level(&self) -> impl Iterator<Item = &SymbolSpan> {
         self.spans.iter().filter(|span| !span.qualname.contains('.'))
@@ -289,7 +302,101 @@ pub fn parse(source: &str) -> Result<Module> {
     let mut bindings = Vec::new();
     collect_bindings(root, source.as_bytes(), &mut bindings);
 
-    Ok(Module { spans, imports, aliases, bindings, has_error: root.has_error() })
+    let mut docstrings = Vec::new();
+    if let Some(doc) = docstring_of(root, source.as_bytes()) {
+        push_docstring(doc, source.as_bytes(), &mut docstrings);
+    }
+    collect_docstrings(root, source.as_bytes(), &mut docstrings);
+    docstrings.sort_unstable();
+
+    Ok(Module { spans, imports, aliases, bindings, docstrings, has_error: root.has_error() })
+}
+
+/// The docstring of every `def` and `class` in the tree, nested ones included.
+///
+/// A definition is a statement, so the walk never enters an expression or a
+/// simple statement: that is most of the tree, and skipping it keeps this pass
+/// cheap. Anything it did miss would only be treated as code.
+fn collect_docstrings(node: Node, src: &[u8], out: &mut Vec<(u32, u32)>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "function_definition" | "class_definition" => {
+                let Some(body) = child.child_by_field_name("body") else { continue };
+                if let Some(doc) = docstring_of(body, src) {
+                    push_docstring(doc, src, out);
+                }
+                collect_docstrings(body, src, out);
+            }
+            kind if kind.ends_with("_statement") && !is_compound(kind) => {}
+            "comment" | "decorator" => {}
+            _ => collect_docstrings(child, src, out),
+        }
+    }
+}
+
+/// Statements with a body that can hold a definition.
+fn is_compound(kind: &str) -> bool {
+    matches!(
+        kind,
+        "if_statement"
+            | "for_statement"
+            | "while_statement"
+            | "try_statement"
+            | "with_statement"
+            | "match_statement"
+    )
+}
+
+/// The string node a body's first statement consists of, if it is a docstring.
+///
+/// Comments are not statements, so one may sit before the docstring. An
+/// f-string is evaluated and never becomes `__doc__`; neither does a bytes
+/// literal, and a t-string is evaluated too. Implicit concatenation is left as
+/// code rather than reasoned about.
+fn docstring_of<'t>(body: Node<'t>, src: &[u8]) -> Option<Node<'t>> {
+    let mut cursor = body.walk();
+    let first = body.named_children(&mut cursor).find(|child| child.kind() != "comment")?;
+    if first.kind() != "expression_statement" || first.named_child_count() != 1 {
+        return None;
+    }
+    let string = first.named_child(0).filter(|node| node.kind() == "string")?;
+    // `string_start` covers the prefix and the opening quotes: `rb'''`, `f"`.
+    let start = string.child(0).filter(|node| node.kind() == "string_start")?;
+    let opening = src.get(start.start_byte()..start.end_byte())?;
+    let evaluated = opening
+        .iter()
+        .take_while(|&&b| b != b'"' && b != b'\'')
+        .any(|b| matches!(b.to_ascii_lowercase(), b'f' | b'b' | b't'));
+    (!evaluated).then_some(string)
+}
+
+/// Record the lines a docstring has to itself.
+///
+/// The first line counts only when nothing but indentation precedes the
+/// string on it, and the last only when nothing but whitespace follows.
+fn push_docstring(string: Node, src: &[u8], out: &mut Vec<(u32, u32)>) {
+    let before = &src[line_start(src, string.start_byte())..string.start_byte()];
+    let after = &src[string.end_byte()..line_end(src, string.end_byte())];
+    let mut first = one_based(string.start_position().row);
+    let mut last = one_based(string.end_position().row);
+    if !before.iter().all(u8::is_ascii_whitespace) {
+        first += 1;
+    }
+    if !after.iter().all(u8::is_ascii_whitespace) {
+        last = last.saturating_sub(1);
+    }
+    if first <= last {
+        out.push((first, last));
+    }
+}
+
+fn line_start(src: &[u8], at: usize) -> usize {
+    src[..at].iter().rposition(|&b| b == b'\n').map_or(0, |newline| newline + 1)
+}
+
+fn line_end(src: &[u8], at: usize) -> usize {
+    src[at..].iter().position(|&b| b == b'\n').map_or(src.len(), |offset| at + offset)
 }
 
 /// Line ranges of every import statement in the tree, at any nesting depth.
@@ -1428,5 +1535,119 @@ def f():
         let crlf = SAMPLE.replace('\n', "\r\n");
         assert_eq!(at(&crlf, 8), at(SAMPLE, 8), "a function body resolves the same");
         assert_eq!(at(&crlf, 16), at(SAMPLE, 16), "and so does a method body");
+    }
+
+    const DOCUMENTED: &str = r#""""Module docstring."""
+
+import os
+
+
+def single():
+    """One line."""
+    return 1
+
+
+def multi():
+    """First line.
+
+    More prose.
+    """
+    return 2
+
+
+class Holder:
+    # a comment before the docstring does not stop it being one
+    r'''Raw docstrings count.'''
+
+    def method(self):
+        """Method doc."""
+        def nested():
+            """Nested doc."""
+        return nested
+
+
+def inline(): """Shares the def line."""
+
+
+def trailing():
+    """Followed by code."""; x = 1
+    return x
+
+
+def formatted():
+    f"""Not a docstring: {os.sep}"""
+
+
+def bytes_doc():
+    b"""Not a docstring either."""
+
+
+def second():
+    x = 1
+    """A bare string after a statement is not a docstring."""
+    return x
+"#;
+
+    fn docstring_lines(source: &str) -> Vec<u32> {
+        let parsed = module(source);
+        let count = u32::try_from(source.lines().count()).expect("a small sample");
+        (1..=count).filter(|&line| parsed.is_docstring_line(line)).collect()
+    }
+
+    #[test]
+    fn a_docstring_is_the_first_string_of_a_module_class_or_def_body() {
+        assert_eq!(
+            docstring_lines(DOCUMENTED),
+            vec![1, 7, 12, 13, 14, 15, 21, 24, 26],
+            "module, function, multi-line, raw class, method and nested docstrings"
+        );
+    }
+
+    #[test]
+    fn a_docstring_sharing_a_line_with_code_leaves_that_line_as_code() {
+        let lines = docstring_lines(DOCUMENTED);
+        assert!(!lines.contains(&30), "`def inline(): \"\"\"…\"\"\"` is the def line");
+        assert!(!lines.contains(&34), "`\"\"\"…\"\"\"; x = 1` runs code after the string");
+    }
+
+    #[test]
+    fn strings_python_does_not_treat_as_docstrings_are_code() {
+        let lines = docstring_lines(DOCUMENTED);
+        assert!(!lines.contains(&39), "an f-string is evaluated, never a docstring");
+        assert!(!lines.contains(&43), "a bytes literal is not a docstring");
+        assert!(!lines.contains(&48), "only the first statement of a body is a docstring");
+    }
+
+    #[test]
+    fn a_multi_line_docstring_opening_on_the_def_line_leaves_only_that_line_as_code() {
+        let source = "def f(): \"\"\"Opens here,\n    and closes here.\"\"\"\n";
+        assert_eq!(docstring_lines(source), vec![2], "line 1 holds the `def`");
+    }
+
+    #[test]
+    fn definitions_inside_compound_statements_keep_their_docstrings() {
+        let source = "\
+if True:
+    def a():
+        \"\"\"A.\"\"\"
+try:
+    class B:
+        \"\"\"B.\"\"\"
+except ImportError:
+    pass
+async def c():
+    \"\"\"C.\"\"\"
+";
+        assert_eq!(docstring_lines(source), vec![3, 6, 10], "`if`, `try` and `async def` alike");
+    }
+
+    #[test]
+    fn a_crlf_docstring_is_still_one() {
+        let crlf = DOCUMENTED.replace('\n', "\r\n");
+        assert_eq!(
+            docstring_lines(&crlf),
+            docstring_lines(DOCUMENTED),
+            "line endings do not matter"
+        );
     }
 }

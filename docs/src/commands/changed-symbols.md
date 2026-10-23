@@ -69,6 +69,7 @@ non-Python changes (1)
   "non_python_changes": ["schema.sql"],
   "ignored_paths": [],
   "test_files_changed": [],
+  "docstring_changes": ["mypkg.models:Animal.label"],
   "errors": []
 }
 ```
@@ -214,6 +215,32 @@ non-Python change too.
 **Caveat:** keep out anything a test reads. If a test lints the docs or checks
 an agent instruction file, those paths are inputs, and ignoring them selects
 around the one test that would catch the change.
+
+## Docstring-only edits
+
+A line that holds nothing but a docstring does not change the symbol it sits
+in. Rewording one moves its symbol to `docstring_changes` instead of
+`changed_symbols`, and a module docstring is not a module-level change, so the
+edit selects no tests. The symbol is listed by id, a module's without a colon,
+so the decision can be audited. An edit that also touches any other line of
+the symbol is a modification as before.
+
+A docstring is the first statement of a module, class or `def` body, when that
+statement is a plain string literal: an f-string, a t-string or a bytes literal
+is code. Only lines the string has to itself count, so in
+`def f(): """doc"""` the line is the `def`'s. Docstrings are set aside only
+when the same module exists on both sides of the diff: deleting or renaming a
+file breaks its importers whatever it held.
+
+**Caveat:** some code reads `__doc__` at runtime — docopt parses it, CLI
+frameworks print it as help text, web frameworks put it in an API schema. A
+test that checks that output is skipped by a docstring edit. Such a project
+counts docstrings as code:
+
+```toml
+[tool.gerenuk]
+docstrings = "code"
+```
 
 ## Exit codes
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-use crate::config::Config;
+use crate::config::{Config, Docstrings};
 use crate::diff::{self, FileDiff, LineRange};
 use crate::git::{Base, Git};
 use crate::modpath::{module_path, symbol_id};
@@ -106,6 +106,11 @@ pub struct ChangedSymbols {
     pub ignored_paths: Vec<String>,
     #[serde(default)]
     pub test_files_changed: Vec<String>,
+    /// Symbols and modules whose only change was to a docstring, under
+    /// `[tool.gerenuk] docstrings = "ignore"` (the default). Listed so the
+    /// decision is auditable; never a seed. A module id has no colon.
+    #[serde(default)]
+    pub docstring_changes: Vec<String>,
     /// Files that could not be parsed; each is also a module-level change.
     #[serde(default)]
     pub errors: Vec<String>,
@@ -274,14 +279,27 @@ fn analyze_file(
     }
 
     let (old_lines, new_lines) = touched(change, old.as_ref(), new.as_ref());
+    let skip_docstrings = config.docstrings == Docstrings::Ignore
+        && edited_in_place(change, old.as_ref(), new.as_ref());
 
     // Keyed by the full `module:QualName` symbol id, not by qualname alone: a
     // rename moves the module, so `pkg.old:f` and `pkg.new:f` are two symbols
     // even though the definition is byte-identical.
     let mut touched_symbols: BTreeMap<String, (&SymbolSpan, &LoadedSide)> = BTreeMap::new();
+    // Symbol and module ids a docstring line touched; whatever no other line
+    // touched ends up in `docstring_changes`.
+    let mut docstring_only: BTreeSet<String> = BTreeSet::new();
+    let mut module_touched = false;
     for (side, lines) in [(old.as_ref(), &old_lines), (new.as_ref(), &new_lines)] {
         let Some(side) = side else { continue };
         for &line in lines {
+            if skip_docstrings && side.parsed.is_docstring_line(line) {
+                docstring_only.insert(match side.parsed.symbol_at(line) {
+                    Some(span) => symbol_id(&side.module, &span.qualname),
+                    None => side.module.clone(),
+                });
+                continue;
+            }
             match side.parsed.symbol_at(line) {
                 Some(span) => {
                     // New-side entries overwrite old-side ones, so the report
@@ -290,9 +308,18 @@ fn analyze_file(
                 }
                 None if side.is_blank(line) => {}
                 None => {
+                    module_touched = true;
                     acc.module_level.insert(side.module_level_change());
                 }
             }
+        }
+    }
+
+    for id in docstring_only {
+        let elsewhere =
+            if id.contains(':') { touched_symbols.contains_key(&id) } else { module_touched };
+        if !elsewhere {
+            acc.docstrings.insert(id);
         }
     }
 
@@ -425,6 +452,20 @@ fn touched(
     }
 }
 
+/// Whether the same module exists on both sides of a hunk diff.
+///
+/// Only then can a docstring line be set aside. Deleting or renaming a module
+/// breaks its importers whatever the file held, and a rename or an untracked
+/// file is attributed whole, docstrings included.
+fn edited_in_place(
+    change: &FileChange,
+    old: Option<&LoadedSide>,
+    new: Option<&LoadedSide>,
+) -> bool {
+    matches!(change.sides, Sides::Hunks { .. })
+        && old.zip(new).is_some_and(|(old, new)| old.module == new.module)
+}
+
 fn all_lines(side: Option<&LoadedSide>) -> Vec<u32> {
     side.map(|s| (1..=s.line_count()).collect()).unwrap_or_default()
 }
@@ -468,6 +509,7 @@ struct Accumulator {
     non_python: BTreeSet<String>,
     ignored_paths: BTreeSet<String>,
     test_files: BTreeSet<String>,
+    docstrings: BTreeSet<String>,
     errors: BTreeSet<String>,
 }
 
@@ -486,6 +528,7 @@ impl Accumulator {
             non_python_changes: self.non_python.into_iter().collect(),
             ignored_paths: self.ignored_paths.into_iter().collect(),
             test_files_changed: self.test_files.into_iter().collect(),
+            docstring_changes: self.docstrings.into_iter().collect(),
             errors: self.errors.into_iter().collect(),
         }
     }
@@ -513,6 +556,7 @@ impl ChangedSymbols {
             && self.non_python_changes.is_empty()
             && self.ignored_paths.is_empty()
             && self.test_files_changed.is_empty()
+            && self.docstring_changes.is_empty()
     }
 
     pub fn render(&self, format: Format) -> Result<String> {
@@ -548,6 +592,7 @@ impl ChangedSymbols {
         symbol_section(&mut out, "ignored symbols", &self.ignored_symbols, width);
         module_section(&mut out, "module-level changes", &self.module_level_changes);
         list_section(&mut out, "changed test files", &self.test_files_changed);
+        list_section(&mut out, "docstring-only changes", &self.docstring_changes);
         list_section(&mut out, "non-Python changes", &self.non_python_changes);
         list_section(&mut out, "ignored paths", &self.ignored_paths);
         list_section(&mut out, "parse errors", &self.errors);
@@ -1369,5 +1414,164 @@ def normalize(df):
             !json.contains("ignored_by"),
             "a non-ignored symbol must not carry a null field, got: {json}"
         );
+    }
+
+    const DOCUMENTED: &str = r#""""Module doc."""
+
+import os
+
+
+def keep(x):
+    """Keep doc."""
+    return x + 1
+
+
+class Service:
+    """Service doc."""
+
+    def run(self):
+        """Run doc."""
+        return 1
+"#;
+
+    fn documented(edit: impl Fn(&str) -> String) -> MapSources {
+        MapSources::default()
+            .with_old("src/pkg/mod.py", DOCUMENTED)
+            .with_new("src/pkg/mod.py", &edit(DOCUMENTED))
+    }
+
+    fn docstrings_count_as_code() -> Config {
+        Config { docstrings: Docstrings::Code, ..Config::default() }
+    }
+
+    #[test]
+    fn a_docstring_only_edit_changes_no_symbol_and_is_listed() {
+        let sources = documented(|s| s.replace("Keep doc.", "Keep doc, reworded."));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(7, 1)], &[(7, 1)]))], &sources);
+
+        assert!(report.changed_symbols.is_empty(), "a docstring does not change behaviour");
+        assert_eq!(report.docstring_changes, vec!["pkg.mod:keep".to_string()], "but it is listed");
+        assert!(!report.is_empty(), "so the report is not mistaken for an empty diff");
+    }
+
+    #[test]
+    fn a_docstring_edit_alongside_a_body_edit_is_a_modification() {
+        let sources = documented(|s| s.replace("Keep doc.", "Reworded.").replace("x + 1", "x + 2"));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(7, 2)], &[(7, 2)]))], &sources);
+
+        assert_eq!(
+            pairs(&report.changed_symbols),
+            vec![("pkg.mod:keep".to_string(), Change::Modified)]
+        );
+        assert!(report.docstring_changes.is_empty(), "a modified symbol is not docstring-only");
+    }
+
+    #[test]
+    fn a_module_docstring_edit_is_not_a_module_level_change() {
+        let sources = documented(|s| s.replace("Module doc.", "Module doc, reworded."));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(1, 1)], &[(1, 1)]))], &sources);
+
+        assert!(modules(&report).is_empty(), "importers of the module are not affected");
+        assert_eq!(
+            report.docstring_changes,
+            vec!["pkg.mod".to_string()],
+            "a module id has no colon"
+        );
+    }
+
+    #[test]
+    fn a_class_docstring_edit_lists_the_class_and_not_its_methods() {
+        let sources = documented(|s| s.replace("Service doc.", "Reworded."));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(12, 1)], &[(12, 1)]))], &sources);
+
+        assert!(report.changed_symbols.is_empty());
+        assert_eq!(report.docstring_changes, vec!["pkg.mod:Service".to_string()]);
+    }
+
+    #[test]
+    fn removing_a_docstring_is_a_docstring_change() {
+        let sources = documented(|s| s.replace("        \"\"\"Run doc.\"\"\"\n", ""));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(15, 1)], &[(14, 0)]))], &sources);
+
+        assert!(report.changed_symbols.is_empty(), "the old side's line was a docstring");
+        assert_eq!(report.docstring_changes, vec!["pkg.mod:Service.run".to_string()]);
+    }
+
+    #[test]
+    fn a_statement_inserted_before_a_docstring_is_a_modification() {
+        let sources =
+            documented(|s| s.replace("    \"\"\"Keep doc.", "    x = 0\n    \"\"\"Keep doc."));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(6, 0)], &[(7, 1)]))], &sources);
+
+        assert_eq!(
+            pairs(&report.changed_symbols),
+            vec![("pkg.mod:keep".to_string(), Change::Modified)],
+            "the inserted line is code, and the string after it is no longer a docstring"
+        );
+    }
+
+    #[test]
+    fn docstrings_count_as_code_when_configured() {
+        let sources = documented(|s| s.replace("Keep doc.", "Reworded."));
+        let config = docstrings_count_as_code();
+        let report =
+            run_with(&[modified("src/pkg/mod.py", hunks(&[(7, 1)], &[(7, 1)]))], &sources, &config);
+
+        assert_eq!(
+            pairs(&report.changed_symbols),
+            vec![("pkg.mod:keep".to_string(), Change::Modified)]
+        );
+        assert!(report.docstring_changes.is_empty(), "nothing is set aside");
+    }
+
+    #[test]
+    fn deleting_a_docstring_only_module_is_still_a_module_level_change() {
+        // Its importers break, whatever the file held.
+        let sources =
+            MapSources::default().with_old("src/pkg/doc.py", "\"\"\"Only a docstring.\"\"\"\n");
+        let change = FileChange {
+            old_path: Some(PathBuf::from("src/pkg/doc.py")),
+            new_path: None,
+            sides: hunks(&[(1, 1)], &[]),
+            binary: false,
+        };
+        let report = run(&[change], &sources);
+
+        assert_eq!(modules(&report), vec!["pkg.doc"]);
+        assert!(report.docstring_changes.is_empty());
+    }
+
+    #[test]
+    fn renaming_a_docstring_only_module_is_still_a_module_level_change() {
+        let body = "\"\"\"Only a docstring.\"\"\"\n";
+        let sources =
+            MapSources::default().with_old("src/pkg/old.py", body).with_new("src/pkg/new.py", body);
+        let change = FileChange {
+            old_path: Some(PathBuf::from("src/pkg/old.py")),
+            new_path: Some(PathBuf::from("src/pkg/new.py")),
+            sides: Sides::Whole,
+            binary: false,
+        };
+        let report = run(&[change], &sources);
+
+        assert_eq!(modules(&report), vec!["pkg.new", "pkg.old"], "a moved module is a new module");
+        assert!(report.docstring_changes.is_empty());
+    }
+
+    #[test]
+    fn docstring_changes_default_to_empty_when_replayed() {
+        let json = r#"{"base": "main", "merge_base": "abc"}"#;
+        let report: ChangedSymbols = serde_json::from_str(json).expect("an older report replays");
+        assert!(report.docstring_changes.is_empty());
+    }
+
+    #[test]
+    fn the_human_report_lists_docstring_only_changes() {
+        let sources = documented(|s| s.replace("Keep doc.", "Reworded."));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(7, 1)], &[(7, 1)]))], &sources);
+        let human = report.render(Format::Human).expect("renders");
+
+        assert!(human.contains("docstring-only changes (1)"), "{human}");
+        assert!(human.contains("pkg.mod:keep"), "{human}");
     }
 }

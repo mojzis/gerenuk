@@ -23,6 +23,7 @@ max-depth = 20
 suite-ms = 800
 ignore-decorators = ["transformation", "celery.task"]
 ignore-paths = ["**/*.md", "docs/**"]
+docstrings = "code"
 pytest-command = ["uv", "run", "pytest", "-o", "addopts="]
 fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
 ```
@@ -37,6 +38,8 @@ fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
 - `ignore-paths`: non-Python files that never force `run_all`, matched on
   the repo-relative path (`*`, `?`, `**`) and listed as `ignored_paths`; a
   `.py` file never is. Leave out anything a test reads, like checked docs.
+- `docstrings`: `ignore` (default) selects nothing for a docstring-only edit;
+  `code` counts it, for code that reads `__doc__` (docopt, CLI help text).
 - `pytest-command`: an argv, never a string, because the common value has
   arguments. Empty means `pytest` on `PATH`; `GERENUK_PYTEST` beats both.
   `-o addopts=` drops a coverage-carrying `addopts` for the hook run only.
@@ -51,10 +54,7 @@ fallback-command = ["scripts/pick-subprojects.sh", "--from-gerenuk"]
   `inherit` keeps them. `--git-env <POLICY>` beats it. The fallback inherits.
 
 **Binaries.** `GERENUK_TYF`, `GERENUK_GIT` and `GERENUK_PYTEST` each name one
-executable and skip the `PATH` lookup.
-
-**Audit.** `gerenuk audit src/app.py` reads the same graph backwards for the
-files you name: symbols nothing references, and symbols only tests reach.
-Exit `1` on findings.
+executable and skip the `PATH` lookup. **Audit.** `gerenuk audit src/app.py`
+lists symbols nothing references, or only tests reach. Exit `1` on findings.
 
 next: run `gerenuk run --dry-run`
