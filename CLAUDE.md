@@ -225,12 +225,16 @@ When a test fails during implementation:
   never dropped. `glob.rs` is pure and refuses syntax it does not implement at
   `Config::load`, because a pattern read literally would never match (ADR
   0021).
-- **A docstring-only edit changes no symbol, and only an in-place edit can be
-  one.** `pysource::Module::docstrings` is the lines a docstring has to itself;
-  `changed::analyze_file` skips them only when `docstrings = "ignore"` (the
-  default) *and* the same module exists on both sides of a hunk diff. Dropping
-  the second half lets deleting or renaming a docstring-only module hide its
-  broken importers. A set-aside id lands in `docstring_changes`, never dropped
+- **A comment- or docstring-only edit changes no symbol, and only an in-place
+  edit can be one.** `pysource::Module::docstrings` and `comments` are the
+  lines a docstring or a comment has to itself, read off the tree so a `#` in a
+  string never counts; a shebang or coding cookie on line 1-2 is code.
+  `blanks` excludes lines inside a string literal, whose value they are part
+  of; an in-place blank line is skipped silently, like one between defs.
+  `changed::analyze_file` skips them only when the same module exists on both
+  sides of a hunk diff, and docstrings only under `docstrings = "ignore"` (the
+  default). Dropping the in-place check lets deleting or renaming an inert-only
+  module hide its broken importers. A set-aside id lands in `inert_changes`, never dropped
   and never a seed (ADR 0022).
 - **Do not trust `tyf`'s production/test split.** Its heuristic reads the whole
   absolute path, so a project under a `tests/` directory has every reference

@@ -561,7 +561,7 @@ fn a_docstring_only_edit_is_listed_and_changes_no_symbol() {
 
     let report = repo.changed_symbols(&[]);
     assert_eq!(pairs(&report, "changed_symbols"), vec![], "adding a docstring changes nothing");
-    assert_eq!(strings(&report, "docstring_changes"), vec!["mypkg.service:describe".to_string()]);
+    assert_eq!(strings(&report, "inert_changes"), vec!["mypkg.service:describe".to_string()]);
 }
 
 #[test]
@@ -583,5 +583,5 @@ fn a_docstring_only_edit_counts_when_docstrings_are_code() {
         pairs(&report, "changed_symbols"),
         vec![("mypkg.service:describe".to_string(), "modified".to_string())]
     );
-    assert_eq!(strings(&report, "docstring_changes"), Vec::<String>::new());
+    assert_eq!(strings(&report, "inert_changes"), Vec::<String>::new());
 }

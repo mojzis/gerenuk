@@ -84,7 +84,7 @@ pub struct Config {
     /// Whether a line holding only a docstring changes the symbol it sits in.
     ///
     /// `ignore` (the default) sets docstring-only edits aside under
-    /// `docstring_changes`, so rewording one selects no tests. `code` counts
+    /// `inert_changes`, so rewording one selects no tests. `code` counts
     /// them like any other line, for a project whose behaviour reads
     /// `__doc__` — docopt, a CLI's `--help`, an API schema.
     pub docstrings: Docstrings,

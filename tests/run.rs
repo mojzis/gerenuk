@@ -723,6 +723,19 @@ fn a_docstring_only_diff_runs_nothing_and_never_falls_back() {
 }
 
 #[test]
+fn a_comment_only_diff_runs_nothing() {
+    let fixture = Fixture::new(0);
+    fixture.repo.write(
+        "src/mypkg/core.py",
+        &CORE.replace("    return value + 1", "    # why\n    return value + 1"),
+    );
+
+    let output = fixture.run(&[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fixture.argv(), None, "a comment impacts nothing, so pytest is not spawned");
+}
+
+#[test]
 fn a_docstring_only_diff_selects_when_docstrings_are_code() {
     let fixture = Fixture::new(0);
     fixture.configure("docstrings = \"code\"\n");

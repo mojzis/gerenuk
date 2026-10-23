@@ -181,6 +181,16 @@ pub struct Module {
     /// lines the string has to itself count: `def f(): \"\"\"doc\"\"\"` leaves
     /// line 1 as code.
     pub docstrings: Vec<(u32, u32)>,
+    /// Lines that hold nothing but a comment, sorted.
+    ///
+    /// Read off the tree, so a `#` line inside a multi-line string is string
+    /// content and not listed. A shebang or an encoding cookie on line 1 or 2
+    /// is not listed either: those decide what runs the file and how it
+    /// decodes.
+    pub comments: Vec<u32>,
+    /// Whitespace-only lines, sorted, except those inside a string literal,
+    /// which are part of its value.
+    pub blanks: Vec<u32>,
     /// The source did not parse cleanly. Callers treat the whole file as
     /// module-level rather than trusting a partial tree.
     pub has_error: bool,
@@ -266,6 +276,18 @@ impl Module {
         self.imports.iter().any(|&(start, end)| line >= start && line <= end)
     }
 
+    /// Whether `line` is whitespace-only and outside every string literal.
+    #[must_use]
+    pub fn is_blank_line(&self, line: u32) -> bool {
+        self.blanks.binary_search(&line).is_ok()
+    }
+
+    /// Whether `line` holds nothing but a comment.
+    #[must_use]
+    pub fn is_comment_line(&self, line: u32) -> bool {
+        self.comments.binary_search(&line).is_ok()
+    }
+
     /// Whether `line` holds nothing but (part of) a docstring.
     #[must_use]
     pub fn is_docstring_line(&self, line: u32) -> bool {
@@ -309,7 +331,67 @@ pub fn parse(source: &str) -> Result<Module> {
     collect_docstrings(root, source.as_bytes(), &mut docstrings);
     docstrings.sort_unstable();
 
-    Ok(Module { spans, imports, aliases, bindings, docstrings, has_error: root.has_error() })
+    let (comments, blanks) = inert_lines(root, source);
+
+    Ok(Module {
+        spans,
+        imports,
+        aliases,
+        bindings,
+        docstrings,
+        comments,
+        blanks,
+        has_error: root.has_error(),
+    })
+}
+
+/// Comment-only and blank lines, as [`Module::comments`] and
+/// [`Module::blanks`] describe them.
+///
+/// The text only nominates a line: the tree says whether a leading `#` opens
+/// a comment, and whether a blank line sits inside a string.
+fn inert_lines(root: Node, source: &str) -> (Vec<u32>, Vec<u32>) {
+    let mut comments = Vec::new();
+    let mut blanks = Vec::new();
+    let mut offset = 0;
+    for (index, line) in source.split_inclusive('\n').enumerate() {
+        let start = offset;
+        offset += line.len();
+        let text = line.trim_start();
+        let at = start + (line.len() - text.len());
+        let number = one_based(index);
+        if text.trim_end().is_empty() {
+            if !inside_string(root, start) {
+                blanks.push(number);
+            }
+            continue;
+        }
+        if !text.starts_with('#') {
+            continue;
+        }
+        if number <= 2 && (text.starts_with("#!") || text.contains("coding")) {
+            continue;
+        }
+        let is_comment = root
+            .descendant_for_byte_range(at, at + 1)
+            .is_some_and(|node| node.kind() == "comment" && node.start_byte() == at);
+        if is_comment {
+            comments.push(number);
+        }
+    }
+    (comments, blanks)
+}
+
+/// Whether the byte at `at` belongs to a string literal.
+fn inside_string(root: Node, at: usize) -> bool {
+    let mut node = root.descendant_for_byte_range(at, at);
+    while let Some(current) = node {
+        if current.kind() == "string" {
+            return true;
+        }
+        node = current.parent();
+    }
+    false
 }
 
 /// The docstring of every `def` and `class` in the tree, nested ones included.
@@ -1649,5 +1731,80 @@ async def c():
             docstring_lines(DOCUMENTED),
             "line endings do not matter"
         );
+    }
+
+    const COMMENTED: &str = r#"#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# An ordinary header comment.
+import os  # a trailing comment shares its line with code
+
+
+def f():
+    # a comment inside a body
+    text = """
+# not a comment: string content
+"""
+    return call(
+        1,  # trailing again
+        # alone inside the call's parentheses
+        2,
+    )
+"#;
+
+    fn comment_lines(source: &str) -> Vec<u32> {
+        let parsed = module(source);
+        let count = u32::try_from(source.lines().count()).expect("a small sample");
+        (1..=count).filter(|&line| parsed.is_comment_line(line)).collect()
+    }
+
+    #[test]
+    fn a_comment_alone_on_its_line_is_a_comment_line() {
+        assert_eq!(
+            comment_lines(COMMENTED),
+            vec![3, 8, 14],
+            "header, body and mid-expression comments; never one sharing a line with code"
+        );
+    }
+
+    #[test]
+    fn a_hash_inside_a_string_is_string_content() {
+        assert!(!comment_lines(COMMENTED).contains(&10), "the string's value would change");
+    }
+
+    #[test]
+    fn a_shebang_or_an_encoding_cookie_is_code() {
+        let lines = comment_lines(COMMENTED);
+        assert!(!lines.contains(&1), "a shebang decides what runs the file");
+        assert!(!lines.contains(&2), "a coding cookie decides how the file decodes");
+        assert_eq!(comment_lines("x = 1\n# vim: set fileencoding=latin-1 :\n"), Vec::<u32>::new());
+        assert_eq!(
+            comment_lines("x = 1\n\n# coding is fun\n"),
+            vec![3],
+            "line 3 cannot be a cookie"
+        );
+    }
+
+    const BLANKS: &str = "\
+def f():
+    a = 1
+
+    text = \"\"\"first
+
+last\"\"\"
+    return call(
+
+        a,
+    )
+";
+
+    fn blank_lines(source: &str) -> Vec<u32> {
+        let parsed = module(source);
+        let count = u32::try_from(source.lines().count()).expect("a small sample");
+        (1..=count).filter(|&line| parsed.is_blank_line(line)).collect()
+    }
+
+    #[test]
+    fn a_blank_line_inside_a_string_is_string_content() {
+        assert_eq!(blank_lines(BLANKS), vec![3, 8], "line 5 is part of `text`'s value");
     }
 }

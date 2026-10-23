@@ -1,0 +1,73 @@
+# 0022 — A comment- or docstring-only edit changes no symbol
+
+**Status:** accepted
+
+## Decision
+
+In phase 1, a changed line that holds nothing but a comment or a docstring is
+not attributed to the symbol it sits in, nor to its module. A symbol or module
+that only such lines touched is listed under `inert_changes` — symbol ids, a
+module's without a colon (ADR 0008) — and seeds nothing.
+
+Comments are always set aside. Docstrings are by default;
+`[tool.gerenuk] docstrings = "code"` counts them as code again.
+
+A docstring is the first statement of a module, class or `def` body when it is
+a plain string literal: not an f-string, t-string or bytes literal, which are
+code, and not an implicit concatenation, which is left as code rather than
+reasoned about. A comment may precede it. Only the lines the string has to
+itself count: `def f(): """doc"""` leaves its line to the `def`.
+
+A comment line is one whose first non-blank character opens a tree-sitter
+`comment` node, so a `#` line inside a multi-line string is string content and
+`x = 1  # why` is code. A shebang or a line containing `coding` on line 1 or 2
+is code: PEP 263 reads the encoding from there, and the decoding changes every
+string literal in the file.
+
+A blank line inside a definition is skipped too, silently, like one between
+definitions: rewording a comment block on either side of a blank line puts the
+blank line in git's hunk. A blank line inside a string literal is never blank
+in this sense — it is part of the value — which also fixes the older
+module-level rule: deleting a blank line from a module-level multi-line string
+used to report nothing.
+
+These apply only when the same module exists on both sides of a hunk diff. A
+deleted or renamed module breaks its importers whatever it held, and an
+untracked file is attributed whole.
+
+## Why
+
+Rewording a comment or a docstring is the commonest change that cannot fail
+a test, and it cost a full selection: a function's callers' tests, or for a
+module-level line every importer's. It is a speed default, chosen for the
+hook a developer waits on.
+
+The filter is per line, beside the blank-line rule, rather than a comparison
+of each symbol's code with comments and docstrings stripped. Any other line
+the diff touches still counts, so an inert edit next to a real one is a
+modification as before, and a statement inserted above a docstring is code on
+its own line. tree-sitter has already parsed both sides, so the cost is one
+more pass over the statements and one lookup per `#` line.
+
+## Cost
+
+A comment never reaches the interpreter, so setting one aside cannot hide a
+failure that pytest would see.
+
+A docstring can. This rule *narrows* a selection, which every other degrade in
+gerenuk refuses to do: code that reads `__doc__` at runtime — docopt, a CLI
+framework's help text, an API schema — gets a confident selection that misses
+the test that checks that output. Making it the default trades that for speed
+in every other project; the docs name the caveat next to the key.
+
+Doctests are not a new gap: gerenuk only selects files `collects_tests`
+accepts, so a doctest in a source module was never selected.
+
+`ChangedSymbols` gained an array that defaults, so an older `--changed` report
+still replays. The fallback payload gained a field, which keeps version `1`
+(ADR 0014).
+
+## Revisit when
+
+A project needs docstrings counted for some modules only — a CLI package that
+uses docopt beside a library that does not. That is a path list, not a policy.

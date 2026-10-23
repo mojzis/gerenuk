@@ -93,8 +93,8 @@ need neither (`non_python_changes`, `parse_errors`) have been settled, so a
 diff of a `pyproject.toml` alone still answers with no `ty` installed. A
 non-Python file an `ignore-paths` pattern matches is not a `non_python_changes`
 entry at all: phase 1 lists it under `ignored_paths` (ADR 0021). Neither is a
-symbol whose only edit was its docstring: phase 1 lists it under
-`docstring_changes` (ADR 0022). `run`
+symbol whose only edit was a comment or its docstring: phase 1 lists it under
+`inert_changes` (ADR 0022). `run`
 adds a fourth source that is neither `tyf` nor `git`: the test files themselves,
 parsed for their fixtures and their collectible names.
 

@@ -106,11 +106,12 @@ pub struct ChangedSymbols {
     pub ignored_paths: Vec<String>,
     #[serde(default)]
     pub test_files_changed: Vec<String>,
-    /// Symbols and modules whose only change was to a docstring, under
-    /// `[tool.gerenuk] docstrings = "ignore"` (the default). Listed so the
-    /// decision is auditable; never a seed. A module id has no colon.
+    /// Symbols and modules whose only change was to comments, or to a
+    /// docstring under `[tool.gerenuk] docstrings = "ignore"` (the default).
+    /// Listed so the decision is auditable; never a seed. A module id has no
+    /// colon.
     #[serde(default)]
-    pub docstring_changes: Vec<String>,
+    pub inert_changes: Vec<String>,
     /// Files that could not be parsed; each is also a module-level change.
     #[serde(default)]
     pub errors: Vec<String>,
@@ -279,22 +280,29 @@ fn analyze_file(
     }
 
     let (old_lines, new_lines) = touched(change, old.as_ref(), new.as_ref());
-    let skip_docstrings = config.docstrings == Docstrings::Ignore
-        && edited_in_place(change, old.as_ref(), new.as_ref());
+    let in_place = edited_in_place(change, old.as_ref(), new.as_ref());
+    let skip_docstrings = in_place && config.docstrings == Docstrings::Ignore;
 
     // Keyed by the full `module:QualName` symbol id, not by qualname alone: a
     // rename moves the module, so `pkg.old:f` and `pkg.new:f` are two symbols
     // even though the definition is byte-identical.
     let mut touched_symbols: BTreeMap<String, (&SymbolSpan, &LoadedSide)> = BTreeMap::new();
-    // Symbol and module ids a docstring line touched; whatever no other line
-    // touched ends up in `docstring_changes`.
-    let mut docstring_only: BTreeSet<String> = BTreeSet::new();
+    // Symbol and module ids a docstring or comment line touched; whatever no
+    // other line touched ends up in `inert_changes`.
+    let mut inert_only: BTreeSet<String> = BTreeSet::new();
     let mut module_touched = false;
     for (side, lines) in [(old.as_ref(), &old_lines), (new.as_ref(), &new_lines)] {
         let Some(side) = side else { continue };
         for &line in lines {
-            if skip_docstrings && side.parsed.is_docstring_line(line) {
-                docstring_only.insert(match side.parsed.symbol_at(line) {
+            // A blank line inside a definition carries no meaning either, but
+            // it is skipped silently, as one between definitions always was.
+            if in_place && side.parsed.is_blank_line(line) {
+                continue;
+            }
+            let inert = (in_place && side.parsed.is_comment_line(line))
+                || (skip_docstrings && side.parsed.is_docstring_line(line));
+            if inert {
+                inert_only.insert(match side.parsed.symbol_at(line) {
                     Some(span) => symbol_id(&side.module, &span.qualname),
                     None => side.module.clone(),
                 });
@@ -315,7 +323,7 @@ fn analyze_file(
         }
     }
 
-    for id in docstring_only {
+    for id in inert_only {
         let elsewhere =
             if id.contains(':') { touched_symbols.contains_key(&id) } else { module_touched };
         if !elsewhere {
@@ -378,32 +386,24 @@ struct LoadedSide {
     path: PathBuf,
     module: String,
     parsed: pysource::Module,
-    /// Whether each line (1-based) is blank, for [`Self::is_blank`].
-    blank: Vec<bool>,
+    line_count: u32,
 }
 
 impl LoadedSide {
-    fn line_count(&self) -> u32 {
-        u32::try_from(self.blank.len()).unwrap_or(u32::MAX)
-    }
-
     /// The `(module, file)` pair this side is reported under.
     fn module_level_change(&self) -> (String, String) {
         (self.module.clone(), display(&self.path))
     }
 
-    /// Whether the line is whitespace-only.
+    /// Whether the line is whitespace-only and outside every string literal:
+    /// a blank line inside a multi-line string is part of its value.
     ///
     /// Blank lines carry no meaning, but adding a function inserts two of them
     /// before the `def`. Attributing those to the module would report a
     /// module-level change — and make phase 2 select the module's whole test
     /// surface — every time anyone appends a function.
     fn is_blank(&self, line: u32) -> bool {
-        usize::try_from(line)
-            .ok()
-            .and_then(|line| self.blank.get(line.saturating_sub(1)))
-            .copied()
-            .unwrap_or(false)
+        self.parsed.is_blank_line(line)
     }
 }
 
@@ -422,10 +422,10 @@ fn load_side(
 
     let parsed =
         pysource::parse(&source).with_context(|| format!("could not parse {}", path.display()))?;
-    let blank: Vec<bool> = source.lines().map(|line| line.trim().is_empty()).collect();
+    let line_count = u32::try_from(source.lines().count()).unwrap_or(u32::MAX);
     let module = sources.module_path(path).unwrap_or_else(|| fallback_module(path));
 
-    Ok(Some(LoadedSide { path: path.to_path_buf(), module, parsed, blank }))
+    Ok(Some(LoadedSide { path: path.to_path_buf(), module, parsed, line_count }))
 }
 
 /// Module name for a path [`crate::modpath`] could not resolve — a non-UTF-8
@@ -454,7 +454,7 @@ fn touched(
 
 /// Whether the same module exists on both sides of a hunk diff.
 ///
-/// Only then can a docstring line be set aside. Deleting or renaming a module
+/// Only then can a docstring or comment line be set aside. Deleting or renaming a module
 /// breaks its importers whatever the file held, and a rename or an untracked
 /// file is attributed whole, docstrings included.
 fn edited_in_place(
@@ -467,7 +467,7 @@ fn edited_in_place(
 }
 
 fn all_lines(side: Option<&LoadedSide>) -> Vec<u32> {
-    side.map(|s| (1..=s.line_count()).collect()).unwrap_or_default()
+    side.map(|s| (1..=s.line_count).collect()).unwrap_or_default()
 }
 
 fn find_span<'a>(spans: &'a [SymbolSpan], qualname: &str) -> Option<&'a SymbolSpan> {
@@ -528,7 +528,7 @@ impl Accumulator {
             non_python_changes: self.non_python.into_iter().collect(),
             ignored_paths: self.ignored_paths.into_iter().collect(),
             test_files_changed: self.test_files.into_iter().collect(),
-            docstring_changes: self.docstrings.into_iter().collect(),
+            inert_changes: self.docstrings.into_iter().collect(),
             errors: self.errors.into_iter().collect(),
         }
     }
@@ -556,7 +556,7 @@ impl ChangedSymbols {
             && self.non_python_changes.is_empty()
             && self.ignored_paths.is_empty()
             && self.test_files_changed.is_empty()
-            && self.docstring_changes.is_empty()
+            && self.inert_changes.is_empty()
     }
 
     pub fn render(&self, format: Format) -> Result<String> {
@@ -592,7 +592,7 @@ impl ChangedSymbols {
         symbol_section(&mut out, "ignored symbols", &self.ignored_symbols, width);
         module_section(&mut out, "module-level changes", &self.module_level_changes);
         list_section(&mut out, "changed test files", &self.test_files_changed);
-        list_section(&mut out, "docstring-only changes", &self.docstring_changes);
+        list_section(&mut out, "docstring- or comment-only changes", &self.inert_changes);
         list_section(&mut out, "non-Python changes", &self.non_python_changes);
         list_section(&mut out, "ignored paths", &self.ignored_paths);
         list_section(&mut out, "parse errors", &self.errors);
@@ -1450,7 +1450,7 @@ class Service:
         let report = run(&[modified("src/pkg/mod.py", hunks(&[(7, 1)], &[(7, 1)]))], &sources);
 
         assert!(report.changed_symbols.is_empty(), "a docstring does not change behaviour");
-        assert_eq!(report.docstring_changes, vec!["pkg.mod:keep".to_string()], "but it is listed");
+        assert_eq!(report.inert_changes, vec!["pkg.mod:keep".to_string()], "but it is listed");
         assert!(!report.is_empty(), "so the report is not mistaken for an empty diff");
     }
 
@@ -1463,7 +1463,7 @@ class Service:
             pairs(&report.changed_symbols),
             vec![("pkg.mod:keep".to_string(), Change::Modified)]
         );
-        assert!(report.docstring_changes.is_empty(), "a modified symbol is not docstring-only");
+        assert!(report.inert_changes.is_empty(), "a modified symbol is not docstring-only");
     }
 
     #[test]
@@ -1472,11 +1472,7 @@ class Service:
         let report = run(&[modified("src/pkg/mod.py", hunks(&[(1, 1)], &[(1, 1)]))], &sources);
 
         assert!(modules(&report).is_empty(), "importers of the module are not affected");
-        assert_eq!(
-            report.docstring_changes,
-            vec!["pkg.mod".to_string()],
-            "a module id has no colon"
-        );
+        assert_eq!(report.inert_changes, vec!["pkg.mod".to_string()], "a module id has no colon");
     }
 
     #[test]
@@ -1485,7 +1481,7 @@ class Service:
         let report = run(&[modified("src/pkg/mod.py", hunks(&[(12, 1)], &[(12, 1)]))], &sources);
 
         assert!(report.changed_symbols.is_empty());
-        assert_eq!(report.docstring_changes, vec!["pkg.mod:Service".to_string()]);
+        assert_eq!(report.inert_changes, vec!["pkg.mod:Service".to_string()]);
     }
 
     #[test]
@@ -1494,7 +1490,7 @@ class Service:
         let report = run(&[modified("src/pkg/mod.py", hunks(&[(15, 1)], &[(14, 0)]))], &sources);
 
         assert!(report.changed_symbols.is_empty(), "the old side's line was a docstring");
-        assert_eq!(report.docstring_changes, vec!["pkg.mod:Service.run".to_string()]);
+        assert_eq!(report.inert_changes, vec!["pkg.mod:Service.run".to_string()]);
     }
 
     #[test]
@@ -1521,7 +1517,7 @@ class Service:
             pairs(&report.changed_symbols),
             vec![("pkg.mod:keep".to_string(), Change::Modified)]
         );
-        assert!(report.docstring_changes.is_empty(), "nothing is set aside");
+        assert!(report.inert_changes.is_empty(), "nothing is set aside");
     }
 
     #[test]
@@ -1538,7 +1534,7 @@ class Service:
         let report = run(&[change], &sources);
 
         assert_eq!(modules(&report), vec!["pkg.doc"]);
-        assert!(report.docstring_changes.is_empty());
+        assert!(report.inert_changes.is_empty());
     }
 
     #[test]
@@ -1555,14 +1551,14 @@ class Service:
         let report = run(&[change], &sources);
 
         assert_eq!(modules(&report), vec!["pkg.new", "pkg.old"], "a moved module is a new module");
-        assert!(report.docstring_changes.is_empty());
+        assert!(report.inert_changes.is_empty());
     }
 
     #[test]
-    fn docstring_changes_default_to_empty_when_replayed() {
+    fn inert_changes_default_to_empty_when_replayed() {
         let json = r#"{"base": "main", "merge_base": "abc"}"#;
         let report: ChangedSymbols = serde_json::from_str(json).expect("an older report replays");
-        assert!(report.docstring_changes.is_empty());
+        assert!(report.inert_changes.is_empty());
     }
 
     #[test]
@@ -1571,7 +1567,75 @@ class Service:
         let report = run(&[modified("src/pkg/mod.py", hunks(&[(7, 1)], &[(7, 1)]))], &sources);
         let human = report.render(Format::Human).expect("renders");
 
-        assert!(human.contains("docstring-only changes (1)"), "{human}");
+        assert!(human.contains("docstring- or comment-only changes (1)"), "{human}");
         assert!(human.contains("pkg.mod:keep"), "{human}");
+    }
+
+    #[test]
+    fn a_comment_only_edit_changes_no_symbol_and_is_listed() {
+        let sources = documented(|s| s.replace("    return x + 1", "    # bump\n    return x + 1"));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(7, 0)], &[(8, 1)]))], &sources);
+
+        assert!(report.changed_symbols.is_empty(), "a comment does not change behaviour");
+        assert_eq!(report.inert_changes, vec!["pkg.mod:keep".to_string()]);
+    }
+
+    #[test]
+    fn a_module_level_comment_is_not_a_module_level_change() {
+        let sources = documented(|s| s.replace("import os\n", "import os\n# why os\n"));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(3, 0)], &[(4, 1)]))], &sources);
+
+        assert!(modules(&report).is_empty(), "importers of the module are not affected");
+        assert_eq!(report.inert_changes, vec!["pkg.mod".to_string()]);
+    }
+
+    #[test]
+    fn comments_are_set_aside_even_when_docstrings_count_as_code() {
+        let sources = documented(|s| s.replace("    return x + 1", "    # bump\n    return x + 1"));
+        let config = docstrings_count_as_code();
+        let report =
+            run_with(&[modified("src/pkg/mod.py", hunks(&[(7, 0)], &[(8, 1)]))], &sources, &config);
+
+        assert!(report.changed_symbols.is_empty(), "the key governs docstrings only");
+        assert_eq!(report.inert_changes, vec!["pkg.mod:keep".to_string()]);
+    }
+
+    #[test]
+    fn deleting_a_comment_only_module_is_still_a_module_level_change() {
+        let sources =
+            MapSources::default().with_old("src/pkg/notes.py", "# nothing but a comment\n");
+        let change = FileChange {
+            old_path: Some(PathBuf::from("src/pkg/notes.py")),
+            new_path: None,
+            sides: hunks(&[(1, 1)], &[]),
+            binary: false,
+        };
+        let report = run(&[change], &sources);
+
+        assert_eq!(modules(&report), vec!["pkg.notes"], "its importers break");
+        assert!(report.inert_changes.is_empty());
+    }
+
+    #[test]
+    fn a_blank_line_edit_inside_a_function_changes_no_symbol() {
+        let sources = documented(|s| s.replace("    return x + 1", "\n    return x + 1"));
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(7, 0)], &[(8, 1)]))], &sources);
+
+        assert!(report.changed_symbols.is_empty(), "a blank line does not change behaviour");
+        assert!(report.inert_changes.is_empty(), "and is skipped silently, like one between defs");
+    }
+
+    #[test]
+    fn a_blank_line_removed_from_a_module_level_string_is_a_module_level_change() {
+        // Regression: the module-level blank-line rule used to skip this, and
+        // the constant's value changed with no symbol or module reported.
+        let before = "TEMPLATE = \"\"\"a\n\nb\"\"\"\n";
+        let sources = MapSources::default()
+            .with_old("src/pkg/mod.py", before)
+            .with_new("src/pkg/mod.py", "TEMPLATE = \"\"\"a\nb\"\"\"\n");
+        let report = run(&[modified("src/pkg/mod.py", hunks(&[(2, 1)], &[(1, 0)]))], &sources);
+
+        assert_eq!(modules(&report), vec!["pkg.mod"], "the string's value changed");
+        assert!(report.inert_changes.is_empty());
     }
 }
