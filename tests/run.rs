@@ -308,6 +308,78 @@ fn a_changed_conftest_selects_the_whole_subtree() {
     );
 }
 
+/// [`repo`] plus sample data named like a test, which the project's own
+/// pytest config would never collect, and `collect-ignore` saying so.
+fn with_collect_ignored_data(fixture: &Fixture) {
+    fixture.repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\ncollect-ignore = [\"tests/data/**\"]\n",
+    );
+    fixture.repo.write("tests/data/test_input.py", "def test_sample():\n    raise SystemExit\n");
+    fixture.repo.commit("sample data");
+}
+
+#[test]
+fn a_collect_ignored_file_is_never_handed_to_pytest() {
+    let fixture = Fixture::new(0);
+    with_collect_ignored_data(&fixture);
+    fixture.repo.write("tests/conftest.py", &CONFTEST.replace("target(1)", "target(2)"));
+    fixture.repo.write("tests/data/test_input.py", "def test_sample():\n    raise KeyError\n");
+
+    let report = json_output(fixture.command().args(["--format", "json", "run", "--dry-run"]));
+    assert_eq!(report["decision"], "selected");
+    let ids: Vec<&str> = report["node_ids"]
+        .as_array()
+        .expect("node ids")
+        .iter()
+        .filter_map(|s| s["node_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        vec!["tests/test_core.py"],
+        "the conftest subtree skips the data file: {report}"
+    );
+    assert_eq!(
+        report["dropped"][0]["entry"], "tests/data/test_input.py",
+        "the changed file is listed"
+    );
+    assert_eq!(report["dropped"][0]["why"], "collect_ignored");
+
+    let output = fixture.run(&[]);
+    assert!(output.status.success());
+    assert_eq!(
+        fixture.argv().expect("pytest should have been spawned"),
+        vec!["tests/test_core.py"]
+    );
+}
+
+#[test]
+fn a_diff_of_only_collect_ignored_test_files_runs_nothing() {
+    let fixture = Fixture::new(0);
+    with_collect_ignored_data(&fixture);
+    fixture.repo.write("tests/data/test_input.py", "def test_sample():\n    raise KeyError\n");
+
+    let output = fixture.run(&[]);
+    assert!(output.status.success());
+    assert_eq!(fixture.argv(), None, "nothing collectible changed, so nothing is spawned");
+}
+
+#[test]
+fn an_unreadable_collect_ignore_pattern_fails_the_run() {
+    let fixture = Fixture::new(0);
+    fixture.repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\ncollect-ignore = [\"tests/{a,b}/**\"]\n",
+    );
+    touch_target(&fixture.repo);
+
+    let output = fixture.run(&[]);
+    assert_eq!(output.status.code(), Some(2), "a pattern that would never match is a config error");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("collect-ignore"), "names the key: {stderr}");
+    assert_eq!(fixture.argv(), None);
+}
+
 #[test]
 fn a_saved_impact_report_can_be_replayed() {
     let fixture = Fixture::new(0);

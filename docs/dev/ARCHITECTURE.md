@@ -117,7 +117,9 @@ checker can follow, so the name edge is reconstructed from the parse.
 
 Both are pure. Every degrade in them widens the selection rather than narrowing
 it, because the one failure mode the command must not have is a confident list
-that misses a test.
+that misses a test. The one narrowing is declared, not inferred: a file a
+`collect-ignore` pattern matches is left out of the fixture map before anything
+reads it, and an entry naming it is dropped as `collect_ignored` (ADR 0023).
 
 ## The closure's two traits
 

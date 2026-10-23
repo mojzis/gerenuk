@@ -29,6 +29,7 @@ use std::rc::Rc;
 use serde::Serialize;
 
 use crate::closure::{Reason, Verdict};
+use crate::config::Config;
 use crate::fixtures::{collects_tests, is_conftest, Collect, Fixture, FixtureMap};
 use crate::impact::ImpactReport;
 use crate::modpath::split_symbol_id;
@@ -124,6 +125,8 @@ pub enum DropReason {
     NotCollectible,
     /// A fixture nothing in its scope consumes.
     NoConsumers,
+    /// `collect-ignore` says pytest never collects this file.
+    CollectIgnored,
 }
 
 impl DropReason {
@@ -134,6 +137,7 @@ impl DropReason {
             Self::Superseded => "covered by the whole file",
             Self::NotCollectible => "pytest collects no tests from it",
             Self::NoConsumers => "no test in scope consumes it",
+            Self::CollectIgnored => "matches `collect-ignore`",
         }
     }
 }
@@ -177,8 +181,11 @@ impl Selection {
 }
 
 /// Map a report onto node ids, expanding fixtures and collapsing whole files.
+///
+/// `config` contributes `collect-ignore` only: a matched file is not part of
+/// the test tree as far as the mapping is concerned.
 #[must_use]
-pub fn select(report: &ImpactReport, tree: &impl Tree) -> Selection {
+pub fn select(report: &ImpactReport, tree: &impl Tree, config: &Config) -> Selection {
     if report.verdict == Verdict::RunAll {
         // Nothing is worth mapping: the whole suite runs either way, and a
         // half-trustworthy list of node ids would only mislead.
@@ -195,10 +202,26 @@ pub fn select(report: &ImpactReport, tree: &impl Tree) -> Selection {
     // Paths now, facts on demand. A report about one test must not cost a
     // parse of every test file in the repository — the same reason
     // `impacted-tests` never lists the tree it does not need.
-    let map = FixtureMap::paths(tree.test_files());
+    // An ignored file is left out of the map itself, so no expansion — a
+    // conftest subtree, a fixture's consumers — can bring it back.
+    let files = tree.test_files().into_iter().filter(|file| !collect_ignored(config, file));
+    let map = FixtureMap::paths(files);
 
-    Mapper { tree, map, selected: BTreeMap::new(), expanded: Vec::new(), dropped: Vec::new() }
-        .run(report)
+    Mapper {
+        tree,
+        config,
+        map,
+        selected: BTreeMap::new(),
+        expanded: Vec::new(),
+        dropped: Vec::new(),
+    }
+    .run(report)
+}
+
+/// Whether `collect-ignore` matches a repository-relative path.
+fn collect_ignored(config: &Config, file: &Path) -> bool {
+    let path: Vec<_> = file.components().map(|part| part.as_os_str().to_string_lossy()).collect();
+    config.collect_ignored(&path.join("/")).is_some()
 }
 
 /// The chain that reached an entry, as the JSON splits it.
@@ -222,6 +245,7 @@ impl Chain {
 
 struct Mapper<'a, T> {
     tree: &'a T,
+    config: &'a Config,
     map: FixtureMap,
     /// Keyed by node id so the first — shortest — chain to it wins.
     selected: BTreeMap<String, Selected>,
@@ -261,6 +285,10 @@ impl<T: Tree> Mapper<'_, T> {
 
     /// One `impacted_tests` entry that named a symbol.
     fn symbol_entry(&mut self, file: &Path, symbol: &str, chain: &Chain) {
+        if collect_ignored(self.config, file) {
+            self.drop_entry(symbol, DropReason::CollectIgnored);
+            return;
+        }
         if !self.tree.exists(file) {
             self.drop_entry(symbol, DropReason::Deleted);
             return;
@@ -323,6 +351,10 @@ impl<T: Tree> Mapper<'_, T> {
 
     /// Select a whole file — or, for a `conftest.py`, everything it configures.
     fn whole_file(&mut self, file: &Path, chain: &Chain) {
+        if collect_ignored(self.config, file) {
+            self.drop_entry(&file.display().to_string(), DropReason::CollectIgnored);
+            return;
+        }
         if !self.tree.exists(file) {
             self.drop_entry(&file.display().to_string(), DropReason::Deleted);
             return;
@@ -431,6 +463,20 @@ mod tests {
     use crate::modpath::module_path;
     use crate::pysource;
     use crate::workspace::is_test_path;
+
+    /// The selection under the default config: nothing is `collect-ignore`d.
+    fn select(report: &ImpactReport, tree: &impl Tree) -> Selection {
+        super::select(report, tree, &Config::default())
+    }
+
+    /// The selection with `collect-ignore` set to `patterns`.
+    fn select_ignoring(report: &ImpactReport, tree: &impl Tree, patterns: &[&str]) -> Selection {
+        let config = Config {
+            collect_ignore: patterns.iter().map(ToString::to_string).collect(),
+            ..Config::default()
+        };
+        super::select(report, tree, &config)
+    }
 
     /// A [`Tree`] over a map of repository-relative path to source text.
     ///
@@ -870,6 +916,108 @@ def test_client():
             }),
             "and the finer entry says why it went, got {:?}",
             selection.dropped
+        );
+    }
+
+    /// `tree()` plus a data file that only looks like a test, which the
+    /// project's own pytest config never collects.
+    fn tree_with_data() -> MapTree {
+        tree().with("tests/data/test_input.py", "def test_sample(shelter):\n    raise SystemExit\n")
+    }
+
+    fn ignored(entry: &str) -> Dropped {
+        Dropped { entry: entry.to_string(), why: DropReason::CollectIgnored }
+    }
+
+    #[test]
+    fn a_changed_test_file_that_is_collect_ignored_is_dropped_not_selected() {
+        let selection = select_ignoring(
+            &report(vec![], vec!["tests/data/test_input.py", "tests/test_b.py"]),
+            &tree_with_data(),
+            &["tests/data/**"],
+        );
+        assert_eq!(ids(&selection), vec!["tests/test_b.py"]);
+        assert_eq!(
+            selection.dropped,
+            vec![ignored("tests/data/test_input.py")],
+            "listed, not lost"
+        );
+    }
+
+    #[test]
+    fn an_impacted_symbol_in_a_collect_ignored_file_is_dropped() {
+        let selection = select_ignoring(
+            &report(
+                vec![
+                    impacted("tests/data/test_input.py", Some("tests.data.test_input:test_sample")),
+                    impacted("tests/data/test_input.py", None),
+                ],
+                vec![],
+            ),
+            &tree_with_data(),
+            &["tests/data/**"],
+        );
+        assert!(ids(&selection).is_empty(), "pytest is never handed the file");
+        assert_eq!(selection.decision, Decision::Nothing);
+        assert_eq!(
+            selection.dropped,
+            vec![ignored("tests.data.test_input:test_sample"), ignored("tests/data/test_input.py")]
+        );
+    }
+
+    #[test]
+    fn a_conftest_subtree_leaves_collect_ignored_files_out() {
+        let tree = tree_with_data();
+        let unfiltered = select(&report(vec![], vec!["tests/conftest.py"]), &tree);
+        assert!(
+            ids(&unfiltered).contains(&"tests/data/test_input.py"),
+            "without the key the data file looks like any other test file"
+        );
+
+        let selection =
+            select_ignoring(&report(vec![], vec!["tests/conftest.py"]), &tree, &["tests/data/**"]);
+        assert_eq!(ids(&selection), vec!["tests/test_a.py", "tests/test_b.py"]);
+        assert_eq!(
+            selection.expanded[0].into,
+            vec!["tests/test_a.py".to_string(), "tests/test_b.py".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_fixture_consumer_in_a_collect_ignored_file_is_not_selected() {
+        let selection = select_ignoring(
+            &report(vec![impacted("tests/conftest.py", Some("tests.conftest:shelter"))], vec![]),
+            &tree_with_data(),
+            &["tests/data/**"],
+        );
+        assert_eq!(ids(&selection), vec!["tests/test_a.py::test_top"]);
+    }
+
+    #[test]
+    fn a_collect_ignored_conftest_is_dropped_rather_than_expanded() {
+        // pytest never loads a conftest.py it does not collect, so it
+        // configures nothing.
+        let selection = select_ignoring(
+            &report(vec![], vec!["tests/conftest.py"]),
+            &tree(),
+            &["tests/conftest.py"],
+        );
+        assert!(ids(&selection).is_empty());
+        assert_eq!(selection.dropped, vec![ignored("tests/conftest.py")]);
+    }
+
+    #[test]
+    fn a_collect_ignored_file_is_never_parsed() {
+        let counting = Counting::new(tree_with_data());
+        let selection = select_ignoring(
+            &report(vec![impacted("tests/conftest.py", Some("tests.conftest:shelter"))], vec![]),
+            &counting,
+            &["tests/data/**"],
+        );
+        assert_eq!(ids(&selection), vec!["tests/test_a.py::test_top"]);
+        assert!(
+            !counting.parsed.into_inner().contains(Path::new("tests/data/test_input.py")),
+            "a file gerenuk will not select is not worth reading"
         );
     }
 

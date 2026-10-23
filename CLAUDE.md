@@ -175,6 +175,12 @@ When a test fails during implementation:
   precision win. `fixtures.rs` holds pytest's conventions and no I/O. That
   includes the unreadable cases: a dynamic `autouse=` reads as *on*, and a
   `usefixtures(*NAMES)` makes the test a consumer of everything visible to it.
+- **`collect-ignore` is read by `select` and nothing else, and it is the one
+  declared narrowing.** A matched file is filtered out before
+  `FixtureMap::paths`, so no expansion brings it back, and every entry naming
+  it lands in `dropped` as `collect_ignored`, never lost silently. Applying it
+  in `workspace::is_test_path` instead would turn the walk's references from
+  it into production ones (ADR 0023).
 - **A `@pytest.fixture` is never collectible, whatever it is called.**
   `test_client` is an ordinary fixture name; deciding on the `test` prefix alone
   emits `conftest.py::test_client` as a node id, which pytest cannot collect,

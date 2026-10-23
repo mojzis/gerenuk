@@ -567,7 +567,7 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
         },
     };
     let index = FsIndex::new(&repo.root, &files);
-    let selection = select::select(&report, &index);
+    let selection = select::select(&report, &index, &repo.config);
 
     let elapsed = started.elapsed().as_millis();
     // The fallback applies to one outcome only; the other two never see it.

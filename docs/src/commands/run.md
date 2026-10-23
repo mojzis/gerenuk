@@ -284,12 +284,44 @@ resolved:
 - entries the working tree no longer has → dropped;
 - `conftest.py` entries → subtree expansion, never a node id;
 - anything pytest collects no tests from → dropped;
+- anything a [`collect-ignore`](#ignoring-files-pytest-never-collects) pattern
+  matches → dropped;
 - everything else → the file is its own node id.
 
 After mapping and expansion, whole-file entries supersede their own per-test
 node ids — the same collapse [the closure
 applies](impacted-tests.md#reading-the-identifiers), re-run because expansion
 can introduce new whole-file entries. Superseded ids appear under `dropped`.
+
+## Ignoring files pytest never collects
+
+gerenuk decides what is a test file by path: anything under `tests/` or
+`test/`, and any `test_*.py` or `*_test.py`. A repository can keep files there
+that pytest is told to skip — sample inputs named `test_*.py`, a legacy
+directory in `collect_ignore_glob` or `--ignore`. Handing one to pytest makes
+it collect a file it was never meant to. List them instead:
+
+```toml
+[tool.gerenuk]
+collect-ignore = ["tests/data/**", "tests/legacy/**"]
+```
+
+The syntax is `ignore-paths`'s: the whole repository-relative path, `*` and `?`
+within a segment, `**` as a whole segment, anything else refused at startup. A
+matched file:
+
+- is never a node id, whether it changed itself or a walk reached it;
+- is left out when a `conftest.py` above it expands to its subtree;
+- is never a fixture's consumer, and fixtures it defines are invisible;
+- if it is a `conftest.py`, is dropped rather than expanded.
+
+Each entry it would have produced is listed under `dropped` with
+`"why": "collect_ignored"`. `impacted-tests` does not read the key, so its
+report still says where a reference came from.
+
+This is the one way to make `run` select *less* than its rules would, so leave
+out anything pytest does collect: a change that reaches only an ignored test
+runs nothing. See [ADR 0023](https://github.com/mojzis/gerenuk/blob/main/docs/adr/0023-collect-ignored-files-are-not-test-files.md).
 
 ## Fast suites
 

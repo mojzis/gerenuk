@@ -81,6 +81,17 @@ pub struct Config {
     /// [`crate::glob`]; a pattern it cannot read fails [`Config::load`].
     pub ignore_paths: Vec<String>,
 
+    /// Patterns for test-tree files `gerenuk run` must never hand to pytest:
+    /// sample data named like a test, a legacy directory the project's own
+    /// pytest config ignores, a `conftest.py` that is never loaded.
+    ///
+    /// Read only when a selection is mapped onto node ids. A matched file is
+    /// never a node id, never part of a `conftest.py` subtree and never a
+    /// fixture's consumer; an entry that named it is listed under `dropped`.
+    /// Empty by default. Same syntax as `ignore-paths`, checked at
+    /// [`Config::load`].
+    pub collect_ignore: Vec<String>,
+
     /// Whether a line holding only a docstring changes the symbol it sits in.
     ///
     /// `ignore` (the default) sets docstring-only edits aside under
@@ -134,6 +145,10 @@ impl Config {
             glob::validate(pattern)
                 .with_context(|| format!("invalid `ignore-paths` entry in {}", path.display()))?;
         }
+        for pattern in &config.collect_ignore {
+            glob::validate(pattern)
+                .with_context(|| format!("invalid `collect-ignore` entry in {}", path.display()))?;
+        }
         Ok(config)
     }
 
@@ -144,6 +159,14 @@ impl Config {
     #[must_use]
     pub fn matching_path(&self, path: &str) -> Option<&str> {
         self.ignore_paths.iter().find(|pattern| glob::matches(pattern, path)).map(String::as_str)
+    }
+
+    /// The `collect-ignore` pattern that matches `path`, if any.
+    ///
+    /// `path` is repository-relative and `/`-separated.
+    #[must_use]
+    pub fn collect_ignored(&self, path: &str) -> Option<&str> {
+        self.collect_ignore.iter().find(|pattern| glob::matches(pattern, path)).map(String::as_str)
     }
 
     /// The decorator entry that causes `decorator` to be ignored, if any.
@@ -450,6 +473,46 @@ mod tests {
         assert!(message.contains("pyproject.toml"), "names the file, got: {message}");
         assert!(message.contains("ignore-paths"), "names the key, got: {message}");
         assert!(message.contains("{md,rst}"), "names the pattern, got: {message}");
+    }
+
+    #[test]
+    fn no_test_file_is_collect_ignored_by_default() {
+        let config = Config::default();
+        assert!(config.collect_ignore.is_empty(), "the conservative behaviour needs no key");
+        assert_eq!(config.collect_ignored("tests/test_x.py"), None, "so nothing matches");
+    }
+
+    #[test]
+    fn the_collect_ignore_patterns_are_read_in_kebab_case() {
+        let tmp = with_pyproject(
+            "[tool.gerenuk]\ncollect-ignore = [\"tests/data/**\", \"tests/test_legacy.py\"]\n",
+        );
+        let config = Config::load(tmp.path()).expect("valid config parses");
+        assert_eq!(
+            config.collect_ignore,
+            vec!["tests/data/**".to_string(), "tests/test_legacy.py".to_string()]
+        );
+        assert_eq!(config.collect_ignored("tests/data/test_input.py"), Some("tests/data/**"));
+        assert_eq!(config.collect_ignored("tests/test_legacy.py"), Some("tests/test_legacy.py"));
+        assert_eq!(config.collect_ignored("tests/test_new.py"), None);
+    }
+
+    #[test]
+    fn collect_ignore_does_not_share_ignore_paths_patterns() {
+        // Two keys for two questions: a non-Python file no test reads is not a
+        // test file pytest never collects.
+        let config = Config { ignore_paths: vec!["tests/**".to_string()], ..Config::default() };
+        assert_eq!(config.collect_ignored("tests/test_x.py"), None);
+    }
+
+    #[test]
+    fn an_unsupported_collect_ignore_pattern_fails_at_load_and_names_the_key() {
+        let tmp = with_pyproject("[tool.gerenuk]\ncollect-ignore = [\"tests/[ab]/**\"]\n");
+        let err = Config::load(tmp.path()).expect_err("a pattern that would never match");
+        let message = format!("{err:#}");
+        assert!(message.contains("pyproject.toml"), "names the file, got: {message}");
+        assert!(message.contains("collect-ignore"), "names the key, got: {message}");
+        assert!(message.contains("[ab]"), "names the pattern, got: {message}");
     }
 
     #[test]
