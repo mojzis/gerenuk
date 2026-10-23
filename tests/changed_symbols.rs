@@ -549,3 +549,39 @@ fn the_full_json_report_matches_its_snapshot() {
         serde_json::to_string_pretty(&report).expect("the report re-serialises")
     );
 }
+
+#[test]
+fn a_docstring_only_edit_is_listed_and_changes_no_symbol() {
+    let repo = src_layout_repo();
+    repo.write(
+        "src/mypkg/service.py",
+        &SERVICE
+            .replace("def describe(name):\n", "def describe(name):\n    \"\"\"Describe.\"\"\"\n"),
+    );
+
+    let report = repo.changed_symbols(&[]);
+    assert_eq!(pairs(&report, "changed_symbols"), vec![], "adding a docstring changes nothing");
+    assert_eq!(strings(&report, "inert_changes"), vec!["mypkg.service:describe".to_string()]);
+}
+
+#[test]
+fn a_docstring_only_edit_counts_when_docstrings_are_code() {
+    let repo = src_layout_repo();
+    repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\ndocstrings = \"code\"\n",
+    );
+    repo.commit("configure");
+    repo.write(
+        "src/mypkg/service.py",
+        &SERVICE
+            .replace("def describe(name):\n", "def describe(name):\n    \"\"\"Describe.\"\"\"\n"),
+    );
+
+    let report = repo.changed_symbols(&[]);
+    assert_eq!(
+        pairs(&report, "changed_symbols"),
+        vec![("mypkg.service:describe".to_string(), "modified".to_string())]
+    );
+    assert_eq!(strings(&report, "inert_changes"), Vec::<String>::new());
+}

@@ -30,3 +30,4 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0019](0019-a-declared-suite-time-skips-the-walk.md) | A declared suite time skips the walk | accepted |
 | [0020](0020-pytest-does-not-inherit-the-hooks-git.md) | pytest does not inherit the hook's git environment | accepted, amends 0011 and 0014 |
 | [0021](0021-ignored-paths-never-widen.md) | Declared non-Python paths never widen the selection | accepted |
+| [0022](0022-an-inert-edit-changes-no-symbol.md) | A comment- or docstring-only edit changes no symbol | accepted |

@@ -710,6 +710,42 @@ fn a_diff_of_only_ignored_paths_runs_nothing_and_never_falls_back() {
 }
 
 #[test]
+fn a_docstring_only_diff_runs_nothing_and_never_falls_back() {
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&[]));
+    fixture.repo.write("src/mypkg/core.py", &CORE.replace("The changed module.", "Reworded."));
+
+    let output = fixture.run(&[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fixture.argv(), None, "a docstring impacts nothing, so pytest is not spawned");
+    assert_eq!(stub.argv(), None, "and it is not a run_all, so the fallback is not either");
+}
+
+#[test]
+fn a_comment_only_diff_runs_nothing() {
+    let fixture = Fixture::new(0);
+    fixture.repo.write(
+        "src/mypkg/core.py",
+        &CORE.replace("    return value + 1", "    # why\n    return value + 1"),
+    );
+
+    let output = fixture.run(&[]);
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(fixture.argv(), None, "a comment impacts nothing, so pytest is not spawned");
+}
+
+#[test]
+fn a_docstring_only_diff_selects_when_docstrings_are_code() {
+    let fixture = Fixture::new(0);
+    fixture.configure("docstrings = \"code\"\n");
+    fixture.repo.write("src/mypkg/core.py", &CORE.replace("The changed module.", "Reworded."));
+
+    fixture.run(&[]);
+    assert!(fixture.argv().is_some(), "the module docstring is a module-level change again");
+}
+
+#[test]
 fn an_ignored_path_beside_a_code_change_keeps_the_selection() {
     let fixture = Fixture::new(0);
     fixture.configure("ignore-paths = [\"**/*.md\"]\n");

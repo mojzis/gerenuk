@@ -444,6 +444,7 @@ branch without parsing anything. On its **stdin** it finds a JSON payload:
     "non_python_changes": ["requirements.txt"],
     "ignored_paths": [],
     "test_files_changed": [],
+    "inert_changes": [],
     "errors": []
   }
 }

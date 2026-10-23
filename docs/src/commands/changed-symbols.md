@@ -69,6 +69,7 @@ non-Python changes (1)
   "non_python_changes": ["schema.sql"],
   "ignored_paths": [],
   "test_files_changed": [],
+  "inert_changes": ["mypkg.models:Animal.label"],
   "errors": []
 }
 ```
@@ -111,10 +112,11 @@ parsed with `tree-sitter-python`.
 | Inside a nested class | `Outer.Inner`, and its methods `Outer.Inner.method` |
 | Module level — imports, constants, module-level statements | `module_level_changes` |
 
-Blank lines are the one exception: they carry no meaning, and appending a
+Blank lines are the first exception: they carry no meaning, and appending a
 function inserts two of them, so they are not treated as module-level changes.
-Docstring and comment edits *are* attributed normally — phase 1 does not try to
-detect semantic no-ops.
+A blank line inside a multi-line string is not blank in this sense — it is part
+of the string's value. Comment and docstring lines are the second exception;
+see [below](#comment--and-docstring-only-edits).
 
 Symbols are named `module.path:QualName`. The module path is the unbroken chain
 of directories above the file that contain `__init__.py`, which resolves
@@ -214,6 +216,40 @@ non-Python change too.
 **Caveat:** keep out anything a test reads. If a test lints the docs or checks
 an agent instruction file, those paths are inputs, and ignoring them selects
 around the one test that would catch the change.
+
+## Comment- and docstring-only edits
+
+A line that holds nothing but a comment or a docstring does not change the
+symbol it sits in. Editing one moves its symbol to `inert_changes` instead of
+`changed_symbols`, and a module-level comment or docstring is not a
+module-level change, so the edit selects no tests. The symbol is listed by id, a module's without a colon,
+so the decision can be audited. An edit that also touches any other line of
+the symbol is a modification as before.
+
+A blank line inside a definition is skipped the same way, silently, as one
+between definitions always was. Rewording a comment block across a blank line
+puts the blank line in the diff too.
+
+A docstring is the first statement of a module, class or `def` body, when that
+statement is a plain string literal: an f-string, a t-string or a bytes literal
+is code. Only lines the string has to itself count, so in
+`def f(): """doc"""` the line is the `def`'s. A comment line is one whose
+text is a comment from its first character on; `x = 1  # why` is code, and a
+`#` inside a multi-line string is string content. A shebang or an encoding
+cookie on line 1 or 2 is code too: it decides what runs the file and how it
+decodes. Either kind is set aside only when the same module exists on both
+sides of the diff: deleting or renaming a file breaks its importers whatever
+it held.
+
+**Caveat:** some code reads `__doc__` at runtime — docopt parses it, CLI
+frameworks print it as help text, web frameworks put it in an API schema. A
+test that checks that output is skipped by a docstring edit. Such a project
+counts docstrings as code. Comments are set aside either way:
+
+```toml
+[tool.gerenuk]
+docstrings = "code"
+```
 
 ## Exit codes
 
