@@ -20,7 +20,7 @@ use crate::closure::{Reason, Verdict};
 use crate::config::Config;
 use crate::diff;
 use crate::fallback::{self, Fallback, Payload};
-use crate::git::{Base, Git};
+use crate::git::{Base, Git, Replay};
 use crate::guide;
 use crate::impact::{self, Budgets, FsIndex, ImpactReport, TyfRefs};
 use crate::model::relative_display;
@@ -212,11 +212,11 @@ pub enum Command {
     /// Rebuild the test selection a commit's diff makes, to see what it ran
     /// and why — and, with `--run`, how long each of those tests took.
     ///
-    /// The checkout must match COMMIT (`git switch --detach COMMIT`, or a
-    /// `git worktree add`): `ty` and pytest both read the working tree, so a
-    /// selection rebuilt against any other tree would be about other code.
-    /// Untracked files are ignored; uncommitted edits to tracked ones are an
-    /// error.
+    /// `ty` and pytest both read the working tree, so the replay needs a
+    /// checkout of COMMIT. If yours already is one it is used; otherwise COMMIT
+    /// is checked out into a worktree gerenuk keeps under `.git/gerenuk/replay`
+    /// and reuses for the next replay, and your checkout is not touched.
+    /// Untracked files are ignored.
     ///
     /// Without `--run` this lists the selection exactly as `run --dry-run`
     /// would, and spawns nothing.
@@ -353,7 +353,7 @@ impl Cli {
                 &root,
                 &RunOptions {
                     base: base.as_deref(),
-                    commit: None,
+                    replay: None,
                     impact: impact.as_deref(),
                     budgets: Budgets::from(&budgets),
                     dry_run,
@@ -373,12 +373,13 @@ impl Cli {
                 } else {
                     pytest_args
                 };
+                let (root, replay) = replay_checkout(&root, &commit, base.as_deref())?;
                 run_pytest(
                     out,
                     &root,
                     &RunOptions {
-                        base: base.as_deref(),
-                        commit: Some(&commit),
+                        base: None,
+                        replay: Some(&replay),
                         impact: None,
                         budgets: Budgets::from(&budgets),
                         dry_run: !run,
@@ -517,13 +518,13 @@ enum Diff<'a> {
     /// The working tree, untracked files included, against a base ref.
     WorkingTree { base: Option<&'a str> },
     /// A commit the checkout matches, against its parent or a base ref.
-    Commit { commit: &'a str, base: Option<&'a str> },
+    Commit(&'a Replay),
 }
 
 impl<'a> Diff<'a> {
-    fn of(base: Option<&'a str>, commit: Option<&'a str>) -> Self {
-        match commit {
-            Some(commit) => Self::Commit { commit, base },
+    fn of(base: Option<&'a str>, replay: Option<&'a Replay>) -> Self {
+        match replay {
+            Some(replay) => Self::Commit(replay),
             None => Self::WorkingTree { base },
         }
     }
@@ -551,7 +552,7 @@ fn impacted_run(
             Diff::WorkingTree { base } => (git.resolve_base(base)?, git.untracked()?),
             // No untracked files: they were never part of the commit, and an
             // empty list here keeps them out of the file index below too.
-            Diff::Commit { commit, base } => (replay_base(git, commit, base)?, Vec::new()),
+            Diff::Commit(replay) => (replay_base(git, replay)?, Vec::new()),
         };
         let report = changed_report(git, root, &base, config, &listed)?;
         untracked = Some(listed);
@@ -595,15 +596,43 @@ fn impacted_run(
     Ok(ImpactRun { report, files: Some(files), changed: Some(changed) })
 }
 
-/// The base a replay of `commit` diffs from, once the checkout is proven to
-/// be that commit.
+/// Resolve what `replay` was asked for, and the checkout to replay it in.
+///
+/// The commit and its base are resolved here, in the checkout the user typed
+/// them in: `HEAD~1` means something else inside the replay worktree. When the
+/// checkout already is the commit it is used as it is; otherwise the commit is
+/// checked out into the worktree [`Git::replay_worktree`] keeps, so the user's
+/// own checkout — HEAD, index and edits — is never touched.
+fn replay_checkout(
+    workspace: &Path,
+    commit: &str,
+    base: Option<&str>,
+) -> Result<(PathBuf, Replay)> {
+    let git = Git::discover(workspace)?;
+    let git = git.rebind(git.top_level()?);
+    let replay = git.resolve_commit(commit, base)?;
+    if git.differs_from(&replay.commit)?.is_empty() {
+        return Ok((workspace.to_path_buf(), replay));
+    }
+    let dir = git.replay_worktree(&replay.commit)?;
+    eprintln!(
+        "gerenuk: the checkout is not {}, so it is replayed in {dir} — kept for the next \
+         replay; `git worktree remove --force {dir}` drops it",
+        short(&replay.commit),
+        dir = dir.display(),
+    );
+    Ok((dir, replay))
+}
+
+/// The base a replay diffs from, once the checkout is proven to be its commit.
 ///
 /// The working-tree diff then *is* the commit's diff, and every later reader of
-/// the tree — `tyf`, the file index, pytest — sees the code the commit made. A
-/// mismatch is an error rather than a `run_all`: there is no right answer to
-/// degrade to when the question is about other code.
-fn replay_base(git: &Git, commit: &str, base: Option<&str>) -> Result<Base> {
-    let replay = git.resolve_commit(commit, base)?;
+/// the tree — `tyf`, the file index, pytest — sees the code the commit made.
+/// [`replay_checkout`] has already picked a checkout that matches, so a
+/// mismatch here means the tree changed under the run; it is an error rather
+/// than a `run_all`, because there is no right answer to degrade to when the
+/// question is about other code.
+fn replay_base(git: &Git, replay: &Replay) -> Result<Base> {
     let differing = git.differs_from(&replay.commit)?;
     if !differing.is_empty() {
         const SHOWN: usize = 5;
@@ -613,9 +642,8 @@ fn replay_base(git: &Git, commit: &str, base: Option<&str>) -> Result<Base> {
             listed.push(format!("… and {} more", differing.len() - SHOWN));
         }
         anyhow::bail!(
-            "the checkout does not match {sha}: {paths}. A replay reads the working tree, so \
-             check the commit out first — `git switch --detach {sha}`, or \
-             `git worktree add <dir> {sha}` and replay from there.",
+            "the checkout at {root} does not match {sha}: {paths}",
+            root = git.top_level()?.display(),
             sha = replay.commit,
             paths = listed.join(", "),
         );
@@ -626,7 +654,7 @@ fn replay_base(git: &Git, commit: &str, base: Option<&str>) -> Result<Base> {
         replay.base.name,
         short(&replay.base.merge_base)
     );
-    Ok(replay.base)
+    Ok(replay.base.clone())
 }
 
 /// A sha shortened for a human, the length `git log --oneline` tends to use.
@@ -637,8 +665,8 @@ fn short(sha: &str) -> &str {
 /// Everything `gerenuk run` was asked for.
 struct RunOptions<'a> {
     base: Option<&'a str>,
-    /// `replay`'s commit: diff it instead of the working tree.
-    commit: Option<&'a str>,
+    /// `replay`'s commit, already resolved: diff it instead of the working tree.
+    replay: Option<&'a Replay>,
     impact: Option<&'a Path>,
     budgets: Budgets,
     dry_run: bool,
@@ -678,7 +706,7 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
         },
         None => impacted_run(
             &repo,
-            Diff::of(options.base, options.commit),
+            Diff::of(options.base, options.replay),
             None,
             options.budgets,
             Economics::Honour,

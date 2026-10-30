@@ -15,26 +15,36 @@ come up then: *why were these tests selected*, and *which of them is slow*.
 
 It needs what [`run`](run.md) needs: `git`, `tyf`, and pytest for `--run`.
 
-## Check the commit out first
+## Where it runs
 
 `ty` and pytest both read the working tree, so a selection rebuilt against any
-other tree would be about other code. The checkout must match `COMMIT`:
+other tree would be about other code. A replay therefore needs a checkout of
+`COMMIT`, and gerenuk makes one when yours is not:
 
-```bash
-git switch --detach 1a2b3c4
+```
+$ gerenuk replay 1a2b3c4
+gerenuk: the checkout is not 1a2b3c4d5e6f, so it is replayed in /repo/.git/gerenuk/replay — kept for the next replay; `git worktree remove --force /repo/.git/gerenuk/replay` drops it
+gerenuk: replaying 1a2b3c4d5e6f against 1a2b3c4^ (0f9e8d7c6b5a)
+…
 ```
 
-or, to leave your own checkout alone:
+Your own checkout — branch, index, uncommitted edits — is not touched. The
+worktree is detached and kept: the first replay pays for a full checkout, and
+each later one only rewrites the files that differ, so checking a handful of
+commits in a row is cheap. Untracked files left in it are removed between
+replays; ignored ones (a `.venv`, caches) stay.
 
-```bash
-git worktree add ../replay 1a2b3c4
-```
+If your checkout already matches `COMMIT` — `HEAD` need not be `COMMIT`, only
+its tracked files have to be — it is used as it is and no worktree is made.
+Untracked files are ignored either way; they were never part of the commit.
+`COMMIT` and `--base` are resolved in your checkout, so `HEAD~1` means what it
+means where you typed it.
 
-and replay from there. Untracked files are ignored — they were never part of
-the commit. An uncommitted edit to a tracked file is an error that names the
-file, as is a checkout of a different commit. Neither degrades to `run_all`:
-there is no right answer to fall back to when the question is about other
-code. `HEAD` itself does not have to be `COMMIT`; only its tree has to match.
+Under `--run`, pytest starts in the worktree with whatever pytest gerenuk
+resolves (see [`run`](run.md)). A virtualenv with the project installed
+editable points at your main checkout, so a `src/` layout may import that code
+instead of the commit's; a `pytest-command` like `uv run pytest` builds an
+environment for the worktree instead, once.
 
 ## Which diff
 

@@ -208,6 +208,67 @@ impl Git {
         )
     }
 
+    /// Check `commit` out into the worktree gerenuk keeps for replays, and
+    /// return its path.
+    ///
+    /// The worktree lives at `<git-common-dir>/gerenuk/replay` and is kept
+    /// between runs: the first replay pays for a full checkout, a later one
+    /// only rewrites the files that differ. Its HEAD is detached, so no branch
+    /// is touched, and untracked files left by an earlier replay are removed
+    /// (ignored ones — a `.venv`, caches — are kept). A directory there that
+    /// is not a worktree of this repository is an error, never overwritten.
+    pub fn replay_worktree(&self, commit: &str) -> Result<PathBuf> {
+        let common = self
+            .run(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+            .context("could not locate the repository's git directory")?;
+        let dir = PathBuf::from(common.trim()).join("gerenuk").join("replay");
+
+        if self.is_worktree(&dir)? {
+            let worktree = self.rebind(&dir);
+            worktree
+                .run(["checkout", "--quiet", "--detach", "--force", commit])
+                .with_context(|| format!("could not check {commit} out in {}", dir.display()))?;
+            worktree
+                .run(["clean", "-d", "--force", "--quiet"])
+                .with_context(|| format!("could not clean {}", dir.display()))?;
+            return Ok(dir);
+        }
+
+        // A registration whose directory was deleted would block the add.
+        self.run(["worktree", "prune"]).context("could not prune stale worktrees")?;
+        if dir.exists() {
+            bail!(
+                "{} exists and is not a worktree of this repository; remove it and replay again",
+                dir.display()
+            );
+        }
+        self.run([
+            OsStr::new("worktree"),
+            OsStr::new("add"),
+            OsStr::new("--quiet"),
+            OsStr::new("--detach"),
+            dir.as_os_str(),
+            OsStr::new(commit),
+        ])
+        .with_context(|| {
+            format!("could not create a worktree for {commit} at {}", dir.display())
+        })?;
+        Ok(dir)
+    }
+
+    /// Whether `dir` exists and is a registered worktree of this repository.
+    fn is_worktree(&self, dir: &Path) -> Result<bool> {
+        let Ok(dir) = dir.canonicalize() else {
+            return Ok(false);
+        };
+        let listed =
+            self.run(["worktree", "list", "--porcelain"]).context("could not list worktrees")?;
+        Ok(listed
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|path| Path::new(path).canonicalize().is_ok_and(|path| path == dir)))
+    }
+
     /// Whether `rev` resolves to a commit.
     fn rev_exists(&self, rev: &str) -> Result<bool> {
         let spec = format!("{rev}^{{commit}}");
@@ -619,5 +680,78 @@ mod tests {
             vec![PathBuf::from("a.py")],
             "an uncommitted edit to a tracked file is a mismatch"
         );
+    }
+
+    /// The commit `dir` has checked out.
+    fn head_of(repo: &TestRepo, dir: &Path) -> String {
+        repo.git(&["-C", &dir.display().to_string(), "rev-parse", "HEAD"]).trim().to_string()
+    }
+
+    #[test]
+    fn a_replay_worktree_checks_the_commit_out_and_leaves_the_checkout_alone() {
+        let repo = TestRepo::new();
+        let (parent, feature) = two_commits(&repo);
+        repo.write("a.py", "x = 9\n");
+
+        let dir = repo.gerenuk_git().replay_worktree(&parent).expect("a worktree is made");
+
+        assert_eq!(head_of(&repo, &dir), parent, "the worktree is at the commit");
+        assert_eq!(std::fs::read_to_string(dir.join("a.py")).expect("checked out"), "x = 1\n");
+        assert_eq!(head_of(&repo, repo.path()), feature, "HEAD does not move");
+        assert_eq!(
+            std::fs::read_to_string(repo.path().join("a.py")).expect("still there"),
+            "x = 9\n",
+            "an uncommitted edit survives"
+        );
+        assert!(
+            repo.git(&["status", "--porcelain"]).lines().all(|line| line == " M a.py"),
+            "the worktree is invisible to the checkout's status"
+        );
+    }
+
+    #[test]
+    fn a_replay_worktree_is_reused_and_cleaned_for_the_next_commit() {
+        let repo = TestRepo::new();
+        let (parent, feature) = two_commits(&repo);
+        let git = repo.gerenuk_git();
+
+        let first = git.replay_worktree(&parent).expect("a worktree is made");
+        std::fs::write(first.join("stray.py"), "y = 1\n").expect("write");
+        std::fs::write(first.join("a.py"), "x = 7\n").expect("write");
+        let second = git.replay_worktree(&feature).expect("the worktree moves");
+
+        assert_eq!(first, second, "one worktree, reused");
+        assert_eq!(head_of(&repo, &second), feature);
+        assert!(git.rebind(&second).differs_from(&feature).expect("diffable").is_empty());
+        assert!(!second.join("stray.py").exists(), "an untracked leftover is removed");
+        let worktrees = repo.git(&["worktree", "list", "--porcelain"]);
+        assert_eq!(worktrees.matches("worktree ").count(), 2, "got:\n{worktrees}");
+    }
+
+    #[test]
+    fn a_replay_worktree_whose_directory_was_deleted_is_made_again() {
+        let repo = TestRepo::new();
+        let (parent, _) = two_commits(&repo);
+        let git = repo.gerenuk_git();
+
+        let dir = git.replay_worktree(&parent).expect("a worktree is made");
+        std::fs::remove_dir_all(&dir).expect("delete it");
+        let again = git.replay_worktree(&parent).expect("a stale registration is pruned");
+        assert_eq!(head_of(&repo, &again), parent);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_the_replay_worktree_is_never_overwritten() {
+        let repo = TestRepo::new();
+        let (parent, _) = two_commits(&repo);
+        let git = repo.gerenuk_git();
+        let dir = git.replay_worktree(&parent).expect("a worktree is made");
+        repo.git(&["worktree", "remove", "--force", &dir.display().to_string()]);
+        std::fs::create_dir_all(&dir).expect("recreate");
+        std::fs::write(dir.join("precious.txt"), "keep\n").expect("write");
+
+        let err = git.replay_worktree(&parent).expect_err("someone else's directory");
+        assert!(err.to_string().contains(&dir.display().to_string()), "names it: {err}");
+        assert!(dir.join("precious.txt").exists(), "and leaves it alone");
     }
 }

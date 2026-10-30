@@ -106,6 +106,11 @@ impl TestRepo {
         String::from_utf8_lossy(&output.stdout).into_owned()
     }
 
+    #[allow(dead_code, reason = "not every test binary reads a file back")]
+    pub fn read(&self, rel: &str) -> String {
+        std::fs::read_to_string(self.path().join(rel)).expect("read file")
+    }
+
     pub fn write(&self, rel: &str, body: &str) {
         let path = self.path().join(rel);
         if let Some(parent) = path.parent() {
