@@ -1387,3 +1387,149 @@ fn a_hooked_run_still_propagates_pytests_failure() {
     assert!(!output.status.success(), "a red suite blocks the commit");
     assert_eq!(hooked.git_ok(&root, &["rev-parse", "HEAD"]), before, "no commit was created");
 }
+
+// ---------------------------------------------------------------------------
+// `gerenuk replay <COMMIT>`: the same selection, rebuilt from a commit's diff.
+// ---------------------------------------------------------------------------
+
+impl Fixture {
+    /// Run `gerenuk replay <extra>` and return the finished output.
+    fn replay(&self, extra: &[&str]) -> std::process::Output {
+        self.command().arg("replay").args(extra).output().expect("gerenuk should run")
+    }
+
+    /// Commit `touch_target` and return the new commit's sha.
+    fn commit_target_change(&self) -> String {
+        touch_target(&self.repo);
+        self.repo.commit("touch target");
+        self.repo.git(&["rev-parse", "HEAD"]).trim().to_string()
+    }
+}
+
+fn stderr(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn a_replay_lists_the_commits_selection_and_spawns_nothing() {
+    let fixture = Fixture::new(0);
+    let sha = fixture.commit_target_change();
+
+    let output = fixture.replay(&[&sha]);
+    assert!(output.status.success(), "listing is exit 0: {}", stderr(&output));
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(text.contains("decision: selected"), "got:\n{text}");
+    assert!(text.contains("tests/test_core.py::test_target"), "got:\n{text}");
+    assert!(text.contains("tests/test_core.py::test_with_fixture"), "got:\n{text}");
+    assert!(fixture.argv().is_none(), "listing must never spawn pytest");
+    assert!(stderr(&output).contains(&sha[..12]), "names what it replays: {}", stderr(&output));
+}
+
+#[test]
+fn a_replay_matches_what_run_selected_before_the_commit() {
+    let fixture = Fixture::new(0);
+    touch_target(&fixture.repo);
+    let before = json_output(fixture.command().args(["--format", "json", "run", "--dry-run"]));
+    fixture.repo.commit("touch target");
+
+    let replayed = json_output(fixture.command().args(["--format", "json", "replay", "HEAD"]));
+    assert_eq!(replayed["decision"], before["decision"]);
+    assert_eq!(replayed["node_ids"], before["node_ids"], "the same tests, for the same reasons");
+}
+
+#[test]
+fn a_replay_with_run_hands_pytest_the_selection_with_timings() {
+    let fixture = Fixture::new(3);
+    let sha = fixture.commit_target_change();
+
+    let output = fixture.replay(&[&sha, "--run", "--", "-q"]);
+    assert_eq!(output.status.code(), Some(3), "the exit code is pytest's own");
+    assert_eq!(
+        fixture.argv().expect("pytest should have been spawned"),
+        vec![
+            "tests/test_core.py::test_target",
+            "tests/test_core.py::test_with_fixture",
+            "--durations=0",
+            "-q",
+        ],
+        "every test's timing, slowest first, before the passthrough so it can override"
+    );
+}
+
+#[test]
+fn a_replay_can_cap_how_many_timings_pytest_reports() {
+    let fixture = Fixture::new(0);
+    let sha = fixture.commit_target_change();
+
+    let output = fixture.replay(&[&sha, "--run", "--durations", "5"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let argv = fixture.argv().expect("pytest should have been spawned");
+    assert_eq!(argv.last().map(String::as_str), Some("--durations=5"), "got {argv:?}");
+}
+
+#[test]
+fn a_replay_refuses_a_checkout_that_is_not_the_commit() {
+    let fixture = Fixture::new(0);
+    let sha = fixture.commit_target_change();
+    fixture.repo.write("src/mypkg/core.py", CORE);
+    fixture.repo.commit("revert");
+
+    let output = fixture.replay(&[&sha]);
+    assert_eq!(output.status.code(), Some(2), "a selection for the wrong tree is no answer");
+    let err = stderr(&output);
+    assert!(err.contains("src/mypkg/core.py"), "names what differs: {err}");
+    assert!(err.contains(&format!("git switch --detach {sha}")), "says how to fix it: {err}");
+    assert!(fixture.argv().is_none());
+}
+
+#[test]
+fn a_replay_refuses_uncommitted_edits_to_tracked_files() {
+    let fixture = Fixture::new(0);
+    let sha = fixture.commit_target_change();
+    fixture.repo.write("tests/helpers.py", "VALUE = 2\n");
+
+    let output = fixture.replay(&[&sha, "--run"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+    assert!(stderr(&output).contains("tests/helpers.py"), "{}", stderr(&output));
+    assert!(fixture.argv().is_none(), "nothing runs against the wrong tree");
+}
+
+#[test]
+fn a_replay_ignores_untracked_files() {
+    // In `run` an untracked non-Python file is a reason to run everything; in a
+    // replay it was never part of the commit.
+    let fixture = Fixture::new(0);
+    let sha = fixture.commit_target_change();
+    fixture.repo.write("notes.txt", "scratch\n");
+
+    let report = json_output(fixture.command().args(["--format", "json", "replay", &sha]));
+    assert_eq!(report["decision"], "selected", "{report}");
+}
+
+#[test]
+fn a_replay_defaults_to_the_commits_own_change_and_base_widens_it() {
+    let fixture = Fixture::new(0);
+    fixture.repo.git(&["checkout", "-b", "feature"]);
+    fixture.commit_target_change();
+    // A second commit that touches nothing any test reaches.
+    fixture.repo.write("src/mypkg/extra.py", "def lonely():\n    return 1\n");
+    fixture.repo.commit("unrelated");
+
+    let own = json_output(fixture.command().args(["--format", "json", "replay", "HEAD"]));
+    assert_eq!(own["decision"], "nothing", "the tip alone reaches no test: {own}");
+
+    let since_fork = json_output(
+        fixture.command().args(["--format", "json", "replay", "HEAD", "--base", "main"]),
+    );
+    assert_eq!(
+        since_fork["decision"], "selected",
+        "everything since the fork, which is what a hook on the branch saw: {since_fork}"
+    );
+}
+
+#[test]
+fn durations_without_run_is_a_usage_error() {
+    let fixture = Fixture::new(0);
+    let output = fixture.replay(&["HEAD", "--durations", "5"]);
+    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+}

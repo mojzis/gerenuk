@@ -8,6 +8,7 @@ computes the whole of it in-process. The other two stand alone.
 | [`changed-symbols`](changed-symbols.md) | Map the working tree's diff to the Python symbols it changed |
 | [`impacted-tests`](impacted-tests.md) | Walk from those changed symbols to the tests that reach them |
 | [`run`](run.md) | Run pytest on exactly those tests |
+| [`replay`](replay.md) | Rebuild a past commit's selection; list it, or run it with per-test timings |
 | [`audit`](audit.md) | Report unreferenced and test-only symbols in the files you name |
 | [`doctor`](doctor.md) | Show the resolved workspace and `tyf` binary, then exit |
 | [`guide`](guide.md) | Print agent-facing instructions: `setup`, `triage` or `tune` |
@@ -38,7 +39,7 @@ answer it says so in the report (`verdict: run_all`) and still exits `0` —
 "run everything" is a usable answer for a pre-commit hook, and failing the hook
 because the analysis was inconclusive only teaches people to bypass it.
 
-[`run`](run.md) is the exception to the table. Its own failures exit `2` as
+[`run`](run.md) is the exception to the table, and so is [`replay --run`](replay.md). Its own failures exit `2` as
 usual, but once pytest starts the exit code is **pytest's**, verbatim — that is
 the hook contract. A selection that turns out to impact no tests exits `0`
 without spawning anything.
@@ -50,5 +51,6 @@ works in a checkout that has never had `ty` installed. `impacted-tests` needs
 both `git` and `tyf`, but looks for `tyf` only once it knows the walk will
 actually run. `run` needs those two plus pytest, which it resolves from
 `GERENUK_PYTEST`, then `pytest-command` in `pyproject.toml`, then `PATH`.
+`replay` needs what `run` needs, and a checkout that matches the commit.
 `audit` and `doctor` need `tyf` on `PATH`. `guide` needs nothing at all, not
 even a repository.

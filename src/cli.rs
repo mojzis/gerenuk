@@ -56,7 +56,8 @@ Getting started:
   3. `gerenuk impacted-tests`     — which tests those changed symbols reach.
   4. `gerenuk run -- -x`          — run exactly those tests under pytest.
   5. `gerenuk run --dry-run`      — that decision and the exact argv, spawning nothing.
-  6. `gerenuk audit pkg/*.py`     — separately: unreferenced and test-only symbols.
+  6. `gerenuk replay <SHA> --run` — a past commit's selection again, with per-test timings.
+  7. `gerenuk audit pkg/*.py`     — separately: unreferenced and test-only symbols.
 
 `gerenuk guide` prints agent-facing instructions for where you are standing: \
 `setup` until a madoqua step names gerenuk in ./pyproject.toml, `triage` after; \
@@ -68,7 +69,7 @@ Exit codes:
   1  findings reported
   2  the run could not complete (tyf missing, bad workspace, ...)
 
-`run` is the exception: once pytest starts, the exit code is pytest's own, \
+`run` (and `replay --run`) is the exception: once pytest starts, the exit code is pytest's own, \
 because gerenuk's process has become pytest. The same goes for a configured \
 `fallback-command`, which takes over a `run_all` outcome.
 
@@ -208,6 +209,45 @@ pub enum Command {
         pytest_args: Vec<OsString>,
     },
 
+    /// Rebuild the test selection a commit's diff makes, to see what it ran
+    /// and why — and, with `--run`, how long each of those tests took.
+    ///
+    /// The checkout must match COMMIT (`git switch --detach COMMIT`, or a
+    /// `git worktree add`): `ty` and pytest both read the working tree, so a
+    /// selection rebuilt against any other tree would be about other code.
+    /// Untracked files are ignored; uncommitted edits to tracked ones are an
+    /// error.
+    ///
+    /// Without `--run` this lists the selection exactly as `run --dry-run`
+    /// would, and spawns nothing.
+    Replay {
+        /// The commit to replay: a sha, or any revision git understands.
+        #[arg(value_name = "COMMIT")]
+        commit: String,
+
+        /// Diff from `merge-base(COMMIT, REF)` instead of COMMIT's parent —
+        /// what a hook on a branch forked from REF saw at that commit.
+        #[arg(long, value_name = "REF")]
+        base: Option<String>,
+
+        #[command(flatten)]
+        budgets: BudgetFlags,
+
+        /// Run the selection under pytest instead of listing it, with
+        /// pytest's per-test timings (`--durations`), slowest first.
+        #[arg(long)]
+        run: bool,
+
+        /// How many of the slowest test phases pytest reports with `--run`.
+        /// `0` reports them all.
+        #[arg(long, value_name = "N", default_value_t = 0, requires = "run")]
+        durations: u32,
+
+        /// Everything after `--`, appended to the pytest argv verbatim.
+        #[arg(last = true, value_name = "PYTEST_ARGS", allow_hyphen_values = true)]
+        pytest_args: Vec<OsString>,
+    },
+
     /// Report symbols that nothing references, and symbols only tests reach.
     Audit {
         /// Python files to audit. Defaults to nothing — pass the files you care about.
@@ -313,6 +353,7 @@ impl Cli {
                 &root,
                 &RunOptions {
                     base: base.as_deref(),
+                    commit: None,
                     impact: impact.as_deref(),
                     budgets: Budgets::from(&budgets),
                     dry_run,
@@ -322,6 +363,32 @@ impl Cli {
                     pytest_args: &pytest_args,
                 },
             ),
+            Command::Replay { commit, base, budgets, run, durations, pytest_args } => {
+                // Before the passthrough, so an explicit `--durations` after
+                // `--` still wins: pytest keeps the last one it is given.
+                let pytest_args: Vec<OsString> = if run {
+                    std::iter::once(OsString::from(format!("--durations={durations}")))
+                        .chain(pytest_args)
+                        .collect()
+                } else {
+                    pytest_args
+                };
+                run_pytest(
+                    out,
+                    &root,
+                    &RunOptions {
+                        base: base.as_deref(),
+                        commit: Some(&commit),
+                        impact: None,
+                        budgets: Budgets::from(&budgets),
+                        dry_run: !run,
+                        format: self.format,
+                        fallback_command: None,
+                        git_env: None,
+                        pytest_args: &pytest_args,
+                    },
+                )
+            }
         }
     }
 }
@@ -404,7 +471,8 @@ pub fn run_impacted_tests(
     changed_file: Option<&Path>,
     budgets: Budgets,
 ) -> Result<ImpactReport> {
-    Ok(impacted_run(&repo_context(workspace)?, base, changed_file, budgets, Economics::Ignore)?
+    let repo = repo_context(workspace)?;
+    Ok(impacted_run(&repo, Diff::WorkingTree { base }, changed_file, budgets, Economics::Ignore)?
         .report)
 }
 
@@ -443,9 +511,27 @@ impl ImpactRun {
     }
 }
 
+/// What the phase-1 diff is taken of.
+#[derive(Debug, Clone, Copy)]
+enum Diff<'a> {
+    /// The working tree, untracked files included, against a base ref.
+    WorkingTree { base: Option<&'a str> },
+    /// A commit the checkout matches, against its parent or a base ref.
+    Commit { commit: &'a str, base: Option<&'a str> },
+}
+
+impl<'a> Diff<'a> {
+    fn of(base: Option<&'a str>, commit: Option<&'a str>) -> Self {
+        match commit {
+            Some(commit) => Self::Commit { commit, base },
+            None => Self::WorkingTree { base },
+        }
+    }
+}
+
 fn impacted_run(
     repo: &Repo,
-    base: Option<&str>,
+    diff: Diff<'_>,
     changed_file: Option<&Path>,
     budgets: Budgets,
     economics: Economics,
@@ -461,8 +547,13 @@ fn impacted_run(
     let changed = if let Some(path) = changed_file {
         load_report::<ChangedSymbols>(path, "changed", "a changed-symbols report")?
     } else {
-        let listed = git.untracked()?;
-        let report = changed_report(git, root, &git.resolve_base(base)?, config, &listed)?;
+        let (base, listed) = match diff {
+            Diff::WorkingTree { base } => (git.resolve_base(base)?, git.untracked()?),
+            // No untracked files: they were never part of the commit, and an
+            // empty list here keeps them out of the file index below too.
+            Diff::Commit { commit, base } => (replay_base(git, commit, base)?, Vec::new()),
+        };
+        let report = changed_report(git, root, &base, config, &listed)?;
         untracked = Some(listed);
         report
     };
@@ -504,9 +595,50 @@ fn impacted_run(
     Ok(ImpactRun { report, files: Some(files), changed: Some(changed) })
 }
 
+/// The base a replay of `commit` diffs from, once the checkout is proven to
+/// be that commit.
+///
+/// The working-tree diff then *is* the commit's diff, and every later reader of
+/// the tree — `tyf`, the file index, pytest — sees the code the commit made. A
+/// mismatch is an error rather than a `run_all`: there is no right answer to
+/// degrade to when the question is about other code.
+fn replay_base(git: &Git, commit: &str, base: Option<&str>) -> Result<Base> {
+    let replay = git.resolve_commit(commit, base)?;
+    let differing = git.differs_from(&replay.commit)?;
+    if !differing.is_empty() {
+        const SHOWN: usize = 5;
+        let mut listed: Vec<String> =
+            differing.iter().take(SHOWN).map(|path| path.display().to_string()).collect();
+        if differing.len() > SHOWN {
+            listed.push(format!("… and {} more", differing.len() - SHOWN));
+        }
+        anyhow::bail!(
+            "the checkout does not match {sha}: {paths}. A replay reads the working tree, so \
+             check the commit out first — `git switch --detach {sha}`, or \
+             `git worktree add <dir> {sha}` and replay from there.",
+            sha = replay.commit,
+            paths = listed.join(", "),
+        );
+    }
+    eprintln!(
+        "gerenuk: replaying {} against {} ({})",
+        short(&replay.commit),
+        replay.base.name,
+        short(&replay.base.merge_base)
+    );
+    Ok(replay.base)
+}
+
+/// A sha shortened for a human, the length `git log --oneline` tends to use.
+fn short(sha: &str) -> &str {
+    sha.get(..12).unwrap_or(sha)
+}
+
 /// Everything `gerenuk run` was asked for.
 struct RunOptions<'a> {
     base: Option<&'a str>,
+    /// `replay`'s commit: diff it instead of the working tree.
+    commit: Option<&'a str>,
     impact: Option<&'a Path>,
     budgets: Budgets,
     dry_run: bool,
@@ -544,7 +676,13 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
             files: None,
             changed: None,
         },
-        None => impacted_run(&repo, options.base, None, options.budgets, Economics::Honour)?,
+        None => impacted_run(
+            &repo,
+            Diff::of(options.base, options.commit),
+            None,
+            options.budgets,
+            Economics::Honour,
+        )?,
     };
 
     // A `run_all` verdict needs no tree: the whole suite runs either way, and
