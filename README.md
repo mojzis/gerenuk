@@ -45,6 +45,7 @@ gerenuk changed-symbols                # what the working tree changed
 gerenuk impacted-tests                 # and which tests that reaches
 gerenuk run -- -q                      # and run exactly those, under pytest
 gerenuk run --dry-run                  # the decision and the argv, no pytest
+gerenuk replay <SHA> --run            # a past commit's selection, with per-test timings
 gerenuk audit pkg/module.py            # separately: what nothing references
 gerenuk guide                          # agent-facing instructions for where you stand
 ```

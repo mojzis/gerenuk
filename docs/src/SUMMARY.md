@@ -7,6 +7,7 @@
   - [changed-symbols](commands/changed-symbols.md)
   - [impacted-tests](commands/impacted-tests.md)
   - [run](commands/run.md)
+  - [replay](commands/replay.md)
   - [audit](commands/audit.md)
   - [doctor](commands/doctor.md)
   - [guide](commands/guide.md)

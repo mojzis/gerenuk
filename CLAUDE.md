@@ -236,6 +236,13 @@ When a test fails during implementation:
   default). Dropping the in-place check lets deleting or renaming an inert-only
   module hide its broken importers. A set-aside id lands in `inert_changes`, never dropped
   and never a seed (ADR 0022).
+- **`replay` reads a commit only through a checkout that matches it.**
+  `cli::replay_base` refuses unless `Git::differs_from` is empty, then hands
+  the ordinary working-tree path a base and an empty untracked list. Reading
+  the commit's blobs instead would need a commit-aware `tyf`, `FsIndex` and
+  pytest; a mismatch is exit `2`, never `run_all`, because no answer about
+  other code is right. Listing is `run --dry-run`; `--run` is `run` plus
+  `--durations=N` ahead of the passthrough.
 - **Do not trust `tyf`'s production/test split.** Its heuristic reads the whole
   absolute path, so a project under a `tests/` directory has every reference
   filed as a test. `analyze::split_refs` re-derives the buckets from paths

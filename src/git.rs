@@ -33,6 +33,14 @@ pub struct Base {
     pub merge_base: String,
 }
 
+/// A commit to replay, and the base its diff starts from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Replay {
+    /// The commit's full sha.
+    pub commit: String,
+    pub base: Base,
+}
+
 /// One completed `git` invocation.
 struct GitOutput {
     success: bool,
@@ -151,6 +159,52 @@ impl Git {
         bail!(
             "no usable base ref (tried {}). Pass --base with a ref that exists.",
             candidates.join(", ")
+        )
+    }
+
+    /// Resolve `commit` for a replay, and the base its diff starts from.
+    ///
+    /// With no `explicit` base that is the commit's first parent, so only the
+    /// commit's own change is replayed. With one it is `merge-base(commit,
+    /// explicit)` — what a hook on a branch forked from `explicit` saw.
+    pub fn resolve_commit(&self, commit: &str, explicit: Option<&str>) -> Result<Replay> {
+        let sha = self
+            .commit_sha(commit)?
+            .with_context(|| format!("`{commit}` does not name a commit in this repository"))?;
+
+        let base = if let Some(name) = explicit {
+            if !self.rev_exists(name)? {
+                bail!("no usable base ref (tried {name}). Pass --base with a ref that exists.");
+            }
+            let merge_base = self
+                .run(["merge-base", sha.as_str(), name])
+                .with_context(|| format!("no common ancestor between `{commit}` and `{name}`"))?;
+            Base { name: name.to_string(), merge_base: merge_base.trim().into() }
+        } else {
+            let parent = self.commit_sha(&format!("{sha}^1"))?.with_context(|| {
+                format!("`{commit}` has no parent to diff against; pass --base")
+            })?;
+            Base { name: format!("{commit}^"), merge_base: parent }
+        };
+        Ok(Replay { commit: sha, base })
+    }
+
+    /// The full sha `rev` names, or `None` when it names no commit.
+    fn commit_sha(&self, rev: &str) -> Result<Option<String>> {
+        let spec = format!("{rev}^{{commit}}");
+        Ok(self
+            .try_run(["rev-parse", "--verify", "--quiet", &spec])?
+            .map(|out| out.trim().to_string()))
+    }
+
+    /// Tracked paths whose working-tree contents differ from `commit`'s tree.
+    ///
+    /// Empty means the checkout *is* that commit as far as any diff can tell,
+    /// whatever `HEAD` says. Untracked files are in neither tree.
+    pub fn differs_from(&self, commit: &str) -> Result<Vec<PathBuf>> {
+        self.paths(
+            ["diff", "--name-only", "-z", "--no-ext-diff", "--no-textconv", commit, "--"],
+            "could not compare the working tree with the replayed commit",
         )
     }
 
@@ -479,5 +533,91 @@ mod tests {
                 "the error should say what is wrong, got: {err}"
             ),
         }
+    }
+
+    /// `base` then `feature` on top of it; returns their full shas.
+    fn two_commits(repo: &TestRepo) -> (String, String) {
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        let base = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.write("a.py", "x = 2\n");
+        repo.commit("feature");
+        let feature = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        (base, feature)
+    }
+
+    #[test]
+    fn a_replayed_commit_diffs_against_its_parent_by_default() {
+        let repo = TestRepo::new();
+        let (parent, feature) = two_commits(&repo);
+
+        let replay = repo.gerenuk_git().resolve_commit("HEAD", None).expect("HEAD has a parent");
+        assert_eq!(replay.commit, feature, "the commit is resolved to a full sha");
+        assert_eq!(replay.base.merge_base, parent, "only the commit's own change is replayed");
+        assert_eq!(replay.base.name, "HEAD^", "the base is named after what was asked for");
+    }
+
+    #[test]
+    fn a_replayed_commit_with_a_base_diffs_from_the_fork_point() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        let fork = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+        repo.git(&["checkout", "-b", "feature"]);
+        repo.write("a.py", "x = 2\n");
+        repo.commit("one");
+        repo.write("a.py", "x = 3\n");
+        repo.commit("two");
+        repo.git(&["checkout", "main"]);
+        repo.write("b.py", "y = 1\n");
+        repo.commit("main moves on");
+
+        let replay =
+            repo.gerenuk_git().resolve_commit("feature", Some("main")).expect("both exist");
+        assert_eq!(
+            replay.base.merge_base, fork,
+            "what a hook on the branch saw: everything since the fork, not main's tip"
+        );
+        assert_eq!(replay.base.name, "main");
+    }
+
+    #[test]
+    fn a_root_commit_cannot_be_replayed_without_a_base() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("root");
+
+        let err = repo.gerenuk_git().resolve_commit("HEAD", None).expect_err("no parent");
+        assert!(err.to_string().contains("no parent"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unknown_commit_is_named_in_the_error() {
+        let repo = TestRepo::new();
+        two_commits(&repo);
+
+        let err = repo.gerenuk_git().resolve_commit("deadbeef", None).expect_err("unknown");
+        assert!(err.to_string().contains("deadbeef"), "got: {err}");
+    }
+
+    #[test]
+    fn the_checkout_matches_the_commit_it_was_built_from() {
+        let repo = TestRepo::new();
+        let (parent, feature) = two_commits(&repo);
+        let git = repo.gerenuk_git();
+        repo.write("untracked.py", "z = 1\n");
+
+        assert!(
+            git.differs_from(&feature).expect("diffable").is_empty(),
+            "an untracked file is not part of either tree"
+        );
+        assert_eq!(git.differs_from(&parent).expect("diffable"), vec![PathBuf::from("a.py")]);
+
+        repo.write("a.py", "x = 9\n");
+        assert_eq!(
+            git.differs_from(&feature).expect("diffable"),
+            vec![PathBuf::from("a.py")],
+            "an uncommitted edit to a tracked file is a mismatch"
+        );
     }
 }

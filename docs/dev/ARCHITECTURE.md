@@ -107,6 +107,16 @@ needed. Its own reach into the working tree is `select::Tree`, a third trait
 that `impact::FsIndex` implements alongside `closure::Index` — same cache, read
 as whole parsed modules rather than one line's classification.
 
+`replay <COMMIT>` is `run` with a different phase-1 diff, and nothing else.
+`cli::replay_base` resolves the commit and its base (the first parent, or
+`merge-base(COMMIT, --base)`), then refuses unless `git diff --name-only
+COMMIT` is empty — a checkout whose tracked files *are* that commit. The
+working-tree diff is then the commit's diff, and every later reader of the tree
+(`tyf`, the file index, pytest) sees the code the commit made, so no seam
+learns about commits. Untracked files are left out of both the diff and the
+index. Listing is `run --dry-run`; `--run` adds `--durations=N` ahead of the
+passthrough and execs as `run` does.
+
 ## The selection
 
 `select.rs` turns an `ImpactReport` into pytest node ids and is where every
