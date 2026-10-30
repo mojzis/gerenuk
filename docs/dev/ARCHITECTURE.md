@@ -108,9 +108,12 @@ that `impact::FsIndex` implements alongside `closure::Index` — same cache, rea
 as whole parsed modules rather than one line's classification.
 
 `replay <COMMIT>` is `run` with a different phase-1 diff, and nothing else.
-`cli::replay_base` resolves the commit and its base (the first parent, or
-`merge-base(COMMIT, --base)`), then refuses unless `git diff --name-only
-COMMIT` is empty — a checkout whose tracked files *are* that commit. The
+`cli::replay_checkout` resolves the commit and its base (the first parent, or
+`merge-base(COMMIT, --base)`) in the user's checkout. If `git diff --name-only
+COMMIT` is empty there — tracked files that *are* that commit — that checkout is
+used; otherwise `Git::replay_worktree` checks the commit out into a kept,
+detached worktree at `<git-common-dir>/gerenuk/replay` and `run` proceeds from
+there (ADR 0023). `cli::replay_base` re-checks the match before the diff. The
 working-tree diff is then the commit's diff, and every later reader of the tree
 (`tyf`, the file index, pytest) sees the code the commit made, so no seam
 learns about commits. Untracked files are left out of both the diff and the

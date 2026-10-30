@@ -1467,31 +1467,100 @@ fn a_replay_can_cap_how_many_timings_pytest_reports() {
     assert_eq!(argv.last().map(String::as_str), Some("--durations=5"), "got {argv:?}");
 }
 
+/// Where `replay` checks a commit out when the checkout is not that commit.
+fn replay_worktree(repo: &TestRepo) -> PathBuf {
+    repo.path().join(".git/gerenuk/replay")
+}
+
 #[test]
-fn a_replay_refuses_a_checkout_that_is_not_the_commit() {
+fn a_replay_of_a_matching_checkout_makes_no_worktree() {
+    let fixture = Fixture::new(0);
+    let sha = fixture.commit_target_change();
+
+    let output = fixture.replay(&[&sha]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(!replay_worktree(&fixture.repo).exists(), "the checkout already is the commit");
+}
+
+#[test]
+fn a_replay_of_another_commit_runs_in_a_worktree_and_leaves_the_checkout_alone() {
     let fixture = Fixture::new(0);
     let sha = fixture.commit_target_change();
     fixture.repo.write("src/mypkg/core.py", CORE);
     fixture.repo.commit("revert");
+    let head = fixture.repo.git(&["rev-parse", "HEAD"]);
+
+    let report = json_output(fixture.command().args(["--format", "json", "replay", &sha]));
+    assert_eq!(report["decision"], "selected", "the commit's own selection: {report}");
+    let ids: Vec<&str> = report["node_ids"]
+        .as_array()
+        .expect("node ids")
+        .iter()
+        .filter_map(|entry| entry["node_id"].as_str())
+        .collect();
+    assert_eq!(ids, ["tests/test_core.py::test_target", "tests/test_core.py::test_with_fixture"]);
+    assert_eq!(fixture.repo.git(&["rev-parse", "HEAD"]), head, "HEAD does not move");
+    assert_eq!(fixture.repo.read("src/mypkg/core.py"), CORE, "the checkout is untouched");
+    assert!(fixture.argv().is_none(), "listing still spawns nothing");
 
     let output = fixture.replay(&[&sha]);
-    assert_eq!(output.status.code(), Some(2), "a selection for the wrong tree is no answer");
     let err = stderr(&output);
-    assert!(err.contains("src/mypkg/core.py"), "names what differs: {err}");
-    assert!(err.contains(&format!("git switch --detach {sha}")), "says how to fix it: {err}");
-    assert!(fixture.argv().is_none());
+    let dir = replay_worktree(&fixture.repo);
+    assert!(err.contains(&dir.display().to_string()), "says where it replays: {err}");
+    assert!(err.contains("git worktree remove"), "and how to drop it: {err}");
 }
 
 #[test]
-fn a_replay_refuses_uncommitted_edits_to_tracked_files() {
+fn a_replay_with_uncommitted_edits_runs_pytest_in_the_worktree() {
     let fixture = Fixture::new(0);
     let sha = fixture.commit_target_change();
     fixture.repo.write("tests/helpers.py", "VALUE = 2\n");
 
     let output = fixture.replay(&[&sha, "--run"]);
-    assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
-    assert!(stderr(&output).contains("tests/helpers.py"), "{}", stderr(&output));
-    assert!(fixture.argv().is_none(), "nothing runs against the wrong tree");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let env = recorded_env(&fixture.record.with_extension("env")).expect("pytest ran");
+    let cwd = PathBuf::from(&env["PWD"]).canonicalize().expect("pytest's cwd exists");
+    assert_eq!(
+        cwd,
+        replay_worktree(&fixture.repo).canonicalize().expect("the worktree exists"),
+        "pytest runs against the commit's tree, not the edited one"
+    );
+    assert_eq!(fixture.repo.read("tests/helpers.py"), "VALUE = 2\n", "the edit survives");
+}
+
+#[test]
+fn a_relative_revision_means_what_it_meant_in_the_checkout() {
+    // `HEAD~1` typed in the checkout is the target change; resolved again
+    // inside the worktree it would be the commit before it, which changes
+    // nothing any test reaches.
+    let fixture = Fixture::new(0);
+    fixture.commit_target_change();
+    fixture.repo.write("src/mypkg/core.py", CORE);
+    fixture.repo.commit("revert");
+
+    let report = json_output(fixture.command().args(["--format", "json", "replay", "HEAD~1"]));
+    assert_eq!(report["decision"], "selected", "{report}");
+}
+
+#[test]
+fn a_second_replay_reuses_the_worktree() {
+    let fixture = Fixture::new(0);
+    let first = fixture.commit_target_change();
+    fixture.repo.write("src/mypkg/extra.py", "def lonely():\n    return 1\n");
+    fixture.repo.commit("unrelated");
+    let second = fixture.repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+    fixture.repo.write("src/mypkg/core.py", CORE);
+    fixture.repo.commit("revert");
+
+    let one = json_output(fixture.command().args(["--format", "json", "replay", &first]));
+    let two = json_output(fixture.command().args(["--format", "json", "replay", &second]));
+    assert_eq!(one["decision"], "selected", "{one}");
+    assert_eq!(
+        two["decision"], "nothing",
+        "the second commit's own change, not the first's: {two}"
+    );
+    let worktrees = fixture.repo.git(&["worktree", "list", "--porcelain"]);
+    assert_eq!(worktrees.matches("worktree ").count(), 2, "one kept worktree:\n{worktrees}");
 }
 
 #[test]

@@ -237,11 +237,17 @@ When a test fails during implementation:
   module hide its broken importers. A set-aside id lands in `inert_changes`, never dropped
   and never a seed (ADR 0022).
 - **`replay` reads a commit only through a checkout that matches it.**
-  `cli::replay_base` refuses unless `Git::differs_from` is empty, then hands
-  the ordinary working-tree path a base and an empty untracked list. Reading
-  the commit's blobs instead would need a commit-aware `tyf`, `FsIndex` and
-  pytest; a mismatch is exit `2`, never `run_all`, because no answer about
-  other code is right. Listing is `run --dry-run`; `--run` is `run` plus
+  `cli::replay_checkout` resolves the commit and base in the user's checkout
+  (`HEAD~1` means something else inside a worktree), uses that checkout if
+  `Git::differs_from` is empty, and otherwise has `Git::replay_worktree` check
+  the commit out into the kept worktree at `<git-common-dir>/gerenuk/replay`
+  — never touching the user's HEAD, index or edits, and never overwriting a
+  directory there that is not a registered worktree (ADR 0023).
+  `cli::replay_base` re-checks the match, then hands the ordinary working-tree
+  path a base and an empty untracked list. Reading the commit's blobs instead
+  would need a commit-aware `tyf`, `FsIndex` and pytest; a mismatch at that
+  point is exit `2`, never `run_all`, because no answer about other code is
+  right. Listing is `run --dry-run`; `--run` is `run` plus
   `--durations=N` ahead of the passthrough.
 - **Do not trust `tyf`'s production/test split.** Its heuristic reads the whole
   absolute path, so a project under a `tests/` directory has every reference
