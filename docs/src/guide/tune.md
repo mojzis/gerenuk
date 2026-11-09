@@ -4,8 +4,8 @@ Reference for the knobs. The defaults are conservative on purpose: tune
 for speed only once a `run_all` reason keeps repeating.
 
 **Where the diff comes from.** `--base <REF>` names the ref to diff against;
-by default `origin/main`, then `main`, then `master`. The working tree -
-staged, unstaged and untracked - is diffed from the merge-base.
+by default `origin/main`, `main`, `master`, then `HEAD` if there is no remote.
+The working tree - staged, unstaged, untracked - is diffed from the merge-base.
 `--workspace <PATH>` names the project root instead of walking up to it.
 
 **Budgets.** The walk says `run_all` at the first limit it hits. A flag

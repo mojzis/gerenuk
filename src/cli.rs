@@ -135,7 +135,8 @@ pub enum Command {
     ///
     /// Needs only `git` — no `tyf`, no `ty`, no Python environment.
     ChangedSymbols {
-        /// Base ref to diff against. Default: origin/main, then main, then master.
+        /// Base ref to diff against. Default: origin/main, then main, then master,
+        /// then HEAD in a repository with no remote.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
     },
@@ -145,7 +146,8 @@ pub enum Command {
     /// Walks the reverse reference graph from `changed-symbols` outwards until
     /// it reaches test code. Needs `git` and `tyf`.
     ImpactedTests {
-        /// Base ref to diff against. Default: origin/main, then main, then master.
+        /// Base ref to diff against. Default: origin/main, then main, then master,
+        /// then HEAD in a repository with no remote.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
 
@@ -168,7 +170,8 @@ pub enum Command {
     /// these tests, run the whole suite, or run nothing at all. The last is why
     /// this is a command and not a list of node ids for a shell to interpolate.
     Run {
-        /// Base ref to diff against. Default: origin/main, then main, then master.
+        /// Base ref to diff against. Default: origin/main, then main, then master,
+        /// then HEAD in a repository with no remote.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
 

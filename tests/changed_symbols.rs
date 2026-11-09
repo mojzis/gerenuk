@@ -460,6 +460,34 @@ fn a_missing_base_ref_exits_with_code_two() {
 }
 
 #[test]
+fn a_new_repository_with_no_commits_reports_everything_as_added() {
+    let repo = TestRepo::new();
+    repo.write("pyproject.toml", "[project]\nname = \"mypkg\"\n");
+    repo.write("src/mypkg/__init__.py", "");
+    repo.write("src/mypkg/service.py", "def describe():\n    return 1\n");
+    repo.git(&["add", "src/mypkg/__init__.py"]);
+
+    let output = gerenuk_bare(repo.path())
+        .args(["changed-symbols", "--format", "json"])
+        .output()
+        .expect("gerenuk should run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "no remote and no commits is a new project, not a failure: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("valid JSON");
+    assert_eq!(report["base"], "HEAD", "the base is local");
+    assert!(
+        pairs(&report, "changed_symbols")
+            .contains(&("mypkg.service:describe".to_string(), "added".to_string())),
+        "an untracked file in an unborn repo is wholly added: {report}"
+    );
+}
+
+#[test]
 fn running_outside_a_repository_exits_with_code_two() {
     let tmp = tempfile::TempDir::new().expect("temp dir");
     std::fs::write(tmp.path().join("pyproject.toml"), "[project]\nname = \"p\"\n")

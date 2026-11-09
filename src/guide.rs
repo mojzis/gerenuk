@@ -328,7 +328,10 @@ mod tests {
             text.contains("not the index"),
             "setup must say the diff is the working tree, so unstaged edits count in a hook",
         );
-        assert!(text.contains("`origin/main` (then `main`, then `master`)"), "the base chain");
+        assert!(
+            text.contains("`origin/main` (then `main`, `master`, or with no remote `HEAD`)"),
+            "the base chain, including the local fallback for a repository with no remote"
+        );
         assert!(text.contains("background daemon"), "setup states the daemon fact");
         assert_eq!(text.matches("daemon").count(), 1, "and states it exactly once");
     }

@@ -94,6 +94,11 @@ the merge base rather than the branch tip means work landing on `main` after you
 branched is not attributed to you.
 
 `--base` defaults to the first of `origin/main`, `main`, `master` that exists.
+In a repository with no remote and none of those — a new project, or one whose
+branch has another name — it falls back to `HEAD`, so the diff is your
+uncommitted work; before the first commit, every file counts as added. A
+repository that has a remote never falls back this way: diffing against `HEAD`
+there would hide committed work you have not pushed.
 A `--base` you pass explicitly is used as given; if it does not resolve, the run
 fails with exit code `2` rather than falling back.
 

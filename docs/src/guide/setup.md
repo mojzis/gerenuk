@@ -24,9 +24,9 @@ extend_check = [
 ```
 
 `pass_files = false` because gerenuk takes no file list: it diffs the working
-tree against `origin/main` (then `main`, then `master`), not the index, so
-unstaged edits and untracked files count in a hook. `--base <REF>` overrides
-the ref. Everything after `--` goes to pytest verbatim.
+tree against `origin/main` (then `main`, `master`, or with no remote `HEAD`),
+not the index, so unstaged edits and untracked files count in a hook.
+`--base <REF>` overrides the ref. Everything after `--` goes to pytest verbatim.
 
 **4. Name the pytest**, only if plain `pytest` is not the one on PATH:
 

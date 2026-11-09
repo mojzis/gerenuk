@@ -21,7 +21,8 @@ pub const DEFAULT_GIT_BIN: &str = "git";
 /// Environment variable that overrides which `git` binary is used.
 pub const GIT_BIN_ENV: &str = "GERENUK_GIT";
 
-/// Base refs tried in order when `--base` is not given.
+/// Base refs tried in order when `--base` is not given. A repository with no
+/// remote falls back to `HEAD` after these (see [`Git::resolve_base`]).
 pub const DEFAULT_BASES: &[&str] = &["origin/main", "main", "master"];
 
 /// The base a run was diffed against.
@@ -139,7 +140,8 @@ impl Git {
     /// Pick a base ref and compute `merge-base(HEAD, base)`.
     ///
     /// An explicit `--base` is used as given and its absence is an error; with
-    /// no `--base`, [`DEFAULT_BASES`] are tried in order.
+    /// no `--base`, [`DEFAULT_BASES`] are tried in order, and then — only in a
+    /// repository with no remote — [`Self::local_base`].
     pub fn resolve_base(&self, explicit: Option<&str>) -> Result<Base> {
         let candidates: Vec<&str> = explicit.map_or_else(|| DEFAULT_BASES.to_vec(), |e| vec![e]);
 
@@ -156,10 +158,38 @@ impl Git {
             });
         }
 
+        if explicit.is_none() && !self.has_remote()? {
+            return self.local_base();
+        }
+
         bail!(
             "no usable base ref (tried {}). Pass --base with a ref that exists.",
             candidates.join(", ")
         )
+    }
+
+    /// The base for a repository with nowhere to push: `HEAD` itself.
+    ///
+    /// With no remote there is no committed-but-unshared work to miss, so the
+    /// working tree against the last commit is the whole change. Before the
+    /// first commit there is no `HEAD` either, and the empty tree stands in:
+    /// every file is new.
+    fn local_base(&self) -> Result<Base> {
+        let merge_base = match self.commit_sha("HEAD")? {
+            Some(sha) => sha,
+            None => self
+                .run(["hash-object", "-t", "tree", "--stdin"])
+                .context("could not compute the empty tree for a repository with no commits")?
+                .trim()
+                .to_string(),
+        };
+        Ok(Base { name: "HEAD".to_string(), merge_base })
+    }
+
+    /// Whether any remote is configured.
+    fn has_remote(&self) -> Result<bool> {
+        let out = self.run(["remote"]).context("could not list remotes")?;
+        Ok(!out.trim().is_empty())
     }
 
     /// Resolve `commit` for a replay, and the base its diff starts from.
@@ -427,6 +457,55 @@ mod tests {
 
         let base = repo.gerenuk_git().resolve_base(None).expect("`master` exists");
         assert_eq!(base.name, "master", "the fallback chain reaches master");
+    }
+
+    #[test]
+    fn a_repo_with_no_remote_and_no_default_branch_compares_against_head() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        repo.git(&["branch", "-m", "main", "trunk"]);
+        let head = repo.git(&["rev-parse", "HEAD"]).trim().to_string();
+
+        let base = repo.gerenuk_git().resolve_base(None).expect("no remote, so HEAD will do");
+        assert_eq!(base.name, "HEAD", "with nothing to push to, the local commit is the base");
+        assert_eq!(base.merge_base, head, "and the diff starts from it");
+    }
+
+    #[test]
+    fn a_repo_with_no_commits_compares_against_the_empty_tree() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "def f():\n    pass\n");
+        repo.git(&["add", "a.py"]);
+
+        let git = repo.gerenuk_git();
+        let base = git.resolve_base(None).expect("an unborn HEAD is still a base");
+        assert_eq!(base.name, "HEAD", "the base is still named after HEAD");
+        let empty = repo.git(&["hash-object", "-t", "tree", "/dev/null"]).trim().to_string();
+        assert_eq!(base.merge_base, empty, "nothing committed means everything is new");
+
+        let text = git.diff(&base.merge_base).expect("diffing the empty tree works");
+        assert!(text.contains("+++ b/a.py"), "the staged file appears as added:\n{text}");
+        assert_eq!(
+            git.show(&base.merge_base, Path::new("a.py")).expect("show runs"),
+            None,
+            "no old blob, so the file reads as wholly added"
+        );
+    }
+
+    #[test]
+    fn a_repo_with_a_remote_never_falls_back_to_head() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        repo.git(&["branch", "-m", "main", "trunk"]);
+        repo.git(&["remote", "add", "upstream", "https://example.invalid/repo.git"]);
+
+        let err = repo
+            .gerenuk_git()
+            .resolve_base(None)
+            .expect_err("HEAD would hide committed, unpushed work");
+        assert!(err.to_string().contains("--base"), "the error says how to fix it, got: {err}");
     }
 
     #[test]
