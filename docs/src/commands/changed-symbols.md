@@ -17,7 +17,7 @@ symbols out to the tests that reach them.
 
 ```
 $ gerenuk changed-symbols
-base main (merge-base 5ddda1f)
+base HEAD~1 (merge-base 5ddda1f)
 
 changed symbols (2)
   modified  method    mypkg.pipelines.enrich:Enricher.run  src/mypkg/pipelines/enrich.py
@@ -37,7 +37,7 @@ non-Python changes (1)
 
 ```json
 {
-  "base": "main",
+  "base": "HEAD~1",
   "merge_base": "5ddda1f2cd66afdf789771b20a3bf667df78f050",
   "changed_symbols": [
     {
@@ -88,10 +88,12 @@ omits `column` is rejected rather than half-read.
 
 ## What gets diffed
 
-The range is `merge-base(HEAD, <base>)` → **working tree**: staged and unstaged
-edits together, plus untracked files that `.gitignore` does not cover. Taking
-the merge base rather than the branch tip means work landing on `main` after you
-branched is not attributed to you.
+The range is `<base>` → **working tree**: staged and unstaged edits together,
+plus untracked files that `.gitignore` does not cover. By default `<base>` is
+`HEAD~1`, so the range is the last commit plus anything not committed yet. Under
+the `branch` scope or an explicit `--base` it is `merge-base(HEAD, <ref>)`:
+taking the merge base rather than the branch tip means work landing on `main`
+after you branched is not attributed to you.
 
 With no `--base`, where the diff starts depends on the scope:
 

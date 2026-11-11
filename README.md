@@ -65,7 +65,7 @@ Python environment.
 
 ```
 $ gerenuk changed-symbols
-base main (merge-base 5ddda1f)
+base HEAD~1 (merge-base 5ddda1f)
 
 changed symbols (2)
   modified  method    mypkg.pipelines.enrich:Enricher.run  src/mypkg/pipelines/enrich.py
@@ -79,9 +79,9 @@ By default the diff runs from `HEAD~1` — the last commit — to the working
 tree, staged and unstaged alike. `scope = "branch"` under `[tool.gerenuk]` (or
 `--scope branch`) diffs the whole branch instead, from
 `merge-base(HEAD, base)` with the first of `origin/main`, `main`, `master` that
-exists; `--base <REF>` names the ref outright. `--format json` emits the same data for scripting. Registry
-decorators can be filtered out via `[tool.gerenuk] ignore-decorators` in
-`pyproject.toml`. See the
+exists; `--base <REF>` names the ref outright. `--format json` emits the same
+data for scripting. Registry decorators can be filtered out via
+`[tool.gerenuk] ignore-decorators` in `pyproject.toml`. See the
 [documentation](https://mojzis.github.io/gerenuk/commands/changed-symbols.html).
 
 ### `impacted-tests`
@@ -92,7 +92,7 @@ reach them — the selection, minus the `pytest` invocation, which is
 
 ```
 $ gerenuk impacted-tests
-base main (merge-base 5ddda1f)
+base HEAD~1 (merge-base 5ddda1f)
 verdict selected
 
 impacted tests (2)

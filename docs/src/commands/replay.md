@@ -51,7 +51,7 @@ environment for the worktree instead, once.
 | Invocation | Diff | Use it for |
 |---|---|---|
 | `replay <COMMIT>` | `COMMIT^` → `COMMIT` | that commit's own change |
-| `replay <COMMIT> --base main` | `merge-base(COMMIT, main)` → `COMMIT` | what a pre-commit hook on a branch forked from `main` saw when it made `COMMIT` |
+| `replay <COMMIT> --base main` | `merge-base(COMMIT, main)` → `COMMIT` | what a hook under `scope = "branch"`, on a branch forked from `main`, saw when it made `COMMIT` |
 
 By default the hook diffs the working tree from `HEAD~1`, so each commit is
 judged on itself (and the one before it). Under `scope = "branch"` it diffs
