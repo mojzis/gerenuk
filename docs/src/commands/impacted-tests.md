@@ -4,7 +4,7 @@ Walk the reference graph from the symbols the working tree changed out to the
 tests that reach them.
 
 ```
-gerenuk impacted-tests [--base <REF>] [--changed <FILE>]
+gerenuk impacted-tests [--base <REF> | --scope <SCOPE>] [--changed <FILE>]
                        [--max-depth <N>] [--max-symbols <N>] [--budget-ms <MS>]
 ```
 
@@ -47,7 +47,7 @@ installed.
 
 ```
 $ gerenuk impacted-tests
-base main (merge-base 57510ca)
+base HEAD~1 (merge-base 57510ca)
 verdict selected
 
 impacted tests (4)
@@ -80,7 +80,7 @@ the chain makes it legible.
 {
   "verdict": "selected",
   "reason": null,
-  "base": "main",
+  "base": "HEAD~1",
   "merge_base": "57510ca2b98d1f9e469ed80748a73adca01f3dcc",
   "impacted_tests": [
     {
@@ -251,8 +251,8 @@ gerenuk impacted-tests --changed changed.json
 
 `--changed` walks a saved phase-1 report instead of diffing the working tree —
 useful for debugging a selection, and for replaying a diff the tree no longer
-has. It conflicts with `--base`, since the saved report already records the base
-it was taken against.
+has. It conflicts with `--base` and `--scope`, since the saved report already
+records the base it was taken against.
 
 ## Performance
 

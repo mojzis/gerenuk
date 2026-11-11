@@ -282,7 +282,8 @@ fn a_declared_suite_duration_does_not_short_circuit_an_inventory() {
     repo.commit("declare the suite");
     touch_target(&repo);
 
-    let report = impacted(&repo, &tyf, &[]);
+    // The branch scope, so the committed config edit is not part of the diff.
+    let report = impacted(&repo, &tyf, &["--scope", "branch"]);
 
     assert_eq!(report["verdict"], "selected", "{report}");
     assert_eq!(report["impacted_tests"].as_array().map(Vec::len), Some(3), "{report}");
@@ -477,7 +478,8 @@ fn an_ignored_path_does_not_turn_a_selection_into_run_all() {
     repo.write("docs/guide/index.md", "# Guide\n");
     touch_target(&repo);
 
-    let report = impacted(&repo, &tyf, &[]);
+    // The branch scope, so the committed config edit is not part of the diff.
+    let report = impacted(&repo, &tyf, &["--scope", "branch"]);
     assert_eq!(report["verdict"], "selected", "a doc edit is not a reason to run everything");
     assert_eq!(
         report["ignored_paths"],

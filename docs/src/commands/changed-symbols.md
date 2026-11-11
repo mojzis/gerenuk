@@ -3,7 +3,7 @@
 Map the working tree's diff to the Python symbols it changed.
 
 ```
-gerenuk changed-symbols [--base <REF>]
+gerenuk changed-symbols [--base <REF> | --scope <SCOPE>]
 ```
 
 Unlike [`audit`](audit.md), this command needs only `git` — no `tyf`, no `ty`,
@@ -17,7 +17,7 @@ symbols out to the tests that reach them.
 
 ```
 $ gerenuk changed-symbols
-base main (merge-base 5ddda1f)
+base HEAD~1 (merge-base 5ddda1f)
 
 changed symbols (2)
   modified  method    mypkg.pipelines.enrich:Enricher.run  src/mypkg/pipelines/enrich.py
@@ -37,7 +37,7 @@ non-Python changes (1)
 
 ```json
 {
-  "base": "main",
+  "base": "HEAD~1",
   "merge_base": "5ddda1f2cd66afdf789771b20a3bf667df78f050",
   "changed_symbols": [
     {
@@ -88,14 +88,26 @@ omits `column` is rejected rather than half-read.
 
 ## What gets diffed
 
-The range is `merge-base(HEAD, <base>)` → **working tree**: staged and unstaged
-edits together, plus untracked files that `.gitignore` does not cover. Taking
-the merge base rather than the branch tip means work landing on `main` after you
-branched is not attributed to you.
+The range is `<base>` → **working tree**: staged and unstaged edits together,
+plus untracked files that `.gitignore` does not cover. By default `<base>` is
+`HEAD~1`, so the range is the last commit plus anything not committed yet. Under
+the `branch` scope or an explicit `--base` it is `merge-base(HEAD, <ref>)`:
+taking the merge base rather than the branch tip means work landing on `main`
+after you branched is not attributed to you.
 
-`--base` defaults to the first of `origin/main`, `main`, `master` that exists.
-A `--base` you pass explicitly is used as given; if it does not resolve, the run
-fails with exit code `2` rather than falling back.
+With no `--base`, where the diff starts depends on the scope:
+
+| Scope | Base | Covers |
+|---|---|---|
+| `last-commit` (default) | `HEAD~1` | the last commit plus anything not committed yet — in a pre-commit hook, the commit being made |
+| `branch` | `merge-base(HEAD, base)`, `base` the first of `origin/main`, `main`, `master` that exists | every commit on the branch |
+
+Set it with `scope = "branch"` under `[tool.gerenuk]`, or per run with
+`--scope branch`; the flag beats the key. A root commit has no `HEAD~1`, so
+`last-commit` falls back to the `branch` chain there.
+
+A `--base` you pass explicitly beats both and is used as given; if it does not
+resolve, the run fails with exit code `2` rather than falling back.
 
 ## How lines become symbols
 

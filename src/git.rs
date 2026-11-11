@@ -24,6 +24,9 @@ pub const GIT_BIN_ENV: &str = "GERENUK_GIT";
 /// Base refs tried in order when `--base` is not given.
 pub const DEFAULT_BASES: &[&str] = &["origin/main", "main", "master"];
 
+/// The ref the last-commit scope diffs against.
+pub const LAST_COMMIT_BASE: &str = "HEAD~1";
+
 /// The base a run was diffed against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Base {
@@ -160,6 +163,19 @@ impl Git {
             "no usable base ref (tried {}). Pass --base with a ref that exists.",
             candidates.join(", ")
         )
+    }
+
+    /// The base for the last commit alone: `HEAD~1`, HEAD's first parent.
+    ///
+    /// The working tree is still what gets diffed, so uncommitted work counts
+    /// too — in a pre-commit hook that is the commit being made. A root commit
+    /// has no parent, and then the [`DEFAULT_BASES`] chain answers instead,
+    /// which is what gerenuk did before this scope existed.
+    pub fn resolve_last_commit(&self) -> Result<Base> {
+        match self.commit_sha(LAST_COMMIT_BASE)? {
+            Some(parent) => Ok(Base { name: LAST_COMMIT_BASE.to_string(), merge_base: parent }),
+            None => self.resolve_base(None),
+        }
     }
 
     /// Resolve `commit` for a replay, and the base its diff starts from.
@@ -416,6 +432,32 @@ mod tests {
             "a full sha should come back, got {}",
             base.merge_base
         );
+    }
+
+    #[test]
+    fn the_last_commit_is_diffed_from_heads_parent() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("first");
+        let parent = repo.git(&["rev-parse", "HEAD"]);
+        repo.write("a.py", "x = 2\n");
+        repo.commit("second");
+
+        let base = repo.gerenuk_git().resolve_last_commit().expect("HEAD has a parent");
+        assert_eq!(base.name, "HEAD~1", "the report names the ref it diffed against");
+        assert_eq!(base.merge_base, parent.trim(), "the diff starts at HEAD's first parent");
+    }
+
+    #[test]
+    fn a_root_commit_falls_back_to_the_default_chain() {
+        // No parent to diff from: the branch chain is what gerenuk did before
+        // the last-commit scope existed, so a fresh repository is no worse off.
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+
+        let base = repo.gerenuk_git().resolve_last_commit().expect("`main` exists");
+        assert_eq!(base.name, "main", "the default chain answers instead");
     }
 
     #[test]

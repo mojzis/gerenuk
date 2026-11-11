@@ -3,7 +3,7 @@
 Run pytest on exactly the tests the working tree's changes impact.
 
 ```
-gerenuk run [--base <REF> | --impact <FILE>]
+gerenuk run [--base <REF> | --scope <SCOPE> | --impact <FILE>]
             [--max-depth <N>] [--max-symbols <N>] [--budget-ms <MS>]
             [--fallback-command <JSON_ARRAY>] [--git-env <POLICY>]
             [--dry-run] [-- <pytest args>…]
@@ -171,7 +171,7 @@ its `source` (`flag`, `env` or `config`), the `reason`, and the complete
     "payload": {
       "gerenuk_fallback_payload_version": 1,
       "reason": "non_python_changes",
-      "report": { "base": "origin/main", "merge_base": "…", "non_python_changes": ["requirements.txt"], "…": "…" }
+      "report": { "base": "HEAD~1", "merge_base": "…", "non_python_changes": ["requirements.txt"], "…": "…" }
     }
   }
 }
@@ -436,7 +436,7 @@ branch without parsing anything. On its **stdin** it finds a JSON payload:
   "gerenuk_fallback_payload_version": 1,
   "reason": "non_python_changes",
   "report": {
-    "base": "origin/main",
+    "base": "HEAD~1",
     "merge_base": "3f2c…",
     "changed_symbols": [],
     "ignored_symbols": [],
@@ -524,7 +524,7 @@ gerenuk run --impact impact.json
 `--impact` maps a saved phase-2 report instead of walking the tree. It is parsed
 strictly — every field required, unknown keys rejected — because a report that
 half-parses becomes a confident selection of the wrong tests. It conflicts with
-`--base` and the budget flags, which belong to the walk that already happened.
+`--base`, `--scope` and the budget flags, which belong to the walk that already happened.
 
 ## Exit codes
 

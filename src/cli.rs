@@ -17,7 +17,7 @@ use crate::changed::{
     analyze as analyze_changes, untracked_change, ChangedSymbols, FileChange, GitSources,
 };
 use crate::closure::{Reason, Verdict};
-use crate::config::Config;
+use crate::config::{Config, Scope};
 use crate::diff;
 use crate::fallback::{self, Fallback, Payload};
 use crate::git::{Base, Git, Replay};
@@ -135,9 +135,17 @@ pub enum Command {
     ///
     /// Needs only `git` — no `tyf`, no `ty`, no Python environment.
     ChangedSymbols {
-        /// Base ref to diff against. Default: origin/main, then main, then master.
+        /// Base ref to diff against. Beats `--scope` and `scope` in
+        /// pyproject.toml.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+
+        /// How much history to diff when no `--base` is given: `last-commit`
+        /// (from HEAD~1, the default) or `branch` (from the merge base with
+        /// origin/main, then main, then master). Beats `scope` in
+        /// pyproject.toml.
+        #[arg(long, value_enum, value_name = "SCOPE", conflicts_with = "base")]
+        scope: Option<Scope>,
     },
 
     /// Report the tests the working tree's changed symbols can reach.
@@ -145,13 +153,21 @@ pub enum Command {
     /// Walks the reverse reference graph from `changed-symbols` outwards until
     /// it reaches test code. Needs `git` and `tyf`.
     ImpactedTests {
-        /// Base ref to diff against. Default: origin/main, then main, then master.
+        /// Base ref to diff against. Beats `--scope` and `scope` in
+        /// pyproject.toml.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
 
+        /// How much history to diff when no `--base` is given: `last-commit`
+        /// (from HEAD~1, the default) or `branch` (from the merge base with
+        /// origin/main, then main, then master). Beats `scope` in
+        /// pyproject.toml.
+        #[arg(long, value_enum, value_name = "SCOPE", conflicts_with = "base")]
+        scope: Option<Scope>,
+
         /// Replay a saved `changed-symbols --format json` report instead of
         /// diffing the working tree.
-        #[arg(long, value_name = "FILE", conflicts_with = "base")]
+        #[arg(long, value_name = "FILE", conflicts_with_all = ["base", "scope"])]
         changed: Option<PathBuf>,
 
         #[command(flatten)]
@@ -168,16 +184,24 @@ pub enum Command {
     /// these tests, run the whole suite, or run nothing at all. The last is why
     /// this is a command and not a list of node ids for a shell to interpolate.
     Run {
-        /// Base ref to diff against. Default: origin/main, then main, then master.
+        /// Base ref to diff against. Beats `--scope` and `scope` in
+        /// pyproject.toml.
         #[arg(long, value_name = "REF")]
         base: Option<String>,
+
+        /// How much history to diff when no `--base` is given: `last-commit`
+        /// (from HEAD~1, the default) or `branch` (from the merge base with
+        /// origin/main, then main, then master). Beats `scope` in
+        /// pyproject.toml.
+        #[arg(long, value_enum, value_name = "SCOPE", conflicts_with = "base")]
+        scope: Option<Scope>,
 
         /// Replay a saved `impacted-tests --format json` report instead of
         /// walking the working tree.
         #[arg(
             long,
             value_name = "FILE",
-            conflicts_with_all = ["base", "max_depth", "max_symbols", "budget_ms"],
+            conflicts_with_all = ["base", "scope", "max_depth", "max_symbols", "budget_ms"],
         )]
         impact: Option<PathBuf>,
 
@@ -320,17 +344,18 @@ impl Cli {
                 write!(out, "{}", report.render(self.format, &root)?)?;
                 Ok(if report.is_clean() { Outcome::Clean } else { Outcome::FindingsReported })
             }
-            Command::ChangedSymbols { base } => {
-                let report = run_changed_symbols(&root, base.as_deref())?;
+            Command::ChangedSymbols { base, scope } => {
+                let report = run_changed_symbols(&root, base.as_deref(), scope)?;
                 write!(out, "{}", report.render(self.format)?)?;
                 // Changed symbols are an inventory, not a verdict: a non-empty
                 // report is the normal case, so it must not fail the hook.
                 Ok(Outcome::Clean)
             }
-            Command::ImpactedTests { base, changed, budgets } => {
+            Command::ImpactedTests { base, scope, changed, budgets } => {
                 let report = run_impacted_tests(
                     &root,
                     base.as_deref(),
+                    scope,
                     changed.as_deref(),
                     Budgets::from(&budgets),
                 )?;
@@ -342,6 +367,7 @@ impl Cli {
             Command::Guide { .. } => unreachable!("handled before the workspace is resolved"),
             Command::Run {
                 base,
+                scope,
                 impact,
                 budgets,
                 dry_run,
@@ -353,6 +379,7 @@ impl Cli {
                 &root,
                 &RunOptions {
                     base: base.as_deref(),
+                    scope,
                     replay: None,
                     impact: impact.as_deref(),
                     budgets: Budgets::from(&budgets),
@@ -379,6 +406,7 @@ impl Cli {
                     &root,
                     &RunOptions {
                         base: None,
+                        scope: None,
                         replay: Some(&replay),
                         impact: None,
                         budgets: Budgets::from(&budgets),
@@ -414,9 +442,13 @@ fn guide_output(topic: Option<guide::Topic>) -> String {
 /// Everything is resolved against the *git* top level rather than `workspace`,
 /// because diff paths are repository-relative — and because the pitch puts
 /// `[tool.gerenuk]` in the repo-root `pyproject.toml`.
-pub fn run_changed_symbols(workspace: &Path, base: Option<&str>) -> Result<ChangedSymbols> {
+pub fn run_changed_symbols(
+    workspace: &Path,
+    base: Option<&str>,
+    scope: Option<Scope>,
+) -> Result<ChangedSymbols> {
     let repo = repo_context(workspace)?;
-    let base = repo.git.resolve_base(base)?;
+    let base = resolve_base(&repo, base, scope)?;
     let untracked = repo.git.untracked()?;
     changed_report(&repo.git, &repo.root, &base, &repo.config, &untracked)
 }
@@ -428,6 +460,18 @@ struct Repo {
     /// so is `[tool.gerenuk]` in the repo-root `pyproject.toml`.
     root: PathBuf,
     config: Config,
+}
+
+/// Where the working-tree diff starts: `--base`, else `--scope`, else the
+/// `scope` key, which defaults to the last commit.
+fn resolve_base(repo: &Repo, base: Option<&str>, scope: Option<Scope>) -> Result<Base> {
+    if base.is_some() {
+        return repo.git.resolve_base(base);
+    }
+    match scope.unwrap_or(repo.config.scope) {
+        Scope::LastCommit => repo.git.resolve_last_commit(),
+        Scope::Branch => repo.git.resolve_base(None),
+    }
 }
 
 fn repo_context(workspace: &Path) -> Result<Repo> {
@@ -469,12 +513,13 @@ fn changed_report(
 pub fn run_impacted_tests(
     workspace: &Path,
     base: Option<&str>,
+    scope: Option<Scope>,
     changed_file: Option<&Path>,
     budgets: Budgets,
 ) -> Result<ImpactReport> {
     let repo = repo_context(workspace)?;
-    Ok(impacted_run(&repo, Diff::WorkingTree { base }, changed_file, budgets, Economics::Ignore)?
-        .report)
+    let diff = Diff::WorkingTree { base, scope };
+    Ok(impacted_run(&repo, diff, changed_file, budgets, Economics::Ignore)?.report)
 }
 
 /// Whether the walk is worth its cost, which only `run` has a view on.
@@ -516,16 +561,16 @@ impl ImpactRun {
 #[derive(Debug, Clone, Copy)]
 enum Diff<'a> {
     /// The working tree, untracked files included, against a base ref.
-    WorkingTree { base: Option<&'a str> },
+    WorkingTree { base: Option<&'a str>, scope: Option<Scope> },
     /// A commit the checkout matches, against its parent or a base ref.
     Commit(&'a Replay),
 }
 
 impl<'a> Diff<'a> {
-    fn of(base: Option<&'a str>, replay: Option<&'a Replay>) -> Self {
+    fn of(base: Option<&'a str>, scope: Option<Scope>, replay: Option<&'a Replay>) -> Self {
         match replay {
             Some(replay) => Self::Commit(replay),
-            None => Self::WorkingTree { base },
+            None => Self::WorkingTree { base, scope },
         }
     }
 }
@@ -549,7 +594,9 @@ fn impacted_run(
         load_report::<ChangedSymbols>(path, "changed", "a changed-symbols report")?
     } else {
         let (base, listed) = match diff {
-            Diff::WorkingTree { base } => (git.resolve_base(base)?, git.untracked()?),
+            Diff::WorkingTree { base, scope } => {
+                (resolve_base(repo, base, scope)?, git.untracked()?)
+            }
             // No untracked files: they were never part of the commit, and an
             // empty list here keeps them out of the file index below too.
             Diff::Commit(replay) => (replay_base(git, replay)?, Vec::new()),
@@ -665,6 +712,8 @@ fn short(sha: &str) -> &str {
 /// Everything `gerenuk run` was asked for.
 struct RunOptions<'a> {
     base: Option<&'a str>,
+    /// `--scope`; `None` means whatever `pyproject.toml` says.
+    scope: Option<Scope>,
     /// `replay`'s commit, already resolved: diff it instead of the working tree.
     replay: Option<&'a Replay>,
     impact: Option<&'a Path>,
@@ -706,7 +755,7 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
         },
         None => impacted_run(
             &repo,
-            Diff::of(options.base, options.replay),
+            Diff::of(options.base, options.scope, options.replay),
             None,
             options.budgets,
             Economics::Honour,
@@ -1009,7 +1058,7 @@ mod tests {
         let cli = Cli::try_parse_from(["gerenuk", "changed-symbols"])
             .expect("the subcommand takes no required arguments");
         match cli.command {
-            Command::ChangedSymbols { base } => {
+            Command::ChangedSymbols { base, .. } => {
                 assert_eq!(base, None, "no --base means the default chain is tried");
             }
             other => panic!("expected changed-symbols, got {other:?}"),
@@ -1030,7 +1079,7 @@ mod tests {
 
         assert_eq!(cli.format, Format::Json, "--format still applies");
         match cli.command {
-            Command::ChangedSymbols { base } => {
+            Command::ChangedSymbols { base, .. } => {
                 assert_eq!(base.as_deref(), Some("upstream/release"), "the ref is passed through");
             }
             other => panic!("expected changed-symbols, got {other:?}"),
@@ -1042,7 +1091,7 @@ mod tests {
         let cli = Cli::try_parse_from(["gerenuk", "impacted-tests"])
             .expect("the subcommand should be usable bare");
         match cli.command {
-            Command::ImpactedTests { base, changed, budgets } => {
+            Command::ImpactedTests { base, changed, budgets, .. } => {
                 assert_eq!(base, None, "the default base chain applies");
                 assert_eq!(changed, None, "and the diff is computed, not replayed");
                 assert_eq!(
@@ -1093,6 +1142,63 @@ mod tests {
             "main",
         ])
         .expect_err("the two flags contradict each other");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn scope_is_unset_unless_given() {
+        let cli = Cli::try_parse_from(["gerenuk", "run"]).expect("bare run parses");
+        match cli.command {
+            Command::Run { scope, .. } => assert_eq!(scope, None, "pyproject.toml decides"),
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn every_diffing_command_accepts_a_scope() {
+        for command in ["changed-symbols", "impacted-tests", "run"] {
+            let cli = Cli::try_parse_from(["gerenuk", command, "--scope", "branch"])
+                .unwrap_or_else(|err| panic!("{command} --scope branch should parse: {err}"));
+            let scope = match cli.command {
+                Command::ChangedSymbols { scope, .. }
+                | Command::ImpactedTests { scope, .. }
+                | Command::Run { scope, .. } => scope,
+                other => panic!("unexpected {other:?}"),
+            };
+            assert_eq!(scope, Some(Scope::Branch), "{command}");
+        }
+        assert!(
+            Cli::try_parse_from(["gerenuk", "run", "--scope", "head"]).is_err(),
+            "unknown scope"
+        );
+    }
+
+    #[test]
+    fn a_scope_and_an_explicit_base_are_mutually_exclusive() {
+        // `--base` already says exactly where the diff starts.
+        for command in ["changed-symbols", "impacted-tests", "run"] {
+            let err =
+                Cli::try_parse_from(["gerenuk", command, "--scope", "branch", "--base", "main"])
+                    .expect_err("the two flags contradict each other");
+            assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_scope_cannot_accompany_a_replayed_report() {
+        let err =
+            Cli::try_parse_from(["gerenuk", "run", "--impact", "report.json", "--scope", "branch"])
+                .expect_err("a saved report already has its base");
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+        let err = Cli::try_parse_from([
+            "gerenuk",
+            "impacted-tests",
+            "--changed",
+            "report.json",
+            "--scope",
+            "branch",
+        ])
+        .expect_err("a saved report already has its base");
         assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 

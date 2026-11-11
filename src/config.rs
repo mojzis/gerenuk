@@ -88,6 +88,27 @@ pub struct Config {
     /// them like any other line, for a project whose behaviour reads
     /// `__doc__` — docopt, a CLI's `--help`, an API schema.
     pub docstrings: Docstrings,
+
+    /// How much history the working tree is diffed against when no `--base`
+    /// is given.
+    ///
+    /// `last-commit` (the default) diffs from `HEAD~1`: the last commit plus
+    /// anything not committed yet, which is what a commit hook needs to check.
+    /// `branch` diffs from the merge base with `origin/main` (then `main`,
+    /// then `master`): every commit on the branch. `--scope` beats it, and
+    /// `--base` beats both.
+    pub scope: Scope,
+}
+
+/// `[tool.gerenuk] scope` and `--scope`: where the diff starts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Scope {
+    /// From `HEAD~1`: the last commit and any uncommitted work
+    #[default]
+    LastCommit,
+    /// From the merge base with `origin/main`, `main` or `master`: the whole branch
+    Branch,
 }
 
 /// `[tool.gerenuk] docstrings`: what a docstring-only edit means.
@@ -250,6 +271,7 @@ pub(crate) mod keys {
                 "git-env",
                 "ignore-paths",
                 "docstrings",
+                "scope",
             ] {
                 assert!(keys.contains(expected), "`{expected}` should be accepted: {keys:?}");
             }
@@ -520,6 +542,29 @@ mod tests {
         let tmp = with_pyproject("[tool.gerenuk]\ndocstrings = \"code\"\n");
         let config = Config::load(tmp.path()).expect("loads");
         assert_eq!(config.docstrings, Docstrings::Code);
+    }
+
+    #[test]
+    fn the_scope_is_the_last_commit_by_default() {
+        let tmp = with_pyproject("[tool.gerenuk]\n");
+        let config = Config::load(tmp.path()).expect("loads");
+        assert_eq!(config.scope, Scope::LastCommit, "a hook checks the commit, not the branch");
+    }
+
+    #[test]
+    fn the_scope_can_be_the_whole_branch() {
+        let tmp = with_pyproject("[tool.gerenuk]\nscope = \"branch\"\n");
+        let config = Config::load(tmp.path()).expect("loads");
+        assert_eq!(config.scope, Scope::Branch);
+        let tmp = with_pyproject("[tool.gerenuk]\nscope = \"last-commit\"\n");
+        let config = Config::load(tmp.path()).expect("loads");
+        assert_eq!(config.scope, Scope::LastCommit);
+    }
+
+    #[test]
+    fn an_unknown_scope_is_an_error() {
+        let tmp = with_pyproject("[tool.gerenuk]\nscope = \"head\"\n");
+        assert!(Config::load(tmp.path()).is_err(), "a typo must not silently mean the default");
     }
 
     #[test]

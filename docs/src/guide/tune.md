@@ -1,12 +1,12 @@
 # Tune gerenuk
 
-Reference for the knobs. The defaults are conservative on purpose: tune
-for speed only once a `run_all` reason keeps repeating.
+Reference for the knobs. Tune for speed once a `run_all` reason repeats.
 
-**Where the diff comes from.** `--base <REF>` names the ref to diff against;
-by default `origin/main`, then `main`, then `master`. The working tree -
-staged, unstaged and untracked - is diffed from the merge-base.
-`--workspace <PATH>` names the project root instead of walking up to it.
+**Where the diff comes from.** The working tree - staged, unstaged and
+untracked - is diffed from `HEAD~1`: the last commit plus what is not
+committed yet. `scope` set to `"branch"` (or `--scope branch`) diffs the whole
+branch from its merge-base with `origin/main`, then `main`, then `master`.
+`--base <REF>` beats both. `--workspace <PATH>` names the project root.
 
 **Budgets.** The walk says `run_all` at the first limit it hits. A flag
 beats `[tool.gerenuk]` in `pyproject.toml`, which beats the default.

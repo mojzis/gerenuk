@@ -422,7 +422,7 @@ fn a_suite_declared_faster_than_a_selection_skips_the_walk_before_tyf_is_looked_
     fixture
         .repo
         .write("pyproject.toml", "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 800\n");
-    fixture.repo.commit("declare the suite");
+    fixture.repo.amend();
     touch_target(&fixture.repo);
 
     let output = fixture
@@ -450,7 +450,7 @@ fn a_fast_suite_still_runs_only_the_changed_test_files_when_nothing_needs_walkin
     fixture
         .repo
         .write("pyproject.toml", "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 800\n");
-    fixture.repo.commit("declare the suite");
+    fixture.repo.amend();
     fixture
         .repo
         .write("tests/test_core.py", &format!("{TEST_CORE}\n\ndef test_more():\n    pass\n"));
@@ -470,7 +470,7 @@ fn a_fast_suite_slower_than_a_selection_is_walked_as_usual() {
         "pyproject.toml",
         "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 30000\n",
     );
-    fixture.repo.commit("declare the suite");
+    fixture.repo.amend();
     touch_target(&fixture.repo);
 
     let output = fixture.run(&["--dry-run", "--format", "json"]);
@@ -486,7 +486,7 @@ fn a_fast_suite_delegates_to_the_fallback_like_any_run_all() {
         "pyproject.toml",
         "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nsuite-ms = 1\nfallback-command = [\"scripts/pick.sh\"]\n",
     );
-    fixture.repo.commit("declare the suite");
+    fixture.repo.amend();
     touch_target(&fixture.repo);
 
     let output = fixture.run(&["--dry-run", "--format", "json"]);
@@ -590,14 +590,15 @@ impl Fixture {
     }
 
     /// Rewrite the repo's `pyproject.toml` with `body` under `[tool.gerenuk]`,
-    /// and commit it: a configuration change is a non-Python change, and left
-    /// in the working tree it would force every outcome to `run_all`.
+    /// and fold it into the base commit: a configuration change is a
+    /// non-Python change, and in the diff it would force every outcome to
+    /// `run_all`.
     fn configure(&self, body: &str) {
         self.repo.write(
             "pyproject.toml",
             &format!("[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\n{body}"),
         );
-        self.repo.commit("configure");
+        self.repo.amend();
     }
 
     /// A change gerenuk cannot reason about at all: the `run_all` outcome.
