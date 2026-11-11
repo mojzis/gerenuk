@@ -19,7 +19,8 @@ Python's actual name resolution, not a name match. Anything gerenuk cannot see
 through becomes "run the whole suite" rather than a confident short list.
 
 📖 **[Documentation](https://mojzis.github.io/gerenuk)** ·
-🤖 [llms.txt](https://mojzis.github.io/gerenuk/llms.txt)
+🤖 [llms.txt](https://mojzis.github.io/gerenuk/llms.txt) ·
+part of **[aesop](https://mojzis.github.io/aesop/)**, a small menagerie of tools for agentic Python
 
 ## Install
 
