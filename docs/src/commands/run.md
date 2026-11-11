@@ -3,7 +3,7 @@
 Run pytest on exactly the tests the working tree's changes impact.
 
 ```
-gerenuk run [--base <REF> | --impact <FILE>]
+gerenuk run [--base <REF> | --scope <SCOPE> | --impact <FILE>]
             [--max-depth <N>] [--max-symbols <N>] [--budget-ms <MS>]
             [--fallback-command <JSON_ARRAY>] [--git-env <POLICY>]
             [--dry-run] [-- <pytest args>…]

@@ -128,6 +128,14 @@ impl TestRepo {
         self.git(&["commit", "-m", message]);
     }
 
+    /// Fold the working tree into the last commit, as if it had always been
+    /// there: setup that no diff should see, whatever the scope.
+    #[allow(dead_code, reason = "not every test binary amends")]
+    pub fn amend(&self) {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "--amend", "--no-edit"]);
+    }
+
     /// Run `gerenuk changed-symbols --format json` and parse the result.
     pub fn changed_symbols(&self, extra: &[&str]) -> serde_json::Value {
         let output = gerenuk_bare(self.path())

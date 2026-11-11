@@ -4,7 +4,7 @@ Walk the reference graph from the symbols the working tree changed out to the
 tests that reach them.
 
 ```
-gerenuk impacted-tests [--base <REF>] [--changed <FILE>]
+gerenuk impacted-tests [--base <REF> | --scope <SCOPE>] [--changed <FILE>]
                        [--max-depth <N>] [--max-symbols <N>] [--budget-ms <MS>]
 ```
 

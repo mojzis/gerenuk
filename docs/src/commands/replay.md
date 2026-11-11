@@ -53,9 +53,11 @@ environment for the worktree instead, once.
 | `replay <COMMIT>` | `COMMIT^` → `COMMIT` | that commit's own change |
 | `replay <COMMIT> --base main` | `merge-base(COMMIT, main)` → `COMMIT` | what a pre-commit hook on a branch forked from `main` saw when it made `COMMIT` |
 
-The hook diffs the working tree against the merge base with `origin/main` (see
+By default the hook diffs the working tree from `HEAD~1`, so each commit is
+judged on itself (and the one before it). Under `scope = "branch"` it diffs
+from the merge base with `origin/main` (see
 [`changed-symbols`](changed-symbols.md)), so a commit late in a branch was
-judged on the whole branch so far. `--base` reproduces that; the default looks
+judged on the whole branch so far; `--base` reproduces that. The default looks
 at the one commit only. A root commit has no parent and needs `--base`.
 
 ## Listing (the default)

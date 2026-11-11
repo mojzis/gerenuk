@@ -32,3 +32,4 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0021](0021-ignored-paths-never-widen.md) | Declared non-Python paths never widen the selection | accepted |
 | [0022](0022-an-inert-edit-changes-no-symbol.md) | A comment- or docstring-only edit changes no symbol | accepted |
 | [0023](0023-a-replay-checks-itself-out.md) | A replay checks its commit out in a worktree it keeps | accepted |
+| [0024](0024-the-default-diff-is-the-last-commit.md) | The default diff is the last commit, not the branch | accepted |

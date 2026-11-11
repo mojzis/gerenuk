@@ -24,9 +24,11 @@ extend_check = [
 ```
 
 `pass_files = false` because gerenuk takes no file list: it diffs the working
-tree against `origin/main` (then `main`, then `master`), not the index, so
-unstaged edits and untracked files count in a hook. `--base <REF>` overrides
-the ref. Everything after `--` goes to pytest verbatim.
+tree, not the index, so unstaged edits and untracked files count in a hook.
+The diff starts at `HEAD~1`, so a hook checks the last commit and the one
+being made. `scope = "branch"` under `[tool.gerenuk]` widens it to the whole
+branch, from `origin/main` (then `main`, then `master`). `--base <REF>`
+overrides both. Everything after `--` goes to pytest verbatim.
 
 **4. Name the pytest**, only if plain `pytest` is not the one on PATH:
 
@@ -36,8 +38,8 @@ pytest-command = ["uv", "run", "pytest"]
 ```
 
 **5. Verify with a real diff.** With no diff at all, `gerenuk run` selects
-nothing, spawns nothing and exits `0`, which proves only that it ran. Push, so
-that `origin/main` matches; change one symbol a test reaches; then:
+nothing, spawns nothing and exits `0`, which proves only that it ran. Change
+one symbol a test reaches; then:
 
 ```bash
 gerenuk impacted-tests

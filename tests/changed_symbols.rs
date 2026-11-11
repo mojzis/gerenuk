@@ -236,7 +236,8 @@ fn a_non_python_change_matching_ignore_paths_is_listed_apart() {
     repo.write("docs/notes.md", "# Notes\n");
     repo.write("data/schema.sql", "CREATE TABLE t (id INT);\n");
 
-    let report = repo.changed_symbols(&[]);
+    // The branch scope, so the committed config edit is not part of the diff.
+    let report = repo.changed_symbols(&["--scope", "branch"]);
     assert_eq!(strings(&report, "ignored_paths"), vec!["docs/notes.md".to_string()]);
     assert_eq!(
         strings(&report, "non_python_changes"),
@@ -584,4 +585,92 @@ fn a_docstring_only_edit_counts_when_docstrings_are_code() {
         vec![("mypkg.service:describe".to_string(), "modified".to_string())]
     );
     assert_eq!(strings(&report, "inert_changes"), Vec::<String>::new());
+}
+
+/// A branch with two commits on it, each touching a different method.
+fn two_commits_on_a_branch() -> TestRepo {
+    let repo = src_layout_repo();
+    repo.git(&["checkout", "-b", "feature"]);
+    repo.write("src/mypkg/service.py", &SERVICE.replace("return LIMIT", "return LIMIT * 2"));
+    repo.commit("earlier work");
+    repo.write(
+        "src/mypkg/service.py",
+        &SERVICE.replace("return LIMIT", "return LIMIT * 2").replace("return []", "return [1]"),
+    );
+    repo.commit("the last commit");
+    repo
+}
+
+#[test]
+fn by_default_only_the_last_commit_is_diffed() {
+    let repo = two_commits_on_a_branch();
+    let report = repo.changed_symbols(&[]);
+
+    assert_eq!(report["base"], "HEAD~1", "the last commit's parent, not the branch base");
+    assert_eq!(
+        pairs(&report, "changed_symbols"),
+        vec![("mypkg.service:Shelter.seniors".to_string(), "modified".to_string())],
+        "earlier commits on the branch were checked when they were made"
+    );
+}
+
+#[test]
+fn the_last_commit_scope_still_sees_uncommitted_work() {
+    let repo = two_commits_on_a_branch();
+    repo.write("src/mypkg/extra.py", "def fresh():\n    return 1\n");
+    let report = repo.changed_symbols(&[]);
+
+    assert!(
+        pairs(&report, "changed_symbols")
+            .contains(&("mypkg.extra:fresh".to_string(), "added".to_string())),
+        "a pre-commit hook sees the commit being made: {report}"
+    );
+}
+
+#[test]
+fn scope_branch_diffs_the_whole_branch() {
+    let repo = two_commits_on_a_branch();
+    let report = repo.changed_symbols(&["--scope", "branch"]);
+
+    assert_eq!(report["base"], "main", "the default chain reaches `main`");
+    assert_eq!(
+        pairs(&report, "changed_symbols"),
+        vec![
+            ("mypkg.service:Shelter.seniors".to_string(), "modified".to_string()),
+            ("mypkg.service:Shelter.summary".to_string(), "modified".to_string()),
+        ],
+        "every commit since the fork point"
+    );
+}
+
+#[test]
+fn scope_branch_in_pyproject_restores_the_branch_diff() {
+    let repo = two_commits_on_a_branch();
+    repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nscope = \"branch\"\n",
+    );
+    let report = repo.changed_symbols(&[]);
+
+    assert_eq!(report["base"], "main", "the config key picks the branch chain");
+}
+
+#[test]
+fn the_scope_flag_beats_the_config_key() {
+    let repo = two_commits_on_a_branch();
+    repo.write(
+        "pyproject.toml",
+        "[project]\nname = \"mypkg\"\n\n[tool.gerenuk]\nscope = \"branch\"\n",
+    );
+    let report = repo.changed_symbols(&["--scope", "last-commit"]);
+
+    assert_eq!(report["base"], "HEAD~1", "--scope overrides pyproject.toml");
+}
+
+#[test]
+fn an_explicit_base_beats_the_scope_key() {
+    let repo = two_commits_on_a_branch();
+    let report = repo.changed_symbols(&["--base", "main"]);
+
+    assert_eq!(report["base"], "main", "--base names the ref outright");
 }

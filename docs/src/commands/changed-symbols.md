@@ -3,7 +3,7 @@
 Map the working tree's diff to the Python symbols it changed.
 
 ```
-gerenuk changed-symbols [--base <REF>]
+gerenuk changed-symbols [--base <REF> | --scope <SCOPE>]
 ```
 
 Unlike [`audit`](audit.md), this command needs only `git` — no `tyf`, no `ty`,
@@ -93,9 +93,19 @@ edits together, plus untracked files that `.gitignore` does not cover. Taking
 the merge base rather than the branch tip means work landing on `main` after you
 branched is not attributed to you.
 
-`--base` defaults to the first of `origin/main`, `main`, `master` that exists.
-A `--base` you pass explicitly is used as given; if it does not resolve, the run
-fails with exit code `2` rather than falling back.
+With no `--base`, where the diff starts depends on the scope:
+
+| Scope | Base | Covers |
+|---|---|---|
+| `last-commit` (default) | `HEAD~1` | the last commit plus anything not committed yet — in a pre-commit hook, the commit being made |
+| `branch` | `merge-base(HEAD, base)`, `base` the first of `origin/main`, `main`, `master` that exists | every commit on the branch |
+
+Set it with `scope = "branch"` under `[tool.gerenuk]`, or per run with
+`--scope branch`; the flag beats the key. A root commit has no `HEAD~1`, so
+`last-commit` falls back to the `branch` chain there.
+
+A `--base` you pass explicitly beats both and is used as given; if it does not
+resolve, the run fails with exit code `2` rather than falling back.
 
 ## How lines become symbols
 
