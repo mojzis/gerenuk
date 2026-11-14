@@ -40,9 +40,9 @@ ty = [
 
 [package.metadata]
 requires-dist = [
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=9.1.1" },
     { name = "ty", marker = "extra == 'ty'" },
-    { name = "ty-find", specifier = ">=0.4" },
+    { name = "ty-find", specifier = ">=0.4.5" },
 ]
 provides-extras = ["dev", "ty"]
 
@@ -181,13 +181,13 @@ wheels = [
 
 [[package]]
 name = "ty-find"
-version = "0.4.5"
+version = "0.5.4"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/ba/86/e275d8f07633e5a7de52a18a5fefac1dab3af14fe707f40726e9f22c5f15/ty_find-0.4.5.tar.gz", hash = "sha256:657a7185e39d4d1b5ce2589f67acac6910825286d473850dd174aad617725792", size = 1035032, upload-time = "2026-08-23T20:28:31.466Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/29/5e/0468fd705b1ed38b4626c238f8bf1b0d34ecf5a8f86df38797cfec1bff48/ty_find-0.5.4.tar.gz", hash = "sha256:3214c86889bac289e07de85904b9eca3d857dfcbdc8249e1ac0fb1de67c234ef", size = 1072302, upload-time = "2026-11-14T17:07:41.898Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/05/eb/b841911c7ca5d84d24a7bf5a9fa944d0e53e3fd8b59af7fafb6fa222c6a9/ty_find-0.4.5-py3-none-macosx_11_0_arm64.whl", hash = "sha256:122fa6db9e4e8264a5fc91ae50783cb13370e307b5498ef9087e1e10b8361128", size = 1099506, upload-time = "2026-08-23T20:28:26.403Z" },
-    { url = "https://files.pythonhosted.org/packages/3c/9a/2c1bac13345ae88708325bf191e2a810428f59b8b7f29a8080053033281a/ty_find-0.4.5-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:799bebaf079438c94cd402186d10f7d3754a6bd5d74d68e0d9074e6f32099420", size = 1266128, upload-time = "2026-08-23T20:28:28.632Z" },
-    { url = "https://files.pythonhosted.org/packages/43/ee/6278ad92790a6d4afcb4d73133e011ca1b986e9cc941fcd8301459cfee43/ty_find-0.4.5-py3-none-win_amd64.whl", hash = "sha256:6a377896ea4a3f20353c5a0e80632d9a2d59eff91a330ae3046ef2bb8a41353d", size = 813738, upload-time = "2026-08-23T20:28:30.031Z" },
+    { url = "https://files.pythonhosted.org/packages/52/a2/dc076feb135be4f2119418e70ce5f5b5f58836ba282101fe3345d306406f/ty_find-0.5.4-py3-none-macosx_11_0_arm64.whl", hash = "sha256:ae6e3f481c25b018c7eddbc9a41e814198a363a21d9a8650ded20606fd150aa5", size = 1775283, upload-time = "2026-11-14T17:07:36.689Z" },
+    { url = "https://files.pythonhosted.org/packages/af/ab/e6b7948a68b9652f0be33a5c3748b3a64abc136f57bd2528618dede55f95/ty_find-0.5.4-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:a3b33cc0ad9a6f0795907ddcf964fcdc5d32437385ed6bc1e3124c08ba2f6301", size = 2037530, upload-time = "2026-11-14T17:07:38.709Z" },
+    { url = "https://files.pythonhosted.org/packages/41/d2/17026600f081ce8c324fe23054f15c1707075152d18fae9f892ee7cc8e8b/ty_find-0.5.4-py3-none-win_amd64.whl", hash = "sha256:cf8be8ab22fa60277b4eea397a52110a8afe8d18fd378e645bc23e0d77f546aa", size = 947552, upload-time = "2026-11-14T17:07:40.244Z" },
 ]
 
 [[package]]
