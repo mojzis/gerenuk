@@ -90,7 +90,9 @@
       "task_set": {}
     }
   ],
-  "pending": {},
+  "pending": {
+    "1:dev": "ff15f559-b9fc-4e20-83dd-b7434aa12b58"
+  },
   "replans": [],
   "plan_sessions": [
     {
