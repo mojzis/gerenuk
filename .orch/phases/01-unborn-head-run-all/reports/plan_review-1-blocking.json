@@ -1,4 +1,0 @@
-[
-  "the brief says to change `tests/test_a.py`, which does not exist (mark it *(new)* or fix the path)",
-  "the brief says to change `pkg/__init__.py`, which does not exist (mark it *(new)* or fix the path)"
-]
