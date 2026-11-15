@@ -1,0 +1,14 @@
+# orch repo config. Layers and roles: `orch guide tune`.
+
+# The gate: one command that must pass after every code change (tests + typecheck).
+gate_cmd = "make review-quick"
+# Run once in each fresh review/QA worktree, e.g. "uv sync".
+setup_cmd = ""
+max_fix_rounds = 2
+remote = "origin"
+push = true
+
+# Per-role overrides, e.g.:
+# [role.dev]
+# model = "sonnet"
+# effort = "high"
