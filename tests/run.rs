@@ -21,7 +21,7 @@ use assert_cmd::cargo::CommandCargoExt;
 use assert_cmd::prelude::*;
 use common::{
     fake_fallback, fake_pytest, fake_tyf, gerenuk, json_output, make_executable, recorded_argv,
-    recorded_env, TestRepo,
+    recorded_env, strip_hook_git_env, TestRepo,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -134,6 +134,7 @@ impl Fixture {
     fn without_tools(&self) -> std::process::Command {
         let git = which::which("git").expect("git should be on PATH for the test suite");
         let mut cmd = std::process::Command::cargo_bin("gerenuk").expect("gerenuk should be built");
+        strip_hook_git_env(&mut cmd);
         cmd.current_dir(self.repo.path())
             .env_remove("GERENUK_TYF")
             .env_remove("GERENUK_PYTEST")
@@ -1246,7 +1247,9 @@ impl Hooked {
     /// `tyf` stub and the git-using pytest, and nothing of this machine's
     /// git config.
     fn git(&self, dir: &Path, args: &[&str]) -> std::process::Output {
-        std::process::Command::new("git")
+        let mut command = std::process::Command::new("git");
+        strip_hook_git_env(&mut command);
+        command
             .current_dir(dir)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
@@ -1602,4 +1605,313 @@ fn durations_without_run_is_a_usage_error() {
     let fixture = Fixture::new(0);
     let output = fixture.replay(&["HEAD", "--durations", "5"]);
     assert_eq!(output.status.code(), Some(2), "{}", stderr(&output));
+}
+
+// An unborn HEAD: a repository with no commit yet, which is what the first
+// commit of every new project runs its pre-commit hook in. Each test builds
+// its scratch repository in its own temp dir.
+
+/// A repository with `HEAD` unborn, the scratch package staged, a recording
+/// pytest stub, and no `tyf` anywhere.
+struct Unborn {
+    tmp: TempDir,
+    repo: TestRepo,
+    pytest: PathBuf,
+    record: PathBuf,
+}
+
+impl Unborn {
+    fn new(exit_code: u8) -> Self {
+        let tmp = TempDir::new().expect("temp dir");
+        let repo = TestRepo::new();
+        repo.write("pkg/__init__.py", "");
+        repo.write("tests/test_a.py", "def test_a():\n    assert True\n");
+        repo.write("pyproject.toml", "[project]\nname = \"pkg\"\nversion = \"0\"\n");
+        repo.git(&["add", "-A"]);
+        let record = tmp.path().join("argv.txt");
+        let pytest = fake_pytest(&tmp, &record, exit_code);
+        Self { tmp, repo, pytest, record }
+    }
+
+    /// `gerenuk` with a recording pytest and no `tyf`: an unborn run that
+    /// reaches for `tyf` would fail here rather than quietly succeed.
+    fn command(&self) -> std::process::Command {
+        let mut cmd = common::gerenuk_no_tyf(self.repo.path());
+        cmd.env("GERENUK_PYTEST", &self.pytest)
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+        cmd.env_remove("GERENUK_TYF");
+        for name in gerenuk::pytest::LOCAL_GIT_ENV {
+            cmd.env_remove(name);
+        }
+        cmd
+    }
+
+    fn run(&self, args: &[&str]) -> std::process::Output {
+        self.command().args(args).output().expect("gerenuk should run")
+    }
+
+    fn argv(&self) -> Option<Vec<String>> {
+        recorded_argv(&self.record)
+    }
+}
+
+fn stderr_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[test]
+fn an_unborn_head_runs_the_bare_suite_in_every_scope() {
+    for scope in [&[][..], &["--scope", "last-commit"], &["--scope", "branch"]] {
+        let unborn = Unborn::new(3);
+        let mut args = vec!["run"];
+        args.extend_from_slice(scope);
+        args.extend(["--", "-q"]);
+
+        let output = unborn.run(&args);
+        assert_eq!(
+            output.status.code(),
+            Some(3),
+            "pytest's code, verbatim ({scope:?}): {}",
+            stderr_of(&output)
+        );
+        assert_eq!(
+            unborn.argv().expect("pytest should have been spawned"),
+            vec!["-q"],
+            "no node ids, only the passthrough ({scope:?})"
+        );
+        assert!(
+            stderr_of(&output).contains("HEAD has no commit yet"),
+            "the summary names the reason: {}",
+            stderr_of(&output)
+        );
+    }
+}
+
+#[test]
+fn an_unborn_dry_run_reports_run_all_and_spawns_nothing() {
+    let unborn = Unborn::new(0);
+    let output = unborn.run(&["--format", "json", "run", "--dry-run"]);
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(report["decision"], "run_all", "{report}");
+    assert_eq!(report["reason"], "unborn_head", "{report}");
+    assert_eq!(unborn.argv(), None, "a dry run spawns no pytest");
+
+    let human = unborn.run(&["run", "--dry-run"]);
+    assert!(human.status.success());
+    let text = format!("{}{}", String::from_utf8_lossy(&human.stdout), stderr_of(&human));
+    assert!(text.contains("HEAD has no commit yet"), "the label is shown: {text}");
+}
+
+#[test]
+fn an_unborn_head_never_looks_for_tyf_or_pytest() {
+    let unborn = Unborn::new(0);
+    let git = which::which("git").expect("git should be on PATH for the test suite");
+    let output = std::process::Command::cargo_bin("gerenuk")
+        .expect("gerenuk should be built")
+        .current_dir(unborn.repo.path())
+        .env_remove("GERENUK_TYF")
+        .env_remove("GERENUK_PYTEST")
+        .env("GERENUK_GIT", git)
+        .env("PATH", "")
+        .args(["--format", "json", "run", "--dry-run"])
+        .output()
+        .expect("gerenuk should run");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(report["reason"], "unborn_head", "{report}");
+}
+
+#[test]
+fn an_unborn_head_hands_the_fallback_a_null_report() {
+    let unborn = Unborn::new(0);
+    let stub = FallbackStub::new(unborn.tmp.path(), "fallback", &unborn.tmp.path().join("fb"), 7);
+    unborn.repo.write(
+        "pyproject.toml",
+        &format!("[project]\nname = \"pkg\"\n\n[tool.gerenuk]\n{}", stub.config(&[])),
+    );
+    unborn.repo.git(&["add", "-A"]);
+
+    let output = unborn.run(&["run"]);
+    assert_eq!(output.status.code(), Some(7), "the fallback's code: {}", stderr_of(&output));
+    assert_eq!(unborn.argv(), None, "pytest is not spawned");
+    assert_eq!(stub.recorded("reason").as_deref(), Some("unborn_head"));
+    let payload = stub.payload();
+    assert_eq!(payload["gerenuk_fallback_payload_version"], 1);
+    assert_eq!(payload["reason"], "unborn_head");
+    assert!(payload["report"].is_null(), "no report was fabricated: {payload}");
+}
+
+#[test]
+fn an_unborn_head_beats_suite_ms() {
+    let unborn = Unborn::new(0);
+    unborn
+        .repo
+        .write("pyproject.toml", "[project]\nname = \"pkg\"\n\n[tool.gerenuk]\nsuite-ms = 800\n");
+    unborn.repo.git(&["add", "-A"]);
+    let output = unborn.run(&["--format", "json", "run", "--dry-run"]);
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(report["reason"], "unborn_head", "{report}");
+}
+
+#[test]
+fn an_unborn_head_with_nothing_staged_still_runs_the_suite() {
+    let unborn = Unborn::new(5);
+    unborn.repo.git(&["rm", "-r", "-q", "--cached", "."]);
+    let output = unborn.run(&["run"]);
+    assert_eq!(output.status.code(), Some(5), "pytest's 'no tests collected', verbatim");
+    // The stub prints one newline for an empty argv, which reads back as one "".
+    assert_eq!(unborn.argv(), Some(vec![String::new()]), "bare argv");
+}
+
+#[test]
+fn an_unborn_head_in_a_linked_worktree_is_unborn_too() {
+    let unborn = Unborn::new(0);
+    unborn.repo.git(&[
+        "-c",
+        "user.name=T",
+        "-c",
+        "user.email=t@e",
+        "commit",
+        "--allow-empty",
+        "-q",
+        "-m",
+        "x",
+    ]);
+    let wt = unborn.tmp.path().join("orphan");
+    unborn.repo.git(&["worktree", "add", "--orphan", "-b", "fresh", wt.to_str().expect("utf-8")]);
+    std::fs::write(wt.join("pyproject.toml"), "[project]\nname = \"pkg\"\n").expect("write");
+
+    let output = unborn
+        .command()
+        .current_dir(&wt)
+        .args(["--format", "json", "run", "--dry-run"])
+        .output()
+        .expect("gerenuk should run");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("JSON");
+    assert_eq!(report["reason"], "unborn_head", "{report}: {}", stderr_of(&output));
+}
+
+#[test]
+fn a_detached_head_is_not_unborn() {
+    let unborn = Unborn::new(0);
+    unborn.repo.git(&["-c", "user.name=T", "-c", "user.email=t@e", "commit", "-q", "-m", "x"]);
+    unborn.repo.git(&["checkout", "-q", "--detach"]);
+    let output = unborn.run(&["--format", "json", "run", "--dry-run", "--scope", "last-commit"]);
+    // A root commit on a detached HEAD has no `main` ref beyond the branch, so
+    // whatever happens, it is not the unborn answer.
+    let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), stderr_of(&output));
+    assert!(!text.contains("unborn_head"), "{text}");
+}
+
+#[test]
+fn an_explicit_missing_base_is_an_error_even_when_unborn() {
+    let unborn = Unborn::new(0);
+    let output = unborn.run(&["run", "--base", "nope"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr_of(&output)
+            .contains("no usable base ref (tried nope). Pass --base with a ref that exists."),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(unborn.argv(), None, "no pytest spawned");
+}
+
+#[test]
+fn an_explicit_missing_base_is_an_error_with_commits_too() {
+    let unborn = Unborn::new(0);
+    unborn.repo.git(&["-c", "user.name=T", "-c", "user.email=t@e", "commit", "-q", "-m", "x"]);
+    let output = unborn.run(&["run", "--base", "nope"]);
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        stderr_of(&output).contains("no usable base ref (tried nope)"),
+        "{}",
+        stderr_of(&output)
+    );
+    assert_eq!(unborn.argv(), None, "no pytest spawned");
+}
+
+#[test]
+fn a_root_commit_error_matches_the_scope() {
+    let unborn = Unborn::new(0);
+    unborn.repo.git(&["-c", "user.name=T", "-c", "user.email=t@e", "commit", "-q", "-m", "x"]);
+    unborn.repo.git(&["branch", "-m", "trunk"]);
+
+    let last = unborn.run(&["run", "--scope", "last-commit", "--dry-run"]);
+    assert_eq!(last.status.code(), Some(2));
+    let msg = stderr_of(&last);
+    assert!(msg.contains("HEAD~1") && msg.contains("root"), "{msg}");
+
+    let branch = unborn.run(&["run", "--scope", "branch", "--dry-run"]);
+    assert_eq!(branch.status.code(), Some(2));
+    assert!(
+        stderr_of(&branch).contains("tried origin/main, main, master"),
+        "{}",
+        stderr_of(&branch)
+    );
+}
+
+#[test]
+fn an_unborn_dry_run_spawns_at_most_three_git_processes() {
+    let unborn = Unborn::new(0);
+    let log = unborn.tmp.path().join("git.log");
+    let wrapper = unborn.tmp.path().join("git-wrapper");
+    let real = which::which("git").expect("git should be on PATH for the test suite");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\nexec '{}' \"$@\"\n",
+            log.display(),
+            real.display()
+        ),
+    )
+    .expect("write wrapper");
+    make_executable(&wrapper);
+
+    let output = unborn
+        .command()
+        .env("GERENUK_GIT", &wrapper)
+        .args(["run", "--dry-run"])
+        .output()
+        .expect("run");
+    assert!(output.status.success(), "{}", stderr_of(&output));
+    let calls = std::fs::read_to_string(&log).expect("git was called");
+    // `Git::discover` may probe once more; the bound is on what is asked after.
+    assert!(calls.lines().count() <= 3, "{calls}");
+    for forbidden in ["ls-files", "diff", "merge-base"] {
+        assert!(!calls.contains(forbidden), "{forbidden} ran on an unborn HEAD:\n{calls}");
+    }
+}
+
+#[test]
+fn the_first_commit_goes_through_a_pre_commit_hook() {
+    let unborn = Unborn::new(0);
+    let hook = unborn.repo.path().join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        format!("#!/usr/bin/env bash\nexec '{}' run\n", env!("CARGO_BIN_EXE_gerenuk")),
+    )
+    .expect("write the hook");
+    make_executable(&hook);
+
+    let mut commit = std::process::Command::new("git");
+    strip_hook_git_env(&mut commit);
+    let output = commit
+        .current_dir(unborn.repo.path())
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GERENUK_PYTEST", &unborn.pytest)
+        .env_remove("GERENUK_TYF")
+        .env_remove("GERENUK_FALLBACK")
+        .args(["commit", "-q", "-m", "first"])
+        .output()
+        .expect("git should run");
+    assert!(
+        output.status.success(),
+        "the hook must not block the first commit: {}",
+        stderr_of(&output)
+    );
+    assert_eq!(unborn.argv(), Some(vec![String::new()]), "the stub saw a bare argv");
+    assert_eq!(unborn.repo.git(&["rev-list", "--count", "HEAD"]).trim(), "1");
 }

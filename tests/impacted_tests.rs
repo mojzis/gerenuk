@@ -752,3 +752,54 @@ fn the_full_json_report_matches_its_snapshot() {
         serde_json::to_string_pretty(&report).expect("the report re-serialises")
     );
 }
+
+/// An unborn repository with the scratch package staged.
+fn unborn_repo() -> TestRepo {
+    let repo = TestRepo::new();
+    repo.write("pkg/__init__.py", "");
+    repo.write("tests/test_a.py", "def test_a():\n    assert True\n");
+    repo.write("pyproject.toml", "[project]\nname = \"pkg\"\nversion = \"0\"\n");
+    repo.git(&["add", "-A"]);
+    repo
+}
+
+#[test]
+fn an_unborn_head_is_run_all_in_every_scope_without_tyf() {
+    let repo = unborn_repo();
+    for scope in [&[][..], &["--scope", "last-commit"], &["--scope", "branch"]] {
+        let report = json_output(
+            gerenuk_no_tyf(repo.path()).args(["--format", "json", "impacted-tests"]).args(scope),
+        );
+        assert_eq!(report["verdict"], "run_all", "{scope:?}: {report}");
+        assert_eq!(report["reason"], "unborn_head", "{scope:?}: {report}");
+        assert_eq!(report["base"], "HEAD", "{report}");
+        assert_eq!(report["impacted_tests"].as_array().map(Vec::len), Some(0), "{report}");
+    }
+}
+
+#[test]
+fn an_unborn_head_human_report_prints_the_label() {
+    let repo = unborn_repo();
+    let output = gerenuk_no_tyf(repo.path()).arg("impacted-tests").output().expect("run");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("HEAD has no commit yet"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+#[test]
+fn an_explicit_missing_base_is_still_exit_two_on_an_unborn_head() {
+    let repo = unborn_repo();
+    let output = gerenuk_no_tyf(repo.path())
+        .args(["impacted-tests", "--base", "nope"])
+        .output()
+        .expect("run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no usable base ref (tried nope)"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

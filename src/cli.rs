@@ -448,7 +448,13 @@ pub fn run_changed_symbols(
     scope: Option<Scope>,
 ) -> Result<ChangedSymbols> {
     let repo = repo_context(workspace)?;
-    let base = resolve_base(&repo, base, scope)?;
+    let base = match resolve_base(&repo, base, scope)? {
+        Resolved::Base(base) => base,
+        Resolved::Unborn => anyhow::bail!(
+            "HEAD has no commit yet, so there is nothing to diff against. \
+             Commit once, or pass --base with a ref that exists."
+        ),
+    };
     let untracked = repo.git.untracked()?;
     changed_report(&repo.git, &repo.root, &base, &repo.config, &untracked)
 }
@@ -462,16 +468,30 @@ struct Repo {
     config: Config,
 }
 
+/// What the base question came to.
+enum Resolved {
+    Base(Base),
+    /// `HEAD` has no commit: there is nothing to diff against, whatever scope.
+    Unborn,
+}
+
 /// Where the working-tree diff starts: `--base`, else `--scope`, else the
 /// `scope` key, which defaults to the last commit.
-fn resolve_base(repo: &Repo, base: Option<&str>, scope: Option<Scope>) -> Result<Base> {
+///
+/// An explicit `--base` never reports an unborn `HEAD`: it asked for a ref, and
+/// a ref that does not exist is an error (ADR 0025).
+fn resolve_base(repo: &Repo, base: Option<&str>, scope: Option<Scope>) -> Result<Resolved> {
     if base.is_some() {
-        return repo.git.resolve_base(base);
+        return repo.git.resolve_base(base).map(Resolved::Base);
+    }
+    if repo.git.head_is_unborn()? {
+        return Ok(Resolved::Unborn);
     }
     match scope.unwrap_or(repo.config.scope) {
         Scope::LastCommit => repo.git.resolve_last_commit(),
         Scope::Branch => repo.git.resolve_base(None),
     }
+    .map(Resolved::Base)
 }
 
 fn repo_context(workspace: &Path) -> Result<Repo> {
@@ -555,6 +575,11 @@ impl ImpactRun {
         let report = impact::run_all(&changed, reason, errors);
         Self { report, files: None, changed: Some(changed) }
     }
+
+    /// `HEAD` has no commit: the whole suite, and no report of what changed.
+    fn unborn() -> Self {
+        Self { report: impact::unborn_head(), files: None, changed: None }
+    }
 }
 
 /// What the phase-1 diff is taken of.
@@ -594,9 +619,11 @@ fn impacted_run(
         load_report::<ChangedSymbols>(path, "changed", "a changed-symbols report")?
     } else {
         let (base, listed) = match diff {
-            Diff::WorkingTree { base, scope } => {
-                (resolve_base(repo, base, scope)?, git.untracked()?)
-            }
+            Diff::WorkingTree { base, scope } => match resolve_base(repo, base, scope)? {
+                Resolved::Base(base) => (base, git.untracked()?),
+                // Before the diff, `tyf` and the file index: nothing is read.
+                Resolved::Unborn => return Ok(ImpactRun::unborn()),
+            },
             // No untracked files: they were never part of the commit, and an
             // empty list here keeps them out of the file index below too.
             Diff::Commit(replay) => (replay_base(git, replay)?, Vec::new()),

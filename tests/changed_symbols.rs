@@ -674,3 +674,17 @@ fn an_explicit_base_beats_the_scope_key() {
 
     assert_eq!(report["base"], "main", "--base names the ref outright");
 }
+
+#[test]
+fn an_unborn_head_has_nothing_to_diff_against() {
+    let repo = TestRepo::new();
+    repo.write("a.py", "x = 1\n");
+    repo.git(&["add", "-A"]);
+
+    let output =
+        gerenuk_bare(repo.path()).arg("changed-symbols").output().expect("gerenuk should run");
+    assert_eq!(output.status.code(), Some(2), "an inventory with no base is still exit 2");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("HEAD has no commit yet"), "names the unborn HEAD: {stderr}");
+    assert!(!stderr.contains("origin/main"), "no branch chain as if it were the cause: {stderr}");
+}

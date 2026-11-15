@@ -305,11 +305,14 @@ pub enum Reason {
     /// The repository declared a full suite (`suite-ms`) faster than a
     /// selection costs, so `run` skipped the walk. Only `run` emits this.
     FastSuite,
+    /// `HEAD` has no commit yet, so there is nothing to diff against. Checked
+    /// first, before anything is read; only a working-tree run emits it.
+    UnbornHead,
 }
 
 impl Reason {
     /// Every variant, for the tests that have to cover each one.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::NonPythonChanges,
         Self::ParseErrors,
         Self::TyfUnavailable,
@@ -320,6 +323,7 @@ impl Reason {
         Self::Budget,
         Self::DecoratorDispatch,
         Self::FastSuite,
+        Self::UnbornHead,
     ];
 
     /// The stable `snake_case` name — the same string the JSON carries.
@@ -341,6 +345,7 @@ impl Reason {
             Self::Budget => "budget",
             Self::DecoratorDispatch => "decorator_dispatch",
             Self::FastSuite => "fast_suite",
+            Self::UnbornHead => "unborn_head",
         }
     }
 
@@ -359,6 +364,7 @@ impl Reason {
                 "a changed symbol is dispatched by an unresolvable decorator"
             }
             Self::FastSuite => "the full suite is faster than a selection",
+            Self::UnbornHead => "HEAD has no commit yet",
         }
     }
 }
@@ -1228,6 +1234,12 @@ mod tests {
     use crate::changed::{ModuleChange, SymbolChange};
     use crate::pysource::{self, Kind};
     use crate::workspace::is_test_path;
+
+    #[test]
+    fn an_unborn_head_has_its_own_name_and_label() {
+        assert_eq!(Reason::UnbornHead.name(), "unborn_head");
+        assert_eq!(Reason::UnbornHead.label(), "HEAD has no commit yet");
+    }
 
     #[test]
     fn every_reason_name_is_the_string_the_json_carries() {

@@ -9,7 +9,8 @@ plus anything not committed yet. `[tool.gerenuk] scope = "branch"` (or
 `--scope branch`) restores the old default: the merge base with `origin/main`,
 then `main`, then `master`. `--scope` beats the key, `--base` beats both and
 conflicts with `--scope`. A root commit has no `HEAD~1`, so `last-commit` falls
-back to the branch chain there.
+back to the branch chain there; a repository with no commit at all is
+[0025](0025-an-unborn-head-runs-everything.md).
 
 ## Why
 

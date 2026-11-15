@@ -167,6 +167,27 @@ pub(crate) fn run_all(
     }
 }
 
+/// `run_all` for a tree that was never diffed: an unborn `HEAD` has no base.
+///
+/// There is no `ChangedSymbols` to borrow from, and none is invented — an empty
+/// one would read as "nothing changed". `base` is `HEAD`, the ref that has no
+/// commit, and `merge_base` is empty for the same reason.
+#[must_use]
+pub(crate) fn unborn_head() -> ImpactReport {
+    ImpactReport {
+        verdict: Verdict::RunAll,
+        reason: Some(Reason::UnbornHead),
+        base: "HEAD".to_string(),
+        merge_base: String::new(),
+        impacted_tests: Vec::new(),
+        test_files_changed: Vec::new(),
+        ignored_symbols: Vec::new(),
+        ignored_paths: Vec::new(),
+        stats: Stats::default(),
+        errors: Vec::new(),
+    }
+}
+
 impl ImpactReport {
     /// The report as JSON, or as the short human summary.
     pub fn render(&self, format: Format) -> Result<String> {
