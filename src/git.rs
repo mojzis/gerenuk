@@ -13,7 +13,7 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 
 /// Binary name looked up on `PATH` when `GERENUK_GIT` is unset.
 pub const DEFAULT_GIT_BIN: &str = "git";
@@ -174,8 +174,27 @@ impl Git {
     pub fn resolve_last_commit(&self) -> Result<Base> {
         match self.commit_sha(LAST_COMMIT_BASE)? {
             Some(parent) => Ok(Base { name: LAST_COMMIT_BASE.to_string(), merge_base: parent }),
-            None => self.resolve_base(None),
+            None => self.resolve_base(None).map_err(|_| {
+                anyhow!(
+                    "no usable base ref: {LAST_COMMIT_BASE} was tried first and does not exist, \
+                     because HEAD is a root commit; the branch chain ({}) has no ref either. \
+                     Pass --base with a ref that exists.",
+                    DEFAULT_BASES.join(", ")
+                )
+            }),
         }
+    }
+
+    /// Whether `HEAD` names a branch that has no commit yet.
+    ///
+    /// Both halves matter: `symbolic-ref` succeeds when `HEAD`
+    /// is a branch name, and `rev-parse` then fails only if that branch is
+    /// unborn. A detached or corrupt `HEAD` fails the first and is not unborn.
+    pub fn head_is_unborn(&self) -> Result<bool> {
+        if self.try_run(["symbolic-ref", "-q", "HEAD"])?.is_none() {
+            return Ok(false);
+        }
+        Ok(!self.rev_exists("HEAD")?)
     }
 
     /// Resolve `commit` for a replay, and the base its diff starts from.
@@ -364,6 +383,19 @@ mod tests {
 
     use super::*;
 
+    /// The test suite also runs inside this repository's own pre-commit hook,
+    /// where `GIT_INDEX_FILE` and friends point at the outer repository and
+    /// would hijack every git a test spawns, including gerenuk's own. Dropped
+    /// once, before the first repository is made.
+    fn drop_hook_git_env() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            for name in crate::pytest::LOCAL_GIT_ENV {
+                std::env::remove_var(name);
+            }
+        });
+    }
+
     /// A throwaway repository, isolated from the developer's git configuration.
     struct TestRepo {
         dir: TempDir,
@@ -371,6 +403,7 @@ mod tests {
 
     impl TestRepo {
         fn new() -> Self {
+            drop_hook_git_env();
             let repo = Self { dir: TempDir::new().expect("temp dir") };
             repo.git(&["init", "--initial-branch=main"]);
             repo.git(&["config", "user.email", "test@example.com"]);
@@ -458,6 +491,72 @@ mod tests {
 
         let base = repo.gerenuk_git().resolve_last_commit().expect("`main` exists");
         assert_eq!(base.name, "main", "the default chain answers instead");
+    }
+
+    #[test]
+    fn head_is_unborn_right_after_init() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.git(&["add", "-A"]);
+        assert!(repo.gerenuk_git().head_is_unborn().expect("asks git"));
+    }
+
+    #[test]
+    fn head_is_not_unborn_after_a_commit() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        assert!(!repo.gerenuk_git().head_is_unborn().expect("asks git"));
+    }
+
+    #[test]
+    fn a_detached_head_is_not_unborn() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        repo.git(&["checkout", "--detach", "HEAD"]);
+        assert!(!repo.gerenuk_git().head_is_unborn().expect("asks git"));
+    }
+
+    #[test]
+    fn a_root_commit_with_no_chain_names_head_parent() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        repo.git(&["branch", "-m", "main", "trunk"]);
+
+        let err = repo.gerenuk_git().resolve_last_commit().expect_err("nothing to diff from");
+        let msg = err.to_string();
+        assert!(msg.contains("HEAD~1"), "names the ref tried first: {msg}");
+        assert!(msg.contains("root commit"), "says why it is missing: {msg}");
+        assert!(msg.contains("origin/main, main, master"), "names the chain: {msg}");
+    }
+
+    #[test]
+    fn the_branch_chain_error_is_unchanged() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+        repo.git(&["branch", "-m", "main", "trunk"]);
+
+        let err = repo.gerenuk_git().resolve_base(None).expect_err("no chain ref");
+        assert_eq!(
+            err.to_string(),
+            "no usable base ref (tried origin/main, main, master). Pass --base with a ref that exists."
+        );
+    }
+
+    #[test]
+    fn a_missing_explicit_base_message_is_exact() {
+        let repo = TestRepo::new();
+        repo.write("a.py", "x = 1\n");
+        repo.commit("base");
+
+        let err = repo.gerenuk_git().resolve_base(Some("nope")).expect_err("missing");
+        assert_eq!(
+            err.to_string(),
+            "no usable base ref (tried nope). Pass --base with a ref that exists."
+        );
     }
 
     #[test]

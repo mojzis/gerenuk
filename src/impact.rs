@@ -167,6 +167,27 @@ pub(crate) fn run_all(
     }
 }
 
+/// `run_all` for a tree that was never diffed: an unborn `HEAD` has no base.
+///
+/// There is no `ChangedSymbols` to borrow from, and none is invented — an empty
+/// one would read as "nothing changed". `base` is `HEAD`, the ref that has no
+/// commit, and `merge_base` is empty for the same reason.
+#[must_use]
+pub(crate) fn unborn_head() -> ImpactReport {
+    ImpactReport {
+        verdict: Verdict::RunAll,
+        reason: Some(Reason::UnbornHead),
+        base: "HEAD".to_string(),
+        merge_base: String::new(),
+        impacted_tests: Vec::new(),
+        test_files_changed: Vec::new(),
+        ignored_symbols: Vec::new(),
+        ignored_paths: Vec::new(),
+        stats: Stats::default(),
+        errors: Vec::new(),
+    }
+}
+
 impl ImpactReport {
     /// The report as JSON, or as the short human summary.
     pub fn render(&self, format: Format) -> Result<String> {
@@ -181,8 +202,14 @@ impl ImpactReport {
         use std::fmt::Write as _;
 
         let mut out = String::new();
-        let short = self.merge_base.get(..7).unwrap_or(&self.merge_base);
-        let _ = writeln!(out, "base {} (merge-base {short})", self.base);
+        if self.merge_base.is_empty() {
+            // An unborn HEAD: there is no commit to name, so say that instead
+            // of printing an empty `(merge-base )`.
+            let _ = writeln!(out, "base {} (no commit yet)", self.base);
+        } else {
+            let short = self.merge_base.get(..7).unwrap_or(&self.merge_base);
+            let _ = writeln!(out, "base {} (merge-base {short})", self.base);
+        }
 
         match self.reason {
             Some(reason) => {
@@ -729,6 +756,13 @@ mod tests {
             "listed as the symbol id `tyf refs` and `run` both use, got:\n{text}"
         );
         assert!(!text.contains("::logged_run_sql"), "never node-id shaped, got:\n{text}");
+    }
+
+    #[test]
+    fn an_unborn_head_names_no_merge_base_rather_than_an_empty_one() {
+        let text = unborn_head().render(Format::Human).expect("human rendering cannot fail");
+        assert!(text.starts_with("base HEAD (no commit yet)\n"), "got:\n{text}");
+        assert!(!text.contains("merge-base"), "there is no commit to name, got:\n{text}");
     }
 
     #[test]

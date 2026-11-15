@@ -28,8 +28,18 @@ pub fn sample_pkg() -> PathBuf {
 /// A `gerenuk` command with `GERENUK_TYF` pointed at `tyf`, run from `cwd`.
 pub fn gerenuk(cwd: &Path, tyf: &Path) -> Command {
     let mut cmd = Command::cargo_bin("gerenuk").expect("gerenuk binary should be built for tests");
+    strip_hook_git_env(&mut cmd);
     cmd.current_dir(cwd).env("GERENUK_TYF", tyf);
     cmd
+}
+
+/// Drop the git environment a pre-commit hook exports (`GIT_INDEX_FILE` and
+/// friends). This suite runs inside the repository's own hook, where it would
+/// point every git a test spawns, gerenuk's included, at the outer repository.
+pub fn strip_hook_git_env(cmd: &mut Command) {
+    for name in gerenuk::pytest::LOCAL_GIT_ENV {
+        cmd.env_remove(name);
+    }
 }
 
 /// A `gerenuk` command with no `tyf` configured at all, run from `cwd`.
@@ -38,6 +48,7 @@ pub fn gerenuk(cwd: &Path, tyf: &Path) -> Command {
 /// leave the environment variable unset.
 pub fn gerenuk_bare(cwd: &Path) -> Command {
     let mut cmd = Command::cargo_bin("gerenuk").expect("gerenuk binary should be built for tests");
+    strip_hook_git_env(&mut cmd);
     cmd.current_dir(cwd).env_remove("GERENUK_TYF");
     cmd
 }
@@ -49,6 +60,7 @@ pub fn gerenuk_bare(cwd: &Path) -> Command {
 pub fn gerenuk_no_tyf(cwd: &Path) -> Command {
     let git = which::which("git").expect("git should be on PATH for the test suite");
     let mut cmd = Command::cargo_bin("gerenuk").expect("gerenuk binary should be built for tests");
+    strip_hook_git_env(&mut cmd);
     cmd.current_dir(cwd).env_remove("GERENUK_TYF").env("GERENUK_GIT", git).env("PATH", "");
     cmd
 }
@@ -91,7 +103,9 @@ impl TestRepo {
     }
 
     pub fn git(&self, args: &[&str]) -> String {
-        let output = Command::new("git")
+        let mut command = Command::new("git");
+        strip_hook_git_env(&mut command);
+        let output = command
             .current_dir(self.path())
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
