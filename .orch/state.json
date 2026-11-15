@@ -7,22 +7,73 @@
   "stop_kind": "",
   "claude_version": "2.1.325 (Claude Code)",
   "started_at": "2026-11-15T12:17:08+00:00",
-  "updated_at": "2026-11-15T12:18:03+00:00",
+  "updated_at": "2026-11-15T12:25:27+00:00",
   "phases": [
     {
       "n": 1,
       "slug": "unborn-head-run-all",
       "title": "Unborn HEAD runs the full suite",
       "scenario": "small",
-      "status": "todo",
-      "done_steps": [],
+      "status": "running",
+      "done_steps": [
+        "brief",
+        "plan_review#1",
+        "brief_rev#1",
+        "plan_review#2",
+        "brief:ok"
+      ],
       "fix_round": 0,
       "attempt": 0,
       "deferred": [],
-      "lead_session": null,
-      "lead_cost_total": 0.0,
-      "sessions": [],
-      "base": null,
+      "lead_session": "3c3eeab0-9910-48c6-965d-8a4f6a7fa5bf",
+      "lead_cost_total": 2.8968016000000003,
+      "sessions": [
+        {
+          "key": "brief",
+          "role": "brief",
+          "session_id": "3c3eeab0-9910-48c6-965d-8a4f6a7fa5bf",
+          "ok": true,
+          "cost": 1.3859306,
+          "error_kind": null,
+          "tokens_in": 1414528,
+          "tokens_out": 12939,
+          "at": "2026-11-15T12:20:56+00:00"
+        },
+        {
+          "key": "plan_review#1",
+          "role": "plan_review",
+          "session_id": "8695aca4-edad-4a8e-a385-c216793e9570",
+          "ok": true,
+          "cost": 1.1747255999999997,
+          "error_kind": null,
+          "tokens_in": 1290286,
+          "tokens_out": 8089,
+          "at": "2026-11-15T12:22:41+00:00"
+        },
+        {
+          "key": "brief_rev#1",
+          "role": "brief",
+          "session_id": "3c3eeab0-9910-48c6-965d-8a4f6a7fa5bf",
+          "ok": true,
+          "cost": 1.5108710000000003,
+          "error_kind": null,
+          "tokens_in": 572603,
+          "tokens_out": 6558,
+          "at": "2026-11-15T12:23:42+00:00"
+        },
+        {
+          "key": "plan_review#2",
+          "role": "plan_review",
+          "session_id": "0d7ece34-f7ae-497b-abc7-878b684b3d2f",
+          "ok": true,
+          "cost": 1.1334532,
+          "error_kind": null,
+          "tokens_in": 1085543,
+          "tokens_out": 8930,
+          "at": "2026-11-15T12:25:27+00:00"
+        }
+      ],
+      "base": "33fec227ff10e16a92d4020b6e3d6f5a888d8811",
       "commit": null,
       "note": "",
       "covers": [
