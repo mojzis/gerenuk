@@ -324,3 +324,183 @@ session `-`, $0.0000
   ]
 }
 ```
+
+## repair[dev]#1 (fix)
+
+session `a86f4643-b43c-4ed5-960d-d295f642c493`, $0.5800
+
+```json
+{
+  "summary": "The phase's work was in the tree but never committed, which is what the gate flagged. I committed it as one commit, f424190, and the tree is clean. Getting it through the pre-commit hook meant fixing a second problem: the hook exports `GIT_INDEX_FILE`, which pointed the test suite's git calls at the outer repository's index. The test helpers now strip it.",
+  "commits": [
+    "f424190 An unborn HEAD runs the full suite instead of exiting 2"
+  ],
+  "tests": {
+    "before": 601,
+    "after": 625,
+    "explained": "Count is the sum of cargo's per-binary 'test result' lines: 462 unit, 9, 35, 13, 30 and 76 integration. The 24 new tests are the phase's tests (git, closure, run, impacted_tests, changed_symbols). None are skipped, ignored or deleted. fmt, clippy -D warnings, cargo test and `make review-quick` pass. The prek hook (fmt, clippy, cargo test) passed on the final commit. The suite also passes with a bogus GIT_INDEX_FILE exported."
+  },
+  "design": "Design as briefed and unchanged. New code: `Git::head_is_unborn`, `Reason::UnbornHead`, and an `impacted_run` check that runs before any diff or tyf lookup. The only addition in this fix is test-side isolation. `src/git.rs` unit tests call a `drop_hook_git_env` once (a `Once` that removes `pytest::LOCAL_GIT_ENV` from the process env). `tests/common/mod.rs` gets `strip_hook_git_env`, applied to its `TestRepo::git` and gerenuk commands. In `tests/run.rs` it is applied to `without_tools`, the hook fixture's `git()` and the first-commit test's `git commit`.",
+  "real_run": "Ran the debug build in a fresh tempdir repo with an unborn HEAD and staged files.\n- `run --dry-run --format json`: exit 0, decision `run_all`, reason `unborn_head`.\n- `impacted-tests --format json`: exit 0, `run_all` / `unborn_head`, base `HEAD`, empty `impacted_tests`.\n- `changed-symbols`: exit 2, \"HEAD has no commit yet, so there is nothing to diff against...\", no `origin/main`.\n- `run --base nope --dry-run`: exit 2, `no usable base ref (tried nope). Pass --base with a ref that exists.`\n\nWith the dry-run JSON format, gerenuk also printed a \"pytest not found on PATH\" line on stderr. It still exited 0. That is not covered by the brief and I did not investigate it.",
+  "deviations": [
+    "Beyond the brief: the test helpers now strip the hook's git env. The prek cargo-test hook runs the suite with GIT_INDEX_FILE exported, and several tests failed there (the replay-worktree unit tests, the linked-worktree tests, the hook fixtures). That blocked the commit, and I did not use --no-verify. Only test code changed for this; production behaviour is untouched.",
+    "Replacing an earlier approach: I first tried a `git` shim script for the unit tests. It hit 'Text file busy' (ETXTBSY) when tests ran in parallel, so I used a one-time `std::env::remove_var` instead (safe in edition 2021)."
+  ],
+  "unresolved_issues": [
+    "During testing I exported a fake GIT_INDEX_FILE and ran the commit. That corrupted this repo's index (invalid cache-tree). I repaired it with `git read-tree HEAD`. The working tree was never touched and the final commit and hook passed. A dangling object warning may remain in `git fsck`.",
+    "The `Git` production spawn in `src/git.rs` still inherits the hook's git env, so `replay` inside a hook could hit the same `GIT_INDEX_FILE` problem. This was not in the fix brief and I did not change it.",
+    "A stray stderr line appeared on the dry-run JSON path in a repo with no pytest on PATH (see real_run). It is unconfirmed whether this is pre-existing."
+  ]
+}
+```
+
+## gate[dev]#1 (gate)
+
+session `-`, $0.0000
+
+```json
+{
+  "ok": true,
+  "cmd": "make review-quick",
+  "returncode": 0,
+  "output": "_resolved_against_the_repo_root_not_the_cwd ... ok\ntest a_hooked_run_lets_a_test_commit_to_its_own_repository_and_not_the_outer_one ... ok\ntest a_replay_defaults_to_the_commits_own_change_and_base_widens_it ... ok\ntest a_replay_matches_what_run_selected_before_the_commit ... ok\ntest a_run_all_verdict_runs_the_bare_suite ... ok\ntest a_root_commit_error_matches_the_scope ... ok\ntest a_run_all_outcome_delegates_to_the_configured_fallback ... ok\ntest an_explicit_missing_base_is_an_error_even_when_unborn ... ok\ntest an_explicit_missing_base_is_an_error_with_commits_too ... ok\ntest a_selection_becomes_the_node_ids_pytest_is_handed ... ok\ntest an_unborn_dry_run_reports_run_all_and_spawns_nothing ... ok\ntest an_unborn_dry_run_spawns_at_most_three_git_processes ... ok\ntest a_saved_impact_report_can_be_replayed ... ok\ntest an_empty_fallback_command_fails_at_startup_whatever_the_outcome ... ok\ntest an_unborn_head_beats_suite_ms ... ok\ntest a_replay_of_another_commit_runs_in_a_worktree_and_leaves_the_checkout_alone ... ok\ntest an_unborn_head_never_looks_for_tyf_or_pytest ... ok\ntest a_suite_declared_faster_than_a_selection_skips_the_walk_before_tyf_is_looked_for ... ok\ntest an_unborn_head_hands_the_fallback_a_null_report ... ok\ntest an_empty_selection_spawns_nothing_at_all ... ok\ntest an_unborn_head_with_nothing_staged_still_runs_the_suite ... ok\ntest an_unborn_head_in_a_linked_worktree_is_unborn_too ... ok\ntest durations_without_run_is_a_usage_error ... ok\ntest an_unknown_git_env_policy_is_a_usage_error ... ok\ntest an_unknown_git_env_policy_in_the_config_names_the_key ... ok\ntest replaying_a_report_conflicts_with_a_base_and_with_every_budget_flag ... ok\ntest an_ignored_path_beside_a_code_change_keeps_the_selection ... ok\ntest the_configured_pytest_command_is_used_when_no_override_is_set ... ok\ntest an_unborn_head_runs_the_bare_suite_in_every_scope ... ok\ntest pytest_does_not_inherit_the_hooks_repository_local_git_variables ... ok\ntest pytests_exit_code_is_the_commands_exit_code ... ok\ntest the_removed_variables_cover_gits_own_list ... ok\ntest a_second_replay_reuses_the_worktree ... ok\ntest the_first_commit_goes_through_a_pre_commit_hook ... ok\ntest the_fallback_is_not_invoked_for_an_empty_selection ... ok\ntest the_dry_run_json_matches_its_snapshot ... ok\ntest the_dry_run_json_without_a_fallback_matches_its_snapshot ... ok\ntest the_dry_run_json_with_a_fallback_matches_its_snapshot ... ok\ntest the_fallbacks_exit_code_is_the_commands_exit_code ... ok\ntest the_fallback_inherits_the_hooks_git_variables ... ok\ntest the_fallback_is_not_invoked_for_a_selected_outcome ... ok\ntest the_git_environment_is_inherited_when_the_flag_says_so ... ok\ntest the_passthrough_arrives_after_the_node_ids_verbatim ... ok\ntest the_flag_beats_the_env_var_which_beats_the_config ... ok\ntest the_dry_run_reports_the_git_environment_policy ... ok\ntest the_git_environment_is_inherited_when_the_config_says_so ... ok\n\ntest result: ok. 76 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n🐍 Running fixture package tests...\n................                                                         [100%]\n16 passed in 0.01s\n\n✅ Quick review passed\n    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.07s\n    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.07s\n     Running unittests src/lib.rs (target/debug/deps/gerenuk-44f9f0cee69d9aae)\n     Running unittests src/main.rs (target/debug/deps/gerenuk-19698d20791a7f9b)\n     Running tests/audit.rs (target/debug/deps/audit-53e49ca8c10ff45b)\n     Running tests/changed_symbols.rs (target/debug/deps/changed_symbols-69694a8c2e0865a1)\n     Running tests/cli.rs (target/debug/deps/cli-34e2fbb12a35e823)\n     Running tests/impacted_tests.rs (target/debug/deps/impacted_tests-f542eae67c7f5069)\n     Running tests/run.rs (target/debug/deps/run-2b5edd09534e46d2)\n   Doc-tests gerenuk\n",
+  "violations": []
+}
+```
+
+## combined (combined)
+
+session `af796d73-cdac-4889-85f1-bf528199e3f0`, $0.4841
+
+```json
+{
+  "verdict": "ship",
+  "findings": [],
+  "checks_run": [
+    {
+      "check": "A12: fmt, clippy -D warnings, cargo test --all-features",
+      "result": "pass",
+      "evidence": "fmt clean; clippy finished with no warnings; 625 tests pass (462+9+35+13+30+76), 0 failed"
+    },
+    {
+      "check": "A11: snapshots untouched",
+      "result": "pass",
+      "evidence": "`git status --short tests/snapshots` empty"
+    },
+    {
+      "check": "A10: triage page",
+      "result": "pass",
+      "evidence": "60 lines, one `next: run` line, guide tests pass; Reason::ALL has 11 entries"
+    },
+    {
+      "check": "R1: unborn default scope dry-run (A2)",
+      "result": "pass",
+      "evidence": "run --dry-run --format json: decision run_all, reason unborn_head, exit 0. Human output: `gerenuk: full suite — HEAD has no commit yet`"
+    },
+    {
+      "check": "R1: --scope last-commit and --scope branch (A1/A2)",
+      "result": "pass",
+      "evidence": "both give decision run_all, reason unborn_head"
+    },
+    {
+      "check": "R1: real pytest (A1)",
+      "result": "pass",
+      "evidence": "`uv run --with pytest gerenuk run -- -q` printed `1 passed in 0.00s`"
+    },
+    {
+      "check": "R1: fallback payload (A3)",
+      "result": "pass",
+      "evidence": "stub fallback got R=unborn_head and payload {\"gerenuk_fallback_payload_version\":1,\"reason\":\"unborn_head\",\"report\":null}; gerenuk exited 7, the fallback's code"
+    },
+    {
+      "check": "R2: impacted-tests (A4)",
+      "result": "pass",
+      "evidence": "all three scopes give verdict run_all, reason unborn_head, base HEAD, empty impacted_tests; exit 0. Human output prints `verdict run_all — HEAD has no commit yet`"
+    },
+    {
+      "check": "R1/R2: no tyf on unborn (A5)",
+      "result": "pass",
+      "evidence": "with PATH holding only a git symlink, run --dry-run and impacted-tests both answer run_all/unborn_head"
+    },
+    {
+      "check": "R3: root commit on a `trunk` branch (A6)",
+      "result": "pass",
+      "evidence": "--scope last-commit exits 2 with `HEAD~1 was tried first ... HEAD is a root commit; the branch chain (origin/main, main, master) ...`. --scope branch exits 2 with `tried origin/main, main, master`"
+    },
+    {
+      "check": "R4: explicit missing base (A7)",
+      "result": "pass",
+      "evidence": "`run --base nope` and `impacted-tests --base nope` in an unborn repo exit 2 with the exact `no usable base ref (tried nope). Pass --base with a ref that exists.`. The with-commits case is covered by the new tests/run.rs test, which passes"
+    },
+    {
+      "check": "A8: changed-symbols on unborn",
+      "result": "pass",
+      "evidence": "exit 2, `HEAD has no commit yet, so there is nothing to diff against...`, no origin/main"
+    },
+    {
+      "check": "Bound: git spawns on unborn dry-run",
+      "result": "pass",
+      "evidence": "GERENUK_GIT wrapper log shows exactly 3 calls: rev-parse --show-toplevel, symbolic-ref -q HEAD, rev-parse --verify --quiet HEAD^{commit}"
+    },
+    {
+      "check": "Linked orphan worktree",
+      "result": "pass",
+      "evidence": "`git worktree add --orphan`, then run --dry-run: reason unborn_head"
+    },
+    {
+      "check": "A9: first commit through a pre-commit hook",
+      "result": "pass",
+      "evidence": "Not re-run by hand. The new hook test in tests/run.rs passes in cargo test. The repair report says the prek hook (fmt, clippy, cargo test) passed on the final commit"
+    },
+    {
+      "check": "Code review of git diff base..HEAD",
+      "result": "pass",
+      "evidence": "head_is_unborn uses try_run only, so no new spawn site. --base skips the unborn check. impacted_run returns before untracked, the diff and tyf. unborn_head() builds no ChangedSymbols. ADR 0025, README row and ADR 0024 pointer are present"
+    }
+  ],
+  "preexisting": [
+    {
+      "id": "P1",
+      "severity": "low",
+      "title": "dry-run prints a `pytest not found` line to stderr when pytest is not on PATH",
+      "detail": "`run --dry-run` resolves pytest and prints the error before the decision, then exits 0 with `argv: unknown`. It is not specific to unborn HEAD, because dry-run always resolves pytest. Not caused by this phase.",
+      "repro": "In any repo with no pytest on PATH, run `gerenuk run --dry-run`.",
+      "files": [
+        "src/cli.rs"
+      ]
+    },
+    {
+      "id": "P2",
+      "severity": "low",
+      "title": "The production Git spawn inherits the hook's GIT_INDEX_FILE",
+      "detail": "`replay` inside a hook could hit the same hijacked-index problem the repair fixed in tests. The repair report flags it and it is out of this phase's scope.",
+      "repro": "Run `gerenuk replay` from within a pre-commit hook that has GIT_INDEX_FILE exported.",
+      "files": [
+        "src/git.rs"
+      ]
+    }
+  ],
+  "proposed_oracles": [
+    "Run gerenuk run --dry-run under a GERENUK_GIT wrapper in an unborn repo and assert at most 3 git calls and no diff/ls-files calls.",
+    "Assert the unborn fallback payload equals {\"gerenuk_fallback_payload_version\":1,\"reason\":\"unborn_head\",\"report\":null}."
+  ]
+}
+```
+
+## learnings (learnings)
+
+session `3c3eeab0-9910-48c6-965d-8a4f6a7fa5bf`, $3.2093
+
+```json
+{
+  "phase_learnings": "## Phase 1: Unborn HEAD runs the full suite. Verdict: ship (commit f424190)\n\n**What was built**\n- `Git::head_is_unborn()` *(new)*. It runs `symbolic-ref -q HEAD` and `rev-parse --verify --quiet HEAD^{commit}`, both through `try_run`, so there is no new spawn site.\n- `cli::resolve_base` now returns a private `Resolved::{Base, Unborn}`.\n- `impacted_run` returns `ImpactRun::unborn()` before it lists untracked files, diffs, looks for `tyf`, or builds the file index.\n- `impact::unborn_head()` *(new)* builds the report without a `ChangedSymbols`, so the fallback payload carries `report: null`.\n- `Reason::UnbornHead` *(new)*: name `unborn_head`, label `HEAD has no commit yet`. `ALL` now has 11 entries; the payload version is still 1.\n- `resolve_last_commit` now says, on a root commit, that `HEAD~1` was tried first.\n- `changed-symbols` on an unborn HEAD still exits 2, with a clearer message.\n- Docs: ADR 0025, a README row, a pointer in ADR 0024, and triage ladder item 1. `triage.md` is held at exactly 60 lines.\n- Tests: 601 → 625 (+24). No snapshot changed.\n\n**What went wrong and how it was caught**\n- **First brief failed plan review.** It named the issue's repro files (`tests/test_a.py`, `pkg/__init__.py`) as bare paths. The existence checker read them as repo files that don't exist. Fixed by describing them as scratch files created in tempdirs, marked *(new)*.\n- **Dev didn't commit.** The repo's prek pre-commit hook runs `cargo test`, and 4 replay-worktree unit tests failed there. Their cause was pre-existing, not this phase: the hook exports a relative `GIT_INDEX_FILE=.git/index`, and the tests' real git calls inherited it. The permission classifier denied `SKIP=cargo-test`. The gate then caught the uncommitted tree.\n- **Repair.** Test helpers now strip `pytest::LOCAL_GIT_ENV`: a `Once` in the `git.rs` unit tests, `strip_hook_git_env` in `tests/common/mod.rs`, and the same in the `tests/run.rs` fixtures. Repair also corrupted the outer repo's index once by exporting a fake `GIT_INDEX_FILE` during testing; it fixed that with `git read-tree HEAD`.\n\n**Where the reports were right or wrong**\n- The dev report was honest about the missing commit and about writing tests alongside the code rather than red-first.\n- The combined review re-ran every functional-QA item by hand: real pytest, the payload, the 3-git-call bound, and the orphan worktree.\n- Gap: A9 (the hook path) was accepted on test evidence alone. The new hook test uses its own simpler hook rather than the `tests/run.rs:1225` fixture the brief named.",
+  "process_lessons": [
+    "In a brief, describe files that a test creates inside a tempdir as scratch files marked *(new)*, never as bare repo paths, or the plan-review existence check blocks the brief.",
+    "Before dev starts, check whether the repo's own pre-commit hook (prek/pre-commit running `cargo test`) passes under the hook's environment, and list that check under Baseline. A hook that fails on the base commit blocks dev's commit, and dev is not allowed to skip it.",
+    "Tell dev to commit through the real hook as part of the phase. The gate fails an uncommitted tree even when every check passes.",
+    "Tests that spawn real git must strip git's repository-local env vars (GIT_INDEX_FILE, GIT_DIR, …), because they run inside hooks too. Use the helpers in tests/common rather than writing new ones.",
+    "Never export a fake GIT_INDEX_FILE (or similar) in the agent's own shell to reproduce a hook issue. It rewrites the real checkout's index. Reproduce inside a tempdir repo instead."
+  ],
+  "handoff": "State of the code after phase 1 (commit f424190 on orch/20261115-121708):\n\n**New and changed contracts**\n- `git::Git::head_is_unborn()`: true only when HEAD is a symbolic ref to a branch with no commit. A detached HEAD is not unborn.\n- `cli::resolve_base` returns a private `Resolved::{Base, Unborn}`. The unborn check is skipped when `--base` is given, so an explicit missing base is still exit 2.\n- `impacted_run` short-circuits on unborn in the `Diff::WorkingTree` arm, before the untracked listing, the diff, the `upfront_reason`/`fast_suite` checks and the `tyf` lookup. Its git calls there are exactly 3: rev-parse `--show-toplevel`, symbolic-ref, rev-parse.\n- `impact::unborn_head()` builds an `ImpactReport` with `verdict: run_all`, `reason: unborn_head`, `base: \"HEAD\"`, `merge_base: \"\"`, every list empty, and no `ChangedSymbols`. `ImpactRun.changed` is `None`, so the fallback payload's `report` is null.\n- `closure::Reason::UnbornHead` has name `unborn_head` and label `HEAD has no commit yet`. `Reason::ALL` is `[Self; 11]`; `gerenuk_fallback_payload_version` is still 1.\n- `changed-symbols` on an unborn HEAD exits 2 with \"HEAD has no commit yet, so there is nothing to diff against…\".\n- `resolve_last_commit`'s root-commit error names `HEAD~1` and then the branch chain. The `--scope branch` and explicit `--base` messages are unchanged.\n- Docs:\n  - `docs/adr/0025-an-unborn-head-runs-everything.md`, with its row in `docs/adr/README.md` and a pointer in 0024.\n  - `docs/src/guide/triage.md` ladder item 1 is the unborn reason. The page is at exactly the 60-line cap: any new reason needs prose cut first.\n\n**Test infrastructure**\n- `tests/common/mod.rs::strip_hook_git_env` removes `pytest::LOCAL_GIT_ENV` from `TestRepo::git` and from gerenuk commands.\n- The `src/git.rs` unit tests drop the same env once, via `Once` and `remove_var`.\n- In `tests/run.rs`, `without_tools`, the hook fixture's `git()` and the first-commit test strip it too.\n- Any new test that spawns real git must use these, or it fails under the repo's prek `cargo test` hook.\n\n**Known gaps and deferred items**\n- **P2:** production `Git::output` still inherits the hook's `GIT_INDEX_FILE` and the rest. `replay` run inside a pre-commit hook could act on the wrong index.\n- **P1:** `run --dry-run` prints a `pytest not found` line to stderr when pytest is not on PATH, then exits 0 with `argv: unknown`. Not specific to unborn HEAD.\n- `unborn_head` is not yet mentioned in `docs/src/` run.md, impacted-tests.md, tune.md or `docs/dev/ARCHITECTURE.md`. Those pages list `fast_suite`; no test requires the new reason there.\n- The unborn first-commit hook test uses its own simple hook, not the `tests/run.rs:1225` fixture.\n- Running `git fsck` on the dev checkout may show a dangling object, left after repair restored the index with `git read-tree HEAD`."
+}
+```

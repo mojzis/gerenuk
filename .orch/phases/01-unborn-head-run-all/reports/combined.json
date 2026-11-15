@@ -1,0 +1,112 @@
+{
+  "verdict": "ship",
+  "findings": [],
+  "checks_run": [
+    {
+      "check": "A12: fmt, clippy -D warnings, cargo test --all-features",
+      "result": "pass",
+      "evidence": "fmt clean; clippy finished with no warnings; 625 tests pass (462+9+35+13+30+76), 0 failed"
+    },
+    {
+      "check": "A11: snapshots untouched",
+      "result": "pass",
+      "evidence": "`git status --short tests/snapshots` empty"
+    },
+    {
+      "check": "A10: triage page",
+      "result": "pass",
+      "evidence": "60 lines, one `next: run` line, guide tests pass; Reason::ALL has 11 entries"
+    },
+    {
+      "check": "R1: unborn default scope dry-run (A2)",
+      "result": "pass",
+      "evidence": "run --dry-run --format json: decision run_all, reason unborn_head, exit 0. Human output: `gerenuk: full suite \u2014 HEAD has no commit yet`"
+    },
+    {
+      "check": "R1: --scope last-commit and --scope branch (A1/A2)",
+      "result": "pass",
+      "evidence": "both give decision run_all, reason unborn_head"
+    },
+    {
+      "check": "R1: real pytest (A1)",
+      "result": "pass",
+      "evidence": "`uv run --with pytest gerenuk run -- -q` printed `1 passed in 0.00s`"
+    },
+    {
+      "check": "R1: fallback payload (A3)",
+      "result": "pass",
+      "evidence": "stub fallback got R=unborn_head and payload {\"gerenuk_fallback_payload_version\":1,\"reason\":\"unborn_head\",\"report\":null}; gerenuk exited 7, the fallback's code"
+    },
+    {
+      "check": "R2: impacted-tests (A4)",
+      "result": "pass",
+      "evidence": "all three scopes give verdict run_all, reason unborn_head, base HEAD, empty impacted_tests; exit 0. Human output prints `verdict run_all \u2014 HEAD has no commit yet`"
+    },
+    {
+      "check": "R1/R2: no tyf on unborn (A5)",
+      "result": "pass",
+      "evidence": "with PATH holding only a git symlink, run --dry-run and impacted-tests both answer run_all/unborn_head"
+    },
+    {
+      "check": "R3: root commit on a `trunk` branch (A6)",
+      "result": "pass",
+      "evidence": "--scope last-commit exits 2 with `HEAD~1 was tried first ... HEAD is a root commit; the branch chain (origin/main, main, master) ...`. --scope branch exits 2 with `tried origin/main, main, master`"
+    },
+    {
+      "check": "R4: explicit missing base (A7)",
+      "result": "pass",
+      "evidence": "`run --base nope` and `impacted-tests --base nope` in an unborn repo exit 2 with the exact `no usable base ref (tried nope). Pass --base with a ref that exists.`. The with-commits case is covered by the new tests/run.rs test, which passes"
+    },
+    {
+      "check": "A8: changed-symbols on unborn",
+      "result": "pass",
+      "evidence": "exit 2, `HEAD has no commit yet, so there is nothing to diff against...`, no origin/main"
+    },
+    {
+      "check": "Bound: git spawns on unborn dry-run",
+      "result": "pass",
+      "evidence": "GERENUK_GIT wrapper log shows exactly 3 calls: rev-parse --show-toplevel, symbolic-ref -q HEAD, rev-parse --verify --quiet HEAD^{commit}"
+    },
+    {
+      "check": "Linked orphan worktree",
+      "result": "pass",
+      "evidence": "`git worktree add --orphan`, then run --dry-run: reason unborn_head"
+    },
+    {
+      "check": "A9: first commit through a pre-commit hook",
+      "result": "pass",
+      "evidence": "Not re-run by hand. The new hook test in tests/run.rs passes in cargo test. The repair report says the prek hook (fmt, clippy, cargo test) passed on the final commit"
+    },
+    {
+      "check": "Code review of git diff base..HEAD",
+      "result": "pass",
+      "evidence": "head_is_unborn uses try_run only, so no new spawn site. --base skips the unborn check. impacted_run returns before untracked, the diff and tyf. unborn_head() builds no ChangedSymbols. ADR 0025, README row and ADR 0024 pointer are present"
+    }
+  ],
+  "preexisting": [
+    {
+      "id": "P1",
+      "severity": "low",
+      "title": "dry-run prints a `pytest not found` line to stderr when pytest is not on PATH",
+      "detail": "`run --dry-run` resolves pytest and prints the error before the decision, then exits 0 with `argv: unknown`. It is not specific to unborn HEAD, because dry-run always resolves pytest. Not caused by this phase.",
+      "repro": "In any repo with no pytest on PATH, run `gerenuk run --dry-run`.",
+      "files": [
+        "src/cli.rs"
+      ]
+    },
+    {
+      "id": "P2",
+      "severity": "low",
+      "title": "The production Git spawn inherits the hook's GIT_INDEX_FILE",
+      "detail": "`replay` inside a hook could hit the same hijacked-index problem the repair fixed in tests. The repair report flags it and it is out of this phase's scope.",
+      "repro": "Run `gerenuk replay` from within a pre-commit hook that has GIT_INDEX_FILE exported.",
+      "files": [
+        "src/git.rs"
+      ]
+    }
+  ],
+  "proposed_oracles": [
+    "Run gerenuk run --dry-run under a GERENUK_GIT wrapper in an unborn repo and assert at most 3 git calls and no diff/ls-files calls.",
+    "Assert the unborn fallback payload equals {\"gerenuk_fallback_payload_version\":1,\"reason\":\"unborn_head\",\"report\":null}."
+  ]
+}
