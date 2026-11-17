@@ -909,24 +909,24 @@ fn dry_run(
     elapsed_ms: u128,
     options: &RunOptions,
 ) -> Result<Outcome> {
-    let argv = if let Some(plan) = &plan {
-        plan.argv.iter().map(OsString::from).collect()
+    let (argv, pytest_error) = if let Some(plan) = &plan {
+        (plan.argv.iter().map(OsString::from).collect(), None)
     } else {
         // A missing pytest must not fail a dry run: the interesting half of
         // the answer is the selection, and reporting it is more use than an
-        // error.
+        // error. Nothing is spawned, so nothing failed: the reason goes into
+        // the report beside the empty argv, not to stderr. Only the top-level
+        // message — `which`'s own "cannot find binary path" adds nothing.
         let resolved = pytest::Runner::resolve(pytest_override(), &repo.config, &repo.root);
         match (selection.decision, resolved) {
-            (Decision::Nothing, _) => Vec::new(),
-            (_, Ok(runner)) => runner.argv(selection, options.pytest_args),
-            (_, Err(err)) => {
-                eprintln!("gerenuk: {err:#}");
-                Vec::new()
-            }
+            (Decision::Nothing, _) => (Vec::new(), None),
+            (_, Ok(runner)) => (runner.argv(selection, options.pytest_args), None),
+            (_, Err(err)) => (Vec::new(), Some(err.to_string())),
         }
     };
 
-    let report = pytest::DryRun { selection, argv, elapsed_ms, fallback: plan, git_env };
+    let report =
+        pytest::DryRun { selection, argv, elapsed_ms, fallback: plan, git_env, pytest_error };
     match options.format {
         Format::Human => write!(out, "{}", report.render_human())?,
         Format::Json => write!(out, "{}", report.render_json()?)?,

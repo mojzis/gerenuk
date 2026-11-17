@@ -23,6 +23,7 @@ use common::{
     fake_fallback, fake_pytest, fake_tyf, gerenuk, json_output, make_executable, recorded_argv,
     recorded_env, strip_hook_git_env, TestRepo,
 };
+use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -374,7 +375,31 @@ fn a_dry_run_still_answers_when_pytest_cannot_be_found() {
         // Not "nothing would be run": the decision line above says `selected`,
         // and the two must not contradict each other.
         .stdout(predicates::str::contains("argv: unknown — pytest could not be resolved"))
-        .stderr(predicates::str::contains("pytest"));
+        // The hint rides on the argv line instead: nothing failed, so nothing
+        // is printed as an error.
+        .stdout(predicates::str::contains("pytest-command"))
+        .stdout(predicates::str::contains("GERENUK_PYTEST"))
+        .stdout(predicates::str::contains("cannot find binary path").not())
+        .stderr(predicates::str::contains("pytest").not());
+}
+
+#[test]
+fn a_dry_run_json_carries_the_pytest_lookup_failure_instead_of_printing_it() {
+    let fixture = Fixture::new(0);
+    touch_target(&fixture.repo);
+    let saved = fixture.save_impact();
+
+    let output = fixture
+        .without_tools()
+        .args(["--format", "json", "run", "--dry-run", "--impact", &saved])
+        .output()
+        .expect("gerenuk should run");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "", "nothing failed, so nothing is said");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(report["argv"], Value::Array(Vec::new()));
+    let error = report["pytest_error"].as_str().expect("the lookup failure is in the report");
+    assert!(error.contains("GERENUK_PYTEST"), "and names the fix: {error}");
 }
 
 #[test]

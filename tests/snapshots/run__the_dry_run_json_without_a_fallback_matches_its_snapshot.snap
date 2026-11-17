@@ -15,6 +15,7 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
     "removed": []
   },
   "node_ids": [],
+  "pytest_error": null,
   "reason": "non_python_changes",
   "verdict": "run_all"
 }

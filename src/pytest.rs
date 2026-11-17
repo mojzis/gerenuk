@@ -332,6 +332,10 @@ pub struct DryRun<'a> {
     pub fallback: Option<Plan<'a>>,
     /// What the child would and would not inherit of git's environment.
     pub git_env: GitEnvPlan,
+    /// Why pytest could not be resolved, when it could not: then `argv` is
+    /// empty although something would run. Reported rather than printed as an
+    /// error, because a dry run spawns nothing and so nothing has failed.
+    pub pytest_error: Option<String>,
 }
 
 impl DryRun<'_> {
@@ -408,6 +412,9 @@ impl DryRun<'_> {
                 Decision::Nothing => writeln!(out, "\nargv: none — nothing would be run"),
                 _ => writeln!(out, "\nargv: unknown — pytest could not be resolved"),
             };
+            if let Some(error) = &self.pytest_error {
+                let _ = writeln!(out, "  {error}");
+            }
         } else {
             let _ = writeln!(out, "\nargv");
             for part in render_argv(&self.argv) {
@@ -434,6 +441,12 @@ impl DryRun<'_> {
             let git_env = serde_json::to_value(&self.git_env)
                 .context("could not serialise the git environment plan")?;
             object.insert("git_env".to_string(), git_env);
+            // Always present too: `null` whenever pytest was found or never
+            // needed looking for.
+            object.insert(
+                "pytest_error".to_string(),
+                self.pytest_error.clone().map_or(serde_json::Value::Null, Into::into),
+            );
         }
         serde_json::to_string_pretty(&value).context("could not render the dry run as JSON")
     }
@@ -573,6 +586,7 @@ mod tests {
             elapsed_ms: 12,
             fallback: None,
             git_env: no_git(),
+            pytest_error: None,
         }
         .render_human();
 
@@ -593,6 +607,7 @@ mod tests {
             elapsed_ms: 3,
             fallback: None,
             git_env: no_git(),
+            pytest_error: None,
         }
         .render_human();
         assert!(text.contains("decision: nothing"), "got:\n{text}");
@@ -618,6 +633,7 @@ mod tests {
             elapsed_ms: 0,
             fallback: None,
             git_env: no_git(),
+            pytest_error: None,
         }
         .render_human();
         assert!(text.contains("expanded tests.conftest:shelter (fixture)"), "got:\n{text}");
@@ -637,6 +653,7 @@ mod tests {
             elapsed_ms: 0,
             fallback: None,
             git_env: no_git(),
+            pytest_error: None,
         }
         .render_human();
         assert!(!text.contains("folded"), "got:\n{text}");
@@ -652,6 +669,7 @@ mod tests {
             elapsed_ms: 0,
             fallback: None,
             git_env: no_git(),
+            pytest_error: None,
         }
         .render_json()
         .expect("the selection serialises");
@@ -684,6 +702,7 @@ mod tests {
             elapsed_ms: 0,
             fallback: Some(plan),
             git_env: GitEnvPlan::inherited(),
+            pytest_error: None,
         };
 
         let text = report.render_human();
@@ -839,6 +858,7 @@ mod tests {
             elapsed_ms: 0,
             fallback: None,
             git_env,
+            pytest_error: None,
         };
         let text = report.render_human();
         assert!(text.contains("\ngit env: isolate — removes GIT_INDEX_FILE\n"), "got:\n{text}");
@@ -854,6 +874,7 @@ mod tests {
             elapsed_ms: 0,
             fallback: None,
             git_env: no_git(),
+            pytest_error: None,
         };
         assert!(
             !report.render_human().contains("git env"),

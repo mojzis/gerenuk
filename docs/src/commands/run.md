@@ -118,10 +118,22 @@ argv
   --from-gerenuk
 ```
 
+When pytest cannot be found, the dry run still answers — the selection is the
+interesting half — and says why on the argv line instead of printing an error,
+because nothing was spawned and so nothing failed:
+
+```
+argv: unknown — pytest could not be resolved
+  `pytest` not found on PATH. Set `pytest-command` under [tool.gerenuk] in pyproject.toml, or point GERENUK_PYTEST at the binary.
+```
+
+A real run in the same state is exit `2`.
+
 `--format json` emits the selection as one object — the verdict and reason
 carried through from the impact report, plus `node_ids`, `expanded`, `dropped`,
-the assembled `argv`, `fallback`, and `git_env` (the policy, and the variables
-it would remove):
+the assembled `argv`, `fallback`, `git_env` (the policy, and the variables it
+would remove) and `pytest_error` (`null` unless pytest was needed and could not
+be resolved; then `argv` is empty and this says why):
 
 ```json
 {
@@ -144,7 +156,8 @@ it would remove):
   ],
   "dropped": [],
   "argv": ["uv", "run", "pytest", "tests/test_fixtures.py::test_described_marks_the_senior"],
-  "fallback": null
+  "fallback": null,
+  "pytest_error": null
 }
 ```
 
