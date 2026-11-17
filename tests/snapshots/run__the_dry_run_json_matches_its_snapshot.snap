@@ -38,6 +38,7 @@ expression: "serde_json::to_string_pretty(&report).expect(\"the report re-serial
       ]
     }
   ],
+  "pytest_error": null,
   "reason": null,
   "verdict": "selected"
 }

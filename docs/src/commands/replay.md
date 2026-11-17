@@ -40,6 +40,12 @@ Untracked files are ignored either way; they were never part of the commit.
 `COMMIT` and `--base` are resolved in your checkout, so `HEAD~1` means what it
 means where you typed it.
 
+From inside a git hook, the hook's `GIT_DIR`, `GIT_INDEX_FILE` and the rest of
+`git rev-parse --local-env-vars` describe your checkout, not the commit. A
+replay drops them from every git it runs once `COMMIT` is resolved, and from
+pytest and the fallback, whatever `git-env` says — so a relative
+`GIT_INDEX_FILE=.git/index` neither breaks the worktree nor reaches your index.
+
 Under `--run`, pytest starts in the worktree with whatever pytest gerenuk
 resolves (see [`run`](run.md)). A virtualenv with the project installed
 editable points at your main checkout, so a `src/` layout may import that code

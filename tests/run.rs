@@ -23,6 +23,7 @@ use common::{
     fake_fallback, fake_pytest, fake_tyf, gerenuk, json_output, make_executable, recorded_argv,
     recorded_env, strip_hook_git_env, TestRepo,
 };
+use predicates::prelude::PredicateBooleanExt;
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -374,7 +375,31 @@ fn a_dry_run_still_answers_when_pytest_cannot_be_found() {
         // Not "nothing would be run": the decision line above says `selected`,
         // and the two must not contradict each other.
         .stdout(predicates::str::contains("argv: unknown — pytest could not be resolved"))
-        .stderr(predicates::str::contains("pytest"));
+        // The hint rides on the argv line instead: nothing failed, so nothing
+        // is printed as an error.
+        .stdout(predicates::str::contains("pytest-command"))
+        .stdout(predicates::str::contains("GERENUK_PYTEST"))
+        .stdout(predicates::str::contains("cannot find binary path").not())
+        .stderr(predicates::str::contains("pytest").not());
+}
+
+#[test]
+fn a_dry_run_json_carries_the_pytest_lookup_failure_instead_of_printing_it() {
+    let fixture = Fixture::new(0);
+    touch_target(&fixture.repo);
+    let saved = fixture.save_impact();
+
+    let output = fixture
+        .without_tools()
+        .args(["--format", "json", "run", "--dry-run", "--impact", &saved])
+        .output()
+        .expect("gerenuk should run");
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "", "nothing failed, so nothing is said");
+    let report: Value = serde_json::from_slice(&output.stdout).expect("stdout is JSON");
+    assert_eq!(report["argv"], Value::Array(Vec::new()));
+    let error = report["pytest_error"].as_str().expect("the lookup failure is in the report");
+    assert!(error.contains("GERENUK_PYTEST"), "and names the fix: {error}");
 }
 
 #[test]
@@ -1914,4 +1939,129 @@ fn the_first_commit_goes_through_a_pre_commit_hook() {
     );
     assert_eq!(unborn.argv(), Some(vec![String::new()]), "the stub saw a bare argv");
     assert_eq!(unborn.repo.git(&["rev-list", "--count", "HEAD"]).trim(), "1");
+}
+
+// --- gerenuk's own git inside a hook (#35) ---
+//
+// A hook exports git's repository-local variables for the repository being
+// committed. gerenuk's diff of that repository must keep them — the hook's
+// index is what is being committed — but a replay worktree is a different
+// checkout, and every git aimed at it must drop them.
+
+/// The index as git sees it: one line per entry, stat noise excluded.
+fn staged(repo: &TestRepo) -> String {
+    repo.git(&["ls-files", "--stage"])
+}
+
+/// A commit worth replaying that the checkout is no longer at, so the replay
+/// needs the worktree; returns its sha.
+fn replay_needs_a_worktree(fixture: &Fixture) -> String {
+    let sha = fixture.commit_target_change();
+    fixture.repo.write("src/mypkg/core.py", CORE);
+    fixture.repo.commit("revert");
+    sha
+}
+
+fn assert_replay_under_hook_env(fixture: &Fixture, env: &[(&str, String)]) {
+    let sha = replay_needs_a_worktree(fixture);
+    let head = fixture.repo.git(&["rev-parse", "HEAD"]);
+    let index = staged(&fixture.repo);
+
+    let output = fixture
+        .command()
+        .envs(env.iter().map(|(name, value)| (*name, value)))
+        .args(["replay", &sha, "--run"])
+        .output()
+        .expect("gerenuk should run");
+
+    assert!(output.status.success(), "the replay completes inside a hook: {}", stderr(&output));
+    assert_eq!(
+        fixture.argv().expect("pytest should have been spawned"),
+        vec![
+            "tests/test_core.py::test_target",
+            "tests/test_core.py::test_with_fixture",
+            "--durations=0",
+        ],
+        "the commit's own selection"
+    );
+    assert_eq!(fixture.repo.git(&["rev-parse", "HEAD"]), head, "the checkout's HEAD is untouched");
+    assert_eq!(staged(&fixture.repo), index, "and so is the hook's index");
+    assert_eq!(fixture.repo.read("src/mypkg/core.py"), CORE, "and the working tree");
+}
+
+#[test]
+fn a_replay_inside_a_hook_with_a_relative_index_file_runs_in_its_worktree() {
+    // prek exports `GIT_INDEX_FILE=.git/index`, relative: from the worktree,
+    // where `.git` is a file, that path cannot be opened at all.
+    let fixture = Fixture::new(0);
+    assert_replay_under_hook_env(&fixture, &[("GIT_INDEX_FILE", ".git/index".to_string())]);
+}
+
+#[test]
+fn a_replay_inside_a_hook_that_exports_the_git_dir_runs_in_its_worktree() {
+    // Absolute `GIT_DIR` and `GIT_WORK_TREE` would aim the worktree's
+    // checkout at the user's own checkout instead.
+    let fixture = Fixture::new(0);
+    let env = hook_env(&fixture);
+    assert_replay_under_hook_env(&fixture, &env);
+}
+
+#[test]
+fn the_hooks_own_diff_reads_the_hooks_index() {
+    // A file `.gitignore` hides, force-staged into the index the hook was
+    // given: tracked there and nowhere else, so only a diff that reads that
+    // index sees it.
+    let fixture = Fixture::new(0);
+    fixture.repo.write(".gitignore", "generated.py\n");
+    fixture.repo.commit("ignore generated.py");
+    fixture.repo.write("generated.py", "def made():\n    return 1\n");
+    let hook_index = fixture.tmp.path().join("hook-index");
+    std::fs::copy(fixture.repo.path().join(".git/index"), &hook_index).expect("copy the index");
+    let mut add = std::process::Command::new("git");
+    strip_hook_git_env(&mut add);
+    let added = add
+        .current_dir(fixture.repo.path())
+        .env("GIT_INDEX_FILE", &hook_index)
+        .args(["add", "--force", "generated.py"])
+        .output()
+        .expect("git should run");
+    assert!(added.status.success(), "{}", String::from_utf8_lossy(&added.stderr));
+
+    let seen = |cmd: &mut std::process::Command| {
+        json_output(cmd.args(["--format", "json", "changed-symbols"])).to_string()
+    };
+    assert!(
+        !seen(&mut fixture.command()).contains("generated.py"),
+        "the repository's own index does not track it"
+    );
+    assert!(
+        seen(fixture.command().env("GIT_INDEX_FILE", &hook_index)).contains("generated.py"),
+        "the hook's index does, and the diff reads that one"
+    );
+}
+
+#[test]
+fn a_replays_children_never_inherit_the_hooks_git_variables() {
+    // The hook's variables describe the user's checkout, not the commit being
+    // replayed: neither pytest nor the fallback that takes a `run_all` is
+    // handed them, though the fallback inherits them on an ordinary run.
+    let fixture = Fixture::new(0);
+    let stub = fixture.fallback("fallback", 0);
+    fixture.configure(&stub.config(&[]));
+    fixture.touch_non_python();
+    fixture.repo.commit("pin requests");
+
+    let output = fixture
+        .command()
+        .envs(hook_env(&fixture))
+        .env("KEEP_ME", "yes")
+        .args(["replay", "HEAD", "--run"])
+        .output()
+        .expect("gerenuk should run");
+    assert!(output.status.success(), "{}", stderr(&output));
+    let env = stub.env().expect("the fallback should have been exec'd");
+    for (name, _) in hook_env(&fixture) {
+        assert_eq!(env.get(name), None, "`{name}` must not reach the fallback");
+    }
+    assert_eq!(env.get("KEEP_ME").map(String::as_str), Some("yes"), "the rest comes through");
 }

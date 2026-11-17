@@ -118,10 +118,22 @@ argv
   --from-gerenuk
 ```
 
+When pytest cannot be found, the dry run still answers — the selection is the
+interesting half — and says why on the argv line instead of printing an error,
+because nothing was spawned and so nothing failed:
+
+```
+argv: unknown — pytest could not be resolved
+  `pytest` not found on PATH. Set `pytest-command` under [tool.gerenuk] in pyproject.toml, or point GERENUK_PYTEST at the binary.
+```
+
+A real run in the same state is exit `2`.
+
 `--format json` emits the selection as one object — the verdict and reason
 carried through from the impact report, plus `node_ids`, `expanded`, `dropped`,
-the assembled `argv`, `fallback`, and `git_env` (the policy, and the variables
-it would remove):
+the assembled `argv`, `fallback`, `git_env` (the policy, and the variables it
+would remove) and `pytest_error` (`null` unless pytest was needed and could not
+be resolved; then `argv` is empty and this says why):
 
 ```json
 {
@@ -144,7 +156,8 @@ it would remove):
   ],
   "dropped": [],
   "argv": ["uv", "run", "pytest", "tests/test_fixtures.py::test_described_marks_the_senior"],
-  "fallback": null
+  "fallback": null,
+  "pytest_error": null
 }
 ```
 
@@ -372,9 +385,13 @@ would remove. Three things it is not:
   inherits everything, whatever `git-env` says. It is the repository's own
   script, run from the hook it was configured for, and it may need the very
   index git handed that hook. A fallback that runs pytest clears them itself.
+  (A replay is the one exception; see below.)
 - **Not gerenuk's.** `changed-symbols` and the walk run before the exec, with
   the hook's context intact; a partial commit's temporary index is exactly
-  what they should be reading.
+  what they should be reading. The exception is
+  [`replay`](replay.md#where-it-runs), which is about a commit rather than
+  what the hook is committing: its git, its pytest and its fallback all run
+  without those variables, whatever `git-env` says.
 - **Not a sandbox.** A test that reads `GIT_DIR` from its own environment and
   passes it on, or finds the outer repository by walking up from its cwd,
   still reaches it. Helpers that deliberately target another repository

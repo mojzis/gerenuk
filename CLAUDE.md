@@ -86,11 +86,21 @@ When a test fails during implementation:
   an argv is a `pytest::Handoff` — stdin bytes and environment variables for
   the child — and the bytes go into an unlinked temp file that becomes fd 0,
   never a pipe, so a child that ignores its stdin cannot block (ADR 0014).
+- **gerenuk's own git inherits the hook's environment except where it aims at
+  another checkout.** `Git::discover` and `rebind` inherit `LOCAL_GIT_ENV`, so
+  the hook's own diff reads the hook's index; `Git::isolated` removes it in
+  `Git::output`. `replay_worktree` isolates everything past `--git-common-dir`
+  (`worktree add` hands its checkout child the hook's `GIT_INDEX_FILE`), and
+  `run_pytest` isolates every git call of a replay plus both of its children,
+  whatever `git-env` says (ADR 0026). `tests/run.rs` replays under prek's
+  relative `GIT_INDEX_FILE` and under absolute `GIT_DIR`/`GIT_WORK_TREE`, and
+  pins the inherit side with an index only the hook can see.
 - **pytest does not inherit the hook's git environment; the fallback does.**
   `pytest::LOCAL_GIT_ENV` is git's own `rev-parse --local-env-vars` list, and
   `GitEnv::Isolate` (the default; `git-env` / `--git-env`) puts the set ones
-  into `Handoff::remove`. Only pytest's handoff removes anything: the fallback
-  is the repository's own script and may need the hook's index (ADR 0020).
+  into `Handoff::remove`. Outside a replay only pytest's handoff removes
+  anything: the fallback is the repository's own script and may need the
+  hook's index (ADR 0020).
   `removals` takes `is_set` as an argument so it stays pure; `tests/run.rs`
   checks the list against the installed git, injects the variables to see
   what each child gets, and commits through a real pre-commit hook in a plain

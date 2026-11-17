@@ -495,7 +495,11 @@ fn resolve_base(repo: &Repo, base: Option<&str>, scope: Option<Scope>) -> Result
 }
 
 fn repo_context(workspace: &Path) -> Result<Repo> {
-    let git = Git::discover(workspace)?;
+    repo_of(&Git::discover(workspace)?)
+}
+
+/// The [`Repo`] `git` is bound inside, at its top level.
+fn repo_of(git: &Git) -> Result<Repo> {
     let root = git.top_level()?;
     let git = git.rebind(&root);
     let config = Config::load(&root)?;
@@ -762,7 +766,15 @@ struct RunOptions<'a> {
 /// left to report anything anyway.
 fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> Result<Outcome> {
     let started = Instant::now();
-    let repo = repo_context(workspace)?;
+    // A replay's checkout is a commit — often the replay worktree — and not
+    // the checkout a hook was run for: none of gerenuk's git calls in it may
+    // see the hook's `GIT_INDEX_FILE` or `GIT_DIR`, from the very first
+    // `rev-parse` on. Anything else is the hook's own checkout, and its diff
+    // reads the hook's index.
+    let repo = match options.replay {
+        Some(_) => repo_of(&Git::discover(workspace)?.isolated(workspace))?,
+        None => repo_context(workspace)?,
+    };
 
     // Resolved before the diff is taken, whatever the outcome turns out to be:
     // an empty argv is a configuration error, and it is found now rather than
@@ -820,8 +832,14 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
     // What pytest loses of the hook's environment. Decided here, after the
     // diff: gerenuk's own git ran in the hook's context, and only the child
     // leaves it. The fallback is not subject to it — it inherits everything.
+    //
+    // A replay is the exception for both children: the hook's variables
+    // describe the user's checkout, not the commit being run, so neither
+    // pytest nor the fallback is handed them, whatever the policy says.
     let git_env = options.git_env.unwrap_or(repo.config.git_env);
-    let git_env_plan = if delegated.is_some() {
+    let git_env_plan = if options.replay.is_some() {
+        pytest::GitEnvPlan::new(pytest::GitEnv::Isolate, is_env_set)
+    } else if delegated.is_some() {
         pytest::GitEnvPlan::inherited()
     } else {
         pytest::GitEnvPlan::new(git_env, is_env_set)
@@ -846,7 +864,9 @@ fn run_pytest(out: &mut impl Write, workspace: &Path, options: &RunOptions) -> R
         // pytest is not resolved at all: the fallback owns the run from here,
         // and the passthrough after `--` is pytest's, so it is not handed on.
         eprintln!("gerenuk: delegating to fallback {}", fallback.describe());
-        let handoff = Payload::new(selection.reason, changed.as_ref()).handoff()?;
+        let mut handoff = Payload::new(selection.reason, changed.as_ref()).handoff()?;
+        // Empty outside a replay: the fallback normally inherits everything.
+        handoff.remove = git_env_plan.removed.iter().map(OsString::from).collect();
         out.flush().context("could not flush gerenuk's own output before running the fallback")?;
         return exec_fallback(fallback, handoff, &repo.root);
     }
@@ -909,24 +929,24 @@ fn dry_run(
     elapsed_ms: u128,
     options: &RunOptions,
 ) -> Result<Outcome> {
-    let argv = if let Some(plan) = &plan {
-        plan.argv.iter().map(OsString::from).collect()
+    let (argv, pytest_error) = if let Some(plan) = &plan {
+        (plan.argv.iter().map(OsString::from).collect(), None)
     } else {
         // A missing pytest must not fail a dry run: the interesting half of
         // the answer is the selection, and reporting it is more use than an
-        // error.
+        // error. Nothing is spawned, so nothing failed: the reason goes into
+        // the report beside the empty argv, not to stderr. Only the top-level
+        // message — `which`'s own "cannot find binary path" adds nothing.
         let resolved = pytest::Runner::resolve(pytest_override(), &repo.config, &repo.root);
         match (selection.decision, resolved) {
-            (Decision::Nothing, _) => Vec::new(),
-            (_, Ok(runner)) => runner.argv(selection, options.pytest_args),
-            (_, Err(err)) => {
-                eprintln!("gerenuk: {err:#}");
-                Vec::new()
-            }
+            (Decision::Nothing, _) => (Vec::new(), None),
+            (_, Ok(runner)) => (runner.argv(selection, options.pytest_args), None),
+            (_, Err(err)) => (Vec::new(), Some(err.to_string())),
         }
     };
 
-    let report = pytest::DryRun { selection, argv, elapsed_ms, fallback: plan, git_env };
+    let report =
+        pytest::DryRun { selection, argv, elapsed_ms, fallback: plan, git_env, pytest_error };
     match options.format {
         Format::Human => write!(out, "{}", report.render_human())?,
         Format::Json => write!(out, "{}", report.render_json()?)?,
