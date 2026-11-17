@@ -385,9 +385,13 @@ would remove. Three things it is not:
   inherits everything, whatever `git-env` says. It is the repository's own
   script, run from the hook it was configured for, and it may need the very
   index git handed that hook. A fallback that runs pytest clears them itself.
+  (A replay is the one exception; see below.)
 - **Not gerenuk's.** `changed-symbols` and the walk run before the exec, with
   the hook's context intact; a partial commit's temporary index is exactly
-  what they should be reading.
+  what they should be reading. The exception is
+  [`replay`](replay.md#where-it-runs), which is about a commit rather than
+  what the hook is committing: its git, its pytest and its fallback all run
+  without those variables, whatever `git-env` says.
 - **Not a sandbox.** A test that reads `GIT_DIR` from its own environment and
   passes it on, or finds the outer repository by walking up from its cwd,
   still reaches it. Helpers that deliberately target another repository

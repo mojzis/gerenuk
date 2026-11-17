@@ -34,3 +34,4 @@ supersedes the old one, and a `Superseded by` line added to it.
 | [0023](0023-a-replay-checks-itself-out.md) | A replay checks its commit out in a worktree it keeps | accepted |
 | [0024](0024-the-default-diff-is-the-last-commit.md) | The default diff is the last commit, not the branch | accepted |
 | [0025](0025-an-unborn-head-runs-everything.md) | An unborn HEAD runs everything | accepted, amends 0024 |
+| [0026](0026-a-replay-drops-the-hooks-git.md) | A replay drops the hook's git environment | accepted, amends 0020 and 0023 |

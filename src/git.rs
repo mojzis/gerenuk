@@ -53,30 +53,57 @@ struct GitOutput {
     stderr: String,
 }
 
+/// Whether a [`Git`] hands its child the repository-local variables a hook
+/// exports ([`crate::pytest::LOCAL_GIT_ENV`]: `GIT_DIR`, `GIT_INDEX_FILE`, …).
+///
+/// Inside a hook they describe the repository being committed. That is what
+/// the diff of the hook's own checkout must see — the hook's index is the
+/// commit being made — so [`Git::discover`] inherits them. Aimed at any other
+/// checkout they are wrong: a relative `GIT_INDEX_FILE` cannot be opened from
+/// a worktree, and an absolute `GIT_DIR` points every command back at the
+/// user's checkout. Those calls isolate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvPolicy {
+    Inherit,
+    Isolate,
+}
+
 /// Runs `git` inside one repository.
 #[derive(Debug, Clone)]
 pub struct Git {
     bin: PathBuf,
     repo: PathBuf,
+    env: EnvPolicy,
 }
 
 impl Git {
-    /// Resolve the `git` binary and bind it to `repo`.
+    /// Resolve the `git` binary and bind it to `repo`, inheriting whatever
+    /// repository-local git variables gerenuk was started with.
     pub fn discover(repo: impl Into<PathBuf>) -> Result<Self> {
         let bin = match std::env::var_os(GIT_BIN_ENV) {
             Some(explicit) => PathBuf::from(explicit),
             None => which::which(DEFAULT_GIT_BIN)
                 .with_context(|| format!("`{DEFAULT_GIT_BIN}` not found on PATH"))?,
         };
-        Ok(Self { bin, repo: repo.into() })
+        Ok(Self { bin, repo: repo.into(), env: EnvPolicy::Inherit })
     }
 
-    /// The same binary, bound to a different repository.
+    /// The same binary, bound to a different directory of the same checkout.
     ///
     /// Cheaper than a second [`Self::discover`], which would re-scan `PATH`.
+    /// The environment policy carries over; a different checkout wants
+    /// [`Self::isolated`].
     #[must_use]
     pub fn rebind(&self, repo: impl Into<PathBuf>) -> Self {
-        Self { bin: self.bin.clone(), repo: repo.into() }
+        Self { bin: self.bin.clone(), repo: repo.into(), env: self.env }
+    }
+
+    /// The same binary, bound to `repo`, and never handing git the
+    /// repository-local variables gerenuk was started with: for a checkout
+    /// that is not the one a hook was run for.
+    #[must_use]
+    pub fn isolated(&self, repo: impl Into<PathBuf>) -> Self {
+        Self { bin: self.bin.clone(), repo: repo.into(), env: EnvPolicy::Isolate }
     }
 
     /// Run `git <args>` in the repository and return stdout.
@@ -119,6 +146,11 @@ impl Git {
         // `core.quotePath=false` keeps non-ASCII paths literal instead of
         // C-escaped, so the diff parser never has to unescape.
         cmd.current_dir(&self.repo).arg("-c").arg("core.quotePath=false").args(args);
+        if self.env == EnvPolicy::Isolate {
+            for name in crate::pytest::LOCAL_GIT_ENV {
+                cmd.env_remove(name);
+            }
+        }
 
         let output =
             cmd.output().with_context(|| format!("failed to spawn `{}`", self.bin.display()))?;
@@ -252,14 +284,20 @@ impl Git {
     /// is touched, and untracked files left by an earlier replay are removed
     /// (ignored ones — a `.venv`, caches — are kept). A directory there that
     /// is not a worktree of this repository is an error, never overwritten.
+    ///
+    /// Everything past locating the git directory runs [`Self::isolated`]:
+    /// inside a hook, `worktree add` hands its own checkout child the hook's
+    /// `GIT_INDEX_FILE`, and a checkout in the worktree would follow an
+    /// exported `GIT_DIR` back into the user's checkout.
     pub fn replay_worktree(&self, commit: &str) -> Result<PathBuf> {
         let common = self
             .run(["rev-parse", "--path-format=absolute", "--git-common-dir"])
             .context("could not locate the repository's git directory")?;
         let dir = PathBuf::from(common.trim()).join("gerenuk").join("replay");
+        let main = self.isolated(&self.repo);
 
-        if self.is_worktree(&dir)? {
-            let worktree = self.rebind(&dir);
+        if main.is_worktree(&dir)? {
+            let worktree = self.isolated(&dir);
             worktree
                 .run(["checkout", "--quiet", "--detach", "--force", commit])
                 .with_context(|| format!("could not check {commit} out in {}", dir.display()))?;
@@ -270,14 +308,14 @@ impl Git {
         }
 
         // A registration whose directory was deleted would block the add.
-        self.run(["worktree", "prune"]).context("could not prune stale worktrees")?;
+        main.run(["worktree", "prune"]).context("could not prune stale worktrees")?;
         if dir.exists() {
             bail!(
                 "{} exists and is not a worktree of this repository; remove it and replay again",
                 dir.display()
             );
         }
-        self.run([
+        main.run([
             OsStr::new("worktree"),
             OsStr::new("add"),
             OsStr::new("--quiet"),
