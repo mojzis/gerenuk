@@ -13,6 +13,7 @@
   - [guide](commands/guide.md)
 - [How it works](how-it-works.md)
 - [Troubleshooting](troubleshooting.md)
+- [Release notes](release-notes.md)
 
 # Agent guide
 
